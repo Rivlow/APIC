@@ -1,0 +1,743 @@
+% tuto_apic2d.tex -- Tutoriel : un solveur APIC 2D quasi-incompressible en Taichi
+% Compiler avec pdfLaTeX (Overleaf : compilateur par défaut).
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[french]{babel}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning}
+\usepackage{listings}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue!60!black,urlcolor=blue!60!black}
+
+% ---------------------------------------------------------------- style des listings
+\definecolor{codebg}{RGB}{247,247,250}
+\definecolor{codekw}{RGB}{0,80,160}
+\definecolor{codecomment}{RGB}{90,120,90}
+\definecolor{codestring}{RGB}{160,60,20}
+\lstset{
+  language=Python,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{codekw}\bfseries,
+  commentstyle=\color{codecomment}\itshape,
+  stringstyle=\color{codestring},
+  backgroundcolor=\color{codebg},
+  frame=single, framerule=0pt, rulecolor=\color{codebg},
+  xleftmargin=6pt, xrightmargin=6pt,
+  breaklines=true, breakatwhitespace=true,
+  showstringspaces=false, tabsize=4,
+  columns=fullflexible, keepspaces=true,
+  literate=
+    {é}{{\'e}}1 {è}{{\`e}}1 {ê}{{\^e}}1 {ë}{{\"e}}1
+    {à}{{\`a}}1 {â}{{\^a}}1 {î}{{\^i}}1 {ï}{{\"i}}1
+    {ô}{{\^o}}1 {ù}{{\`u}}1 {û}{{\^u}}1 {ç}{{\c{c}}}1
+    {É}{{\'E}}1 {È}{{\`E}}1 {À}{{\`A}}1 {œ}{{\oe}}1
+}
+% Code en ligne : \detokenize neutralise les caractères actifs de babel-french (: ; ! ?)
+% et affiche les underscores tels quels, sans passer par \lstinline (fragile dans une macro).
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+
+\title{Un solveur APIC 2D d'eau quasi-incompressible en Taichi\\
+  \large Tutoriel pas à pas, de la page blanche au programme complet}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Ce tutoriel construit, en six étapes et environ 150 lignes de Python/Taichi, un solveur de fluide
+2D hybride particules/grille de type \textbf{APIC} (\emph{Affine Particle-In-Cell}).
+L'eau est traitée comme un fluide \textbf{quasi-incompressible} : la pression vient d'une simple
+loi d'état, sans résolution d'équation de Poisson. Le programme gère les parois du domaine,
+des obstacles, et affiche au choix le champ de masse volumique ou de vitesse dans la fenêtre
+GGUI de Taichi. Le code complet, testé avec Taichi 1.7.4, est donné en annexe.
+\end{abstract}
+
+\tableofcontents
+\bigskip
+
+% ================================================================
+\section{Prérequis}
+
+\begin{itemize}
+  \item Python 3.10 à 3.13 et Taichi :
+\begin{lstlisting}[language=bash]
+pip install taichi
+\end{lstlisting}
+  \item Un GPU est un plus (CUDA ou Vulkan) mais pas indispensable : remplacer
+        \code{ti.gpu} par \code{ti.cpu} dans \code{ti.init} suffit.
+  \item Lancer le programme final avec \code{python apic2d.py}. Touches :
+        \textbf{Espace} bascule masse volumique / vitesse, \textbf{R} réinitialise, \textbf{Échap} quitte.
+\end{itemize}
+
+Le tutoriel a été testé avec Taichi 1.7.4 (Python 3.13, backend CUDA et backend CPU).
+
+% ================================================================
+\section{L'idée générale}
+
+\subsection{Une méthode hybride}
+
+Une méthode \emph{particules/grille} stocke le fluide sur des \textbf{particules} (position, vitesse,
+état de compression) et utilise une \textbf{grille} temporaire à chaque pas de temps pour calculer
+les forces et appliquer les conditions limites. Les particules transportent la matière
+(l'advection est exacte et sans diffusion numérique), la grille fait le travail eulérien
+(pression, parois, obstacles). Chaque pas de temps est un cycle en trois temps :
+
+\begin{center}
+\begin{tikzpicture}[
+  box/.style={draw, rounded corners, minimum width=3.6cm, minimum height=1.1cm, align=center, fill=blue!5},
+  arr/.style={-{Latex[length=3mm]}, thick}]
+  \node[box] (p) {Particules\\ $x_p,\,v_p,\,C_p,\,J_p$};
+  \node[box, right=3.4cm of p] (g) {Grille\\ $m_i,\,v_i$};
+  \draw[arr] (p.north east) to[bend left=25] node[above]{\textbf{1. P2G} : masse, quantité de mouvement, pression} (g.north west);
+  \draw[arr] (g.south west) to[bend left=25] node[below]{\textbf{3. G2P} : vitesse, $C_p$, $J_p$, position} (p.south east);
+  \draw[arr] (g.east) -- ++(1.6,0) node[right, align=left]{\textbf{2. Grille} :\\ gravité,\\ parois, obstacles};
+\end{tikzpicture}
+\end{center}
+
+\begin{enumerate}
+  \item \textbf{P2G} (\emph{particle to grid}) : chaque particule dépose sa masse et sa quantité
+        de mouvement sur les n\oe uds voisins, ainsi que la force de pression qu'elle exerce.
+  \item \textbf{Mise à jour de la grille} : on obtient la vitesse des n\oe uds, on ajoute la gravité,
+        on impose les conditions limites (parois, obstacles).
+  \item \textbf{G2P} (\emph{grid to particle}) : chaque particule relit la vitesse de la grille,
+        met à jour sa matrice affine $C_p$, son taux de compression $J_p$ et avance.
+\end{enumerate}
+
+\subsection{PIC, FLIP, APIC}
+
+La différence entre les variantes tient à ce qu'une particule transporte entre deux pas :
+\begin{itemize}
+  \item \textbf{PIC} : la particule prend la vitesse interpolée de la grille. Simple mais très
+        dissipatif : chaque aller-retour lisse le champ de vitesse.
+  \item \textbf{FLIP} : la particule ajoute l'\emph{incrément} de vitesse de la grille. Peu dissipatif
+        mais bruité, il faut le mélanger avec du PIC.
+  \item \textbf{APIC} : la particule transporte sa vitesse \emph{et} une matrice $C_p$ ($2\times 2$)
+        décrivant la variation locale de vitesse autour d'elle. On dépose sur la grille une vitesse
+        \emph{affine} $v_p + C_p (x_i - x_p)$. Résultat : conservation du moment cinétique, peu
+        de dissipation, pas de bruit, aucun paramètre de mélange. C'est ce que nous implémentons.
+\end{itemize}
+
+\subsection{Quasi-incompressible : pourquoi et comment}
+
+Un solveur strictement incompressible impose $\nabla\cdot v = 0$ en résolvant une équation de
+Poisson pour la pression à chaque pas (\emph{projection}). C'est la partie la plus lourde d'un
+solveur de fluide. Ici on l'évite : chaque particule suit son \textbf{taux de dilatation}
+$J_p$ ($J_p = 1$ au repos, $J_p < 1$ comprimée) et la pression est donnée par une loi d'état
+\[
+  p = E\,(1 - J),
+\]
+où $E$ est une raideur. Le fluide est un peu compressible, avec une vitesse du son
+$c_s = \sqrt{E/\rho}$. Tant que les vitesses de l'écoulement restent petites devant $c_s$
+(nombre de Mach faible), les variations de masse volumique restent de l'ordre de $\mathrm{Ma}^2$,
+soit quelques pour cent : c'est \og quasi-incompressible \fg. Le prix à payer est un pas de temps
+petit, limité par $c_s$ (voir \S\ref{sec:stab}).
+
+% ================================================================
+\section{Le minimum de mathématiques}
+
+\subsection{Interpolation par B-spline quadratique}
+\label{sec:bspline}
+
+La grille a $n$ n\oe uds par côté sur le carré unité, espacés de $\Delta x = 1/n$.
+Une particule en $x_p$ interagit avec les $3\times 3$ n\oe uds les plus proches via le noyau
+B-spline quadratique (par dimension) :
+\[
+  N(u) =
+  \begin{cases}
+    \tfrac34 - u^2 & |u| < \tfrac12,\\[2pt]
+    \tfrac12\left(\tfrac32 - |u|\right)^2 & \tfrac12 \le |u| < \tfrac32,\\[2pt]
+    0 & \text{sinon.}
+  \end{cases}
+\]
+Dans le code on calcule le n\oe ud \code{base} en bas à gauche du stencil et la position
+relative \code{fx} $\in [0.5, 1.5)^2$ :
+\[
+  \texttt{base} = \left\lfloor \frac{x_p}{\Delta x} - \tfrac12 \right\rfloor,\qquad
+  \texttt{fx} = \frac{x_p}{\Delta x} - \texttt{base},
+\]
+et les trois poids par dimension valent
+\[
+  w_0 = \tfrac12\,(1.5 - \texttt{fx})^2,\qquad
+  w_1 = \tfrac34 - (\texttt{fx} - 1)^2,\qquad
+  w_2 = \tfrac12\,(\texttt{fx} - 0.5)^2,
+\]
+avec $w_0 + w_1 + w_2 = 1$. Le poids 2D du n\oe ud $(i,j)$ du stencil est $w_{ip} = w_i^x\, w_j^y$.
+
+\begin{center}
+\begin{tikzpicture}[scale=1.1]
+  \draw[step=1, gray!50, thin] (-0.5,-0.5) grid (3.5,3.5);
+  \foreach \i in {0,...,3} \foreach \j in {0,...,3} \fill[gray!60] (\i,\j) circle (2pt);
+  \foreach \i in {0,1,2} \foreach \j in {0,1,2} \fill[blue!70] (\i,\j) circle (3pt);
+  \fill[red] (1.3,0.8) circle (3.5pt) node[right=3pt] {$x_p$};
+  \node[below left, blue!70!black] at (0,0) {\texttt{base}};
+  \draw[{Latex}-{Latex}, thick] (0,-0.9) -- (1.3,-0.9) node[midway, below] {$\texttt{fx}_x\,\Delta x$};
+  \node[align=left, anchor=west] at (4.2,1.5) {n\oe uds du stencil $3\times3$\\ (bleus), pondérés par $w_{ip}$};
+\end{tikzpicture}
+\end{center}
+
+\subsection{Le transfert APIC}
+
+\paragraph{P2G.} Masse et quantité de mouvement des n\oe uds :
+\[
+  m_i = \sum_p w_{ip}\, m_p,\qquad
+  (m v)_i = \sum_p w_{ip}\, m_p \big( v_p + C_p\,(x_i - x_p) \big).
+\]
+Le terme $C_p (x_i - x_p)$ est la signature d'APIC : la particule dépose un champ de vitesse
+affine, pas une vitesse constante.
+
+\paragraph{G2P.} Vitesse et matrice affine de la particule :
+\[
+  v_p = \sum_i w_{ip}\, v_i,\qquad
+  C_p = B_p D_p^{-1},\quad
+  B_p = \sum_i w_{ip}\, v_i\,(x_i - x_p)^{\mathsf T},\quad
+  D_p = \sum_i w_{ip}\,(x_i - x_p)(x_i - x_p)^{\mathsf T}.
+\]
+Pour la B-spline quadratique on a exactement $D_p = \frac{\Delta x^2}{4}\, I$, d'où la formule
+utilisée dans le code :
+\[
+  \boxed{\;C_p = \frac{4}{\Delta x^2}\sum_i w_{ip}\, v_i\,(x_i - x_p)^{\mathsf T}\;}
+\]
+$C_p$ est une approximation du gradient de vitesse $\nabla v$ au voisinage de la particule.
+
+\subsection{Pression quasi-incompressible}
+
+\paragraph{Taux de dilatation.} $J_p$ suit $\dot J = J\,\nabla\cdot v$, et comme
+$C_p \approx \nabla v$, on a $\nabla\cdot v \approx \operatorname{tr} C_p$ :
+\[
+  J_p \leftarrow J_p\,\big(1 + \Delta t\,\operatorname{tr} C_p\big).
+\]
+
+\paragraph{Force nodale.} Avec la contrainte de Cauchy $\sigma = -p\,I = E(J-1)\,I$, la force
+exercée par la particule $p$ sur le n\oe ud $i$ est $f_i = -V_p\,\sigma_p\,\nabla w_{ip}$.
+Pour la B-spline quadratique le gradient du poids se simplifie en
+$\nabla w_{ip} \approx \frac{4}{\Delta x^2}\,w_{ip}\,(x_i - x_p)$ (approximation MLS-MPM), donc
+\[
+  \Delta t\, f_i = w_{ip}\;\underbrace{\Big(-\Delta t\,\frac{4 E V_p}{\Delta x^2}\,(J_p - 1)\Big)}_{\texttt{stress}}\;(x_i - x_p).
+\]
+C'est exactement le terme \code{stress * dpos} déposé dans P2G. Vérification du signe :
+une particule comprimée ($J_p < 1$) donne \code{stress} $> 0$ et pousse les n\oe uds
+\emph{loin} d'elle, ce qui la détend.
+
+\subsection{Stabilité et choix des paramètres}
+\label{sec:stab}
+
+Le schéma est explicite : il faut $\Delta t < \Delta x / (c_s + |v|_{\max})$ avec
+$c_s = \sqrt{E/\rho}$. Avec les valeurs du code :
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Paramètre & Valeur & Rôle \\
+\midrule
+$n$ & 128 & n\oe uds par côté, $\Delta x = 1/128$ \\
+$\rho$ & 1 & masse volumique de repos \\
+$E$ & 400 & raideur, $c_s = 20$ \\
+$\Delta t$ & $2\cdot10^{-4}$ & $< \Delta x / c_s \approx 3.9\cdot10^{-4}$ \\
+$V_p$ & $(\Delta x/2)^2$ & 4 particules par cellule \\
+$g$ & 9.8 & gravité \\
+\code{bound} & 3 & épaisseur des parois (en n\oe uds) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Une vitesse d'éclaboussure de $3$ donne $\mathrm{Ma} \approx 0.15$, donc des variations de masse
+volumique de l'ordre de $2\,\%$. Augmenter $E$ rend l'eau plus incompressible mais impose
+de réduire $\Delta t$.
+
+% ================================================================
+\section{Étape 1 : squelette Taichi, paramètres et champs}
+
+On initialise Taichi, on définit les constantes physiques, puis les \emph{champs} (tableaux
+vivant sur le GPU). Les particules ont quatre attributs, la grille en a deux plus un masque
+d'obstacles, et une image sert à l'affichage.
+
+\begin{lstlisting}
+import taichi as ti
+
+ti.init(arch=ti.gpu)  # remplacer par ti.cpu si pas de GPU
+
+# ---------------------------------------------------------------- Paramètres
+n_grid = 128                 # noeuds par côté (domaine = carré unité)
+dx = 1.0 / n_grid
+inv_dx = float(n_grid)
+dt = 2e-4                    # pas de temps (doit vérifier dt < dx / c_s)
+substeps = 10                # sous-pas par image affichée
+bound = 3                    # épaisseur des parois du domaine (en noeuds)
+
+rho = 1.0                    # masse volumique de repos
+E = 400.0                    # raideur : pression p = E (1 - J), c_s = sqrt(E / rho)
+gravity = 9.8
+p_vol = (dx * 0.5) ** 2      # 4 particules par cellule -> volume d'une particule
+p_mass = p_vol * rho
+
+# Bloc d'eau initial [x0, x1] x [y0, y1]
+water_x0, water_x1 = 0.05, 0.45
+water_y0, water_y1 = 0.30, 0.90
+n_particles = int((water_x1 - water_x0) * (water_y1 - water_y0) * n_grid * n_grid * 4)
+
+# Obstacles : un disque et un rectangle
+disk_center = ti.Vector([0.55, 0.30])
+disk_radius = 0.10
+rect_x0, rect_x1, rect_y0, rect_y1 = 0.72, 0.95, 0.00, 0.14
+
+# ---------------------------------------------------------------- Champs
+x = ti.Vector.field(2, ti.f32, n_particles)          # position
+v = ti.Vector.field(2, ti.f32, n_particles)          # vitesse
+C = ti.Matrix.field(2, 2, ti.f32, n_particles)       # matrice affine APIC (gradient de vitesse)
+J = ti.field(ti.f32, n_particles)                    # taux de dilatation (1 = repos)
+
+grid_v = ti.Vector.field(2, ti.f32, (n_grid, n_grid))  # quantité de mouvement puis vitesse
+grid_m = ti.field(ti.f32, (n_grid, n_grid))            # masse
+solid = ti.field(ti.i32, (n_grid, n_grid))             # 1 si le noeud est dans un obstacle
+img = ti.Vector.field(3, ti.f32, (n_grid, n_grid))     # image affichée
+\end{lstlisting}
+
+\paragraph{Remarques.}
+\begin{itemize}
+  \item \code{grid_v} contient la \emph{quantité de mouvement} après P2G, puis la \emph{vitesse}
+        après division par la masse : on réutilise le même champ.
+  \item \code{n_particles} est calculé pour avoir 4 particules par cellule dans le bloc d'eau,
+        cohérent avec \code{p_vol}.
+  \item Le masque \code{solid} est défini sur les n\oe uds : un n\oe ud dans un obstacle est
+        marqué 1. C'est tout ce qu'il faut pour gérer des obstacles de forme quelconque.
+\end{itemize}
+
+% ================================================================
+\section{Étape 2 : initialisation (eau et obstacles)}
+
+Un kernel place les particules aléatoirement dans le bloc d'eau, au repos ($v = 0$,
+$C = 0$, $J = 1$), et remplit le masque d'obstacles par des tests géométriques sur la
+position de chaque n\oe ud. Le même kernel sert de \emph{reset} (touche R).
+
+\begin{lstlisting}
+@ti.kernel
+def init():
+    for p in x:
+        x[p] = [water_x0 + ti.random() * (water_x1 - water_x0),
+                water_y0 + ti.random() * (water_y1 - water_y0)]
+        v[p] = [0.0, 0.0]
+        C[p] = ti.Matrix.zero(ti.f32, 2, 2)
+        J[p] = 1.0
+    for i, j in solid:
+        pos = ti.Vector([i, j]) * dx
+        in_disk = (pos - disk_center).norm() < disk_radius
+        in_rect = rect_x0 <= pos.x and pos.x <= rect_x1 and rect_y0 <= pos.y and pos.y <= rect_y1
+        solid[i, j] = 1 if (in_disk or in_rect) else 0
+\end{lstlisting}
+
+Pour ajouter un obstacle, il suffit d'ajouter un test sur \code{pos} : n'importe quelle forme
+décrite analytiquement (ou lue depuis une image) convient.
+
+% ================================================================
+\section{Étape 3 : P2G, des particules vers la grille}
+
+C'est le c\oe ur du solveur. Pour chaque particule : stencil, poids, coefficient de pression,
+puis dépôt sur les 9 n\oe uds. Les opérateurs \code{+=} sur des champs sont automatiquement
+atomiques dans une boucle parallèle Taichi.
+
+\begin{lstlisting}
+@ti.kernel
+def p2g():
+    for i, j in grid_m:
+        grid_v[i, j] = [0.0, 0.0]
+        grid_m[i, j] = 0.0
+    for p in x:
+        base = int(x[p] * inv_dx - 0.5)          # noeud en bas à gauche du stencil 3x3
+        fx = x[p] * inv_dx - base                # position relative dans le stencil
+        w = [0.5 * (1.5 - fx) ** 2,              # poids B-spline quadratique
+             0.75 - (fx - 1.0) ** 2,
+             0.5 * (fx - 0.5) ** 2]
+        # Pression quasi-incompressible : p = E (1 - J). Le coefficient "stress"
+        # contient dt, le volume, et le 4/dx^2 du gradient des poids.
+        stress = -dt * 4.0 * E * p_vol * (J[p] - 1.0) * inv_dx * inv_dx
+        for i, j in ti.static(ti.ndrange(3, 3)):
+            offset = ti.Vector([i, j])
+            dpos = (offset - fx) * dx            # vecteur particule -> noeud
+            weight = w[i].x * w[j].y
+            grid_v[base + offset] += weight * (p_mass * (v[p] + C[p] @ dpos)  # APIC
+                                               + stress * dpos)               # pression
+            grid_m[base + offset] += weight * p_mass
+\end{lstlisting}
+
+\paragraph{Ligne par ligne.}
+\begin{itemize}
+  \item \code{base}, \code{fx}, \code{w} : voir \S\ref{sec:bspline}. \code{fx} et chaque
+        \code{w[k]} sont des vecteurs 2D ; \code{w[i].x * w[j].y} est le poids 2D du n\oe ud
+        $(i,j)$ du stencil.
+  \item \code{stress} : le coefficient $-\Delta t\,4 E V_p (J_p-1)/\Delta x^2$ de la force de pression.
+  \item \code{ti.static(ti.ndrange(3, 3))} : boucle $3\times3$ déroulée à la compilation.
+  \item \code{dpos} $= x_i - x_p$ en unités physiques.
+  \item Le dépôt combine le terme APIC $m_p (v_p + C_p\,\texttt{dpos})$ et le terme de pression
+        $\texttt{stress}\cdot\texttt{dpos}$, tous deux pondérés par $w_{ip}$.
+\end{itemize}
+
+% ================================================================
+\section{Étape 4 : mise à jour de la grille, parois et obstacles}
+
+Sur chaque n\oe ud portant de la masse : conversion en vitesse, gravité, puis conditions limites.
+
+\begin{lstlisting}
+@ti.kernel
+def grid_step():
+    for i, j in grid_m:
+        if grid_m[i, j] > 0:
+            grid_v[i, j] /= grid_m[i, j]                      # quantité de mouvement -> vitesse
+            grid_v[i, j].y -= dt * gravity
+            # Parois du domaine (glissement libre) : on annule la composante normale entrante
+            if i < bound and grid_v[i, j].x < 0:
+                grid_v[i, j].x = 0.0
+            if i > n_grid - bound and grid_v[i, j].x > 0:
+                grid_v[i, j].x = 0.0
+            if j < bound and grid_v[i, j].y < 0:
+                grid_v[i, j].y = 0.0
+            if j > n_grid - bound and grid_v[i, j].y > 0:
+                grid_v[i, j].y = 0.0
+            # Obstacles (adhérence) : vitesse nulle
+            if solid[i, j] == 1:
+                grid_v[i, j] = [0.0, 0.0]
+\end{lstlisting}
+
+\paragraph{Parois du domaine.} Sur une bande de \code{bound} n\oe uds le long de chaque bord,
+on annule la composante de vitesse \emph{normale} qui pointe vers la paroi, et on laisse la
+composante tangentielle : c'est une condition de \textbf{glissement libre} (\emph{free-slip})
+qui autorise l'eau à se décoller de la paroi. Les particules ne peuvent pas traverser :
+une fois dans la bande, tous les n\oe uds de leur stencil interdisent la vitesse entrante.
+
+\paragraph{Obstacles.} Sur les n\oe uds marqués \code{solid}, la vitesse est mise à zéro :
+condition d'\textbf{adhérence} (\emph{no-slip}), la plus simple possible. L'eau colle un peu à
+l'obstacle et les particules peuvent s'y enfoncer d'une cellule environ (cosmétique : la zone
+est dessinée en gris). Une variante glissement libre demanderait la normale de l'obstacle en
+chaque n\oe ud.
+
+% ================================================================
+\section{Étape 5 : G2P, de la grille vers les particules}
+
+Chaque particule relit la vitesse des 9 n\oe uds, reconstruit $C_p$ avec la formule encadrée,
+met à jour $J_p$ et avance.
+
+\begin{lstlisting}
+@ti.kernel
+def g2p():
+    for p in x:
+        base = int(x[p] * inv_dx - 0.5)
+        fx = x[p] * inv_dx - base
+        w = [0.5 * (1.5 - fx) ** 2,
+             0.75 - (fx - 1.0) ** 2,
+             0.5 * (fx - 0.5) ** 2]
+        new_v = ti.Vector.zero(ti.f32, 2)
+        new_C = ti.Matrix.zero(ti.f32, 2, 2)
+        for i, j in ti.static(ti.ndrange(3, 3)):
+            offset = ti.Vector([i, j])
+            dpos = (offset - fx) * dx
+            g_v = grid_v[base + offset]
+            weight = w[i].x * w[j].y
+            new_v += weight * g_v
+            new_C += 4.0 * inv_dx * inv_dx * weight * g_v.outer_product(dpos)  # C = sum w v (x_i - x_p)^T / (dx^2/4)
+        v[p] = new_v
+        C[p] = new_C
+        J[p] *= 1.0 + dt * new_C.trace()         # dJ/dt = J div(v)
+        x[p] += dt * v[p]
+        x[p] = ti.math.clamp(x[p], bound * dx, 1.0 - bound * dx)  # sécurité : jamais hors grille
+\end{lstlisting}
+
+\paragraph{Remarques.}
+\begin{itemize}
+  \item \code{g_v.outer_product(dpos)} calcule $v_i\,(x_i-x_p)^{\mathsf T}$ ; le facteur
+        \code{4.0 * inv_dx * inv_dx} est le $D_p^{-1} = 4/\Delta x^2$.
+  \item \code{new_C.trace()} $\approx \nabla\cdot v$ sert à mettre à jour $J_p$.
+  \item Le \code{clamp} final est une sécurité : une particule hors de la grille produirait
+        un accès mémoire invalide dans P2G (silencieux sur GPU). Avec les parois de l'étape 4,
+        il n'est normalement jamais actif.
+\end{itemize}
+
+À ce stade le solveur est complet : un pas de temps est \code{p2g(); grid_step(); g2p()}.
+
+% ================================================================
+\section{Étape 6 : affichage et boucle principale}
+
+\subsection{Le kernel de rendu}
+
+On remplit une image de $n\times n$ pixels directement depuis la grille : gris pour les
+obstacles, sinon une couleur proportionnelle à la masse volumique (mode 0) ou à la norme de la
+vitesse (mode 1). La masse volumique d'un n\oe ud est $m_i/\Delta x^2$, ramenée à $\rho$
+(valeur 1 pour de l'eau au repos). Un léger gain d'affichage (1/0.8) sature le volume d'eau
+pour que l'\oe il ne soit pas distrait par le bruit d'échantillonnage des particules.
+
+\begin{lstlisting}
+@ti.kernel
+def render(mode: ti.i32):
+    for i, j in img:
+        if solid[i, j] == 1:
+            img[i, j] = [0.35, 0.35, 0.35]
+        else:
+            val = 0.0
+            if mode == 0:
+                val = grid_m[i, j] / (dx * dx * rho) / 0.8   # masse volumique relative (1 = eau au repos), gain 1/0.8
+            else:
+                val = grid_v[i, j].norm() / 3.0        # vitesse (3 m/s -> couleur maximale)
+            val = ti.math.clamp(val, 0.0, 1.0)
+            if mode == 0:
+                img[i, j] = ti.Vector([0.02, 0.02, 0.08]) * (1 - val) + ti.Vector([0.35, 0.65, 1.0]) * val
+            else:
+                img[i, j] = ti.Vector([0.02, 0.02, 0.08]) * (1 - val) + ti.Vector([1.0, 0.75, 0.2]) * val
+\end{lstlisting}
+
+\subsection{La fenêtre GGUI et la boucle}
+
+\code{ti.ui.Window} ouvre une fenêtre ; \code{canvas.set_image} affiche un champ image et le met
+automatiquement à l'échelle de la fenêtre ; \code{window.get_gui()} fournit un petit panneau de
+texte. Les événements clavier se lisent avec \code{window.get_event(ti.ui.PRESS)} qui remplit
+\code{window.event.key}. À chaque image on effectue \code{substeps} pas de temps.
+
+\begin{lstlisting}
+def main():
+    window = ti.ui.Window("APIC 2D - eau quasi-incompressible", res=(512, 512))
+    canvas = window.get_canvas()
+    gui = window.get_gui()
+    mode = 0
+    init()
+    while window.running:
+        while window.get_event(ti.ui.PRESS):
+            if window.event.key == ti.ui.ESCAPE:
+                window.running = False
+            elif window.event.key == ti.ui.SPACE:
+                mode = 1 - mode
+            elif window.event.key == 'r':
+                init()
+        for _ in range(substeps):
+            p2g()
+            grid_step()
+            g2p()
+        render(mode)
+        canvas.set_image(img)
+        gui.begin("APIC 2D", 0.02, 0.02, 0.50, 0.16)
+        gui.text("Affichage : " + ("masse volumique" if mode == 0 else "vitesse"))
+        gui.text("ESPACE : basculer l'affichage")
+        gui.text("R : reset      ESC : quitter")
+        gui.end()
+        window.show()
+
+
+if __name__ == "__main__":
+    main()
+\end{lstlisting}
+
+\subsection{Ce que l'on doit voir}
+
+Le bloc d'eau tombe, s'écrase sur le sol, contourne le disque, submerge le rectangle puis
+s'étale. En mode masse volumique, les zones d'impact apparaissent plus claires (compression) ;
+en mode vitesse, les jets et les éclaboussures ressortent en orange. Avec ces paramètres,
+la masse totale sur la grille est conservée exactement, $J_p$ reste entre $0.9$ et $1.1$ pour
+plus de 99\,\% des particules, et la simulation reste stable indéfiniment.
+
+% ================================================================
+\section{Pour aller plus loin}
+
+Trois extensions naturelles, dans l'ordre de difficulté : (1) une condition de glissement
+libre sur les obstacles, en stockant une normale par n\oe ud solide et en n'annulant que la
+composante normale entrante ; (2) une vraie \textbf{projection de pression} (résolution de
+$\nabla^2 p = \rho\,\nabla\cdot v / \Delta t$ sur la grille par Jacobi ou gradient conjugué),
+qui remplace $E$ et $J$ et lève la contrainte sur $\Delta t$ liée à $c_s$ ; (3) le passage en 3D,
+quasi immédiat : vecteurs à trois composantes, stencil $3\times3\times3$ et $D_p$ inchangé.
+
+% ================================================================
+\appendix
+\section{Code complet : \texttt{apic2d.py}}
+
+\begin{lstlisting}
+# apic2d.py -- Solveur APIC 2D pour de l'eau quasi-incompressible (Taichi)
+#
+# Cycle par pas de temps :
+#   1. p2g()       : particules -> grille (masse, quantité de mouvement, force de pression)
+#   2. grid_step() : grille (vitesse, gravité, parois, obstacles)
+#   3. g2p()       : grille -> particules (vitesse, matrice affine C, J, position)
+#
+# Touches : ESPACE = masse volumique / vitesse, R = reset, ESC = quitter
+
+import taichi as ti
+
+ti.init(arch=ti.gpu)  # remplacer par ti.cpu si pas de GPU
+
+# ---------------------------------------------------------------- Paramètres
+n_grid = 128                 # noeuds par côté (domaine = carré unité)
+dx = 1.0 / n_grid
+inv_dx = float(n_grid)
+dt = 2e-4                    # pas de temps (doit vérifier dt < dx / c_s)
+substeps = 10                # sous-pas par image affichée
+bound = 3                    # épaisseur des parois du domaine (en noeuds)
+
+rho = 1.0                    # masse volumique de repos
+E = 400.0                    # raideur : pression p = E (1 - J), c_s = sqrt(E / rho)
+gravity = 9.8
+p_vol = (dx * 0.5) ** 2      # 4 particules par cellule -> volume d'une particule
+p_mass = p_vol * rho
+
+# Bloc d'eau initial [x0, x1] x [y0, y1]
+water_x0, water_x1 = 0.05, 0.45
+water_y0, water_y1 = 0.30, 0.90
+n_particles = int((water_x1 - water_x0) * (water_y1 - water_y0) * n_grid * n_grid * 4)
+
+# Obstacles : un disque et un rectangle
+disk_center = ti.Vector([0.55, 0.30])
+disk_radius = 0.10
+rect_x0, rect_x1, rect_y0, rect_y1 = 0.72, 0.95, 0.00, 0.14
+
+# ---------------------------------------------------------------- Champs
+x = ti.Vector.field(2, ti.f32, n_particles)          # position
+v = ti.Vector.field(2, ti.f32, n_particles)          # vitesse
+C = ti.Matrix.field(2, 2, ti.f32, n_particles)       # matrice affine APIC (gradient de vitesse)
+J = ti.field(ti.f32, n_particles)                    # taux de dilatation (1 = repos)
+
+grid_v = ti.Vector.field(2, ti.f32, (n_grid, n_grid))  # quantité de mouvement puis vitesse
+grid_m = ti.field(ti.f32, (n_grid, n_grid))            # masse
+solid = ti.field(ti.i32, (n_grid, n_grid))             # 1 si le noeud est dans un obstacle
+img = ti.Vector.field(3, ti.f32, (n_grid, n_grid))     # image affichée
+
+
+# ---------------------------------------------------------------- Initialisation
+@ti.kernel
+def init():
+    for p in x:
+        x[p] = [water_x0 + ti.random() * (water_x1 - water_x0),
+                water_y0 + ti.random() * (water_y1 - water_y0)]
+        v[p] = [0.0, 0.0]
+        C[p] = ti.Matrix.zero(ti.f32, 2, 2)
+        J[p] = 1.0
+    for i, j in solid:
+        pos = ti.Vector([i, j]) * dx
+        in_disk = (pos - disk_center).norm() < disk_radius
+        in_rect = rect_x0 <= pos.x and pos.x <= rect_x1 and rect_y0 <= pos.y and pos.y <= rect_y1
+        solid[i, j] = 1 if (in_disk or in_rect) else 0
+
+
+# ---------------------------------------------------------------- 1. Particules -> grille
+@ti.kernel
+def p2g():
+    for i, j in grid_m:
+        grid_v[i, j] = [0.0, 0.0]
+        grid_m[i, j] = 0.0
+    for p in x:
+        base = int(x[p] * inv_dx - 0.5)          # noeud en bas à gauche du stencil 3x3
+        fx = x[p] * inv_dx - base                # position relative dans le stencil
+        w = [0.5 * (1.5 - fx) ** 2,              # poids B-spline quadratique
+             0.75 - (fx - 1.0) ** 2,
+             0.5 * (fx - 0.5) ** 2]
+        # Pression quasi-incompressible : p = E (1 - J). Le coefficient "stress"
+        # contient dt, le volume, et le 4/dx^2 du gradient des poids.
+        stress = -dt * 4.0 * E * p_vol * (J[p] - 1.0) * inv_dx * inv_dx
+        for i, j in ti.static(ti.ndrange(3, 3)):
+            offset = ti.Vector([i, j])
+            dpos = (offset - fx) * dx            # vecteur particule -> noeud
+            weight = w[i].x * w[j].y
+            grid_v[base + offset] += weight * (p_mass * (v[p] + C[p] @ dpos)  # APIC
+                                               + stress * dpos)               # pression
+            grid_m[base + offset] += weight * p_mass
+
+
+# ---------------------------------------------------------------- 2. Mise à jour de la grille
+@ti.kernel
+def grid_step():
+    for i, j in grid_m:
+        if grid_m[i, j] > 0:
+            grid_v[i, j] /= grid_m[i, j]                      # quantité de mouvement -> vitesse
+            grid_v[i, j].y -= dt * gravity
+            # Parois du domaine (glissement libre) : on annule la composante normale entrante
+            if i < bound and grid_v[i, j].x < 0:
+                grid_v[i, j].x = 0.0
+            if i > n_grid - bound and grid_v[i, j].x > 0:
+                grid_v[i, j].x = 0.0
+            if j < bound and grid_v[i, j].y < 0:
+                grid_v[i, j].y = 0.0
+            if j > n_grid - bound and grid_v[i, j].y > 0:
+                grid_v[i, j].y = 0.0
+            # Obstacles (adhérence) : vitesse nulle
+            if solid[i, j] == 1:
+                grid_v[i, j] = [0.0, 0.0]
+
+
+# ---------------------------------------------------------------- 3. Grille -> particules
+@ti.kernel
+def g2p():
+    for p in x:
+        base = int(x[p] * inv_dx - 0.5)
+        fx = x[p] * inv_dx - base
+        w = [0.5 * (1.5 - fx) ** 2,
+             0.75 - (fx - 1.0) ** 2,
+             0.5 * (fx - 0.5) ** 2]
+        new_v = ti.Vector.zero(ti.f32, 2)
+        new_C = ti.Matrix.zero(ti.f32, 2, 2)
+        for i, j in ti.static(ti.ndrange(3, 3)):
+            offset = ti.Vector([i, j])
+            dpos = (offset - fx) * dx
+            g_v = grid_v[base + offset]
+            weight = w[i].x * w[j].y
+            new_v += weight * g_v
+            new_C += 4.0 * inv_dx * inv_dx * weight * g_v.outer_product(dpos)  # C = sum w v (x_i - x_p)^T / (dx^2/4)
+        v[p] = new_v
+        C[p] = new_C
+        J[p] *= 1.0 + dt * new_C.trace()         # dJ/dt = J div(v)
+        x[p] += dt * v[p]
+        x[p] = ti.math.clamp(x[p], bound * dx, 1.0 - bound * dx)  # sécurité : jamais hors grille
+
+
+# ---------------------------------------------------------------- Affichage
+@ti.kernel
+def render(mode: ti.i32):
+    for i, j in img:
+        if solid[i, j] == 1:
+            img[i, j] = [0.35, 0.35, 0.35]
+        else:
+            val = 0.0
+            if mode == 0:
+                val = grid_m[i, j] / (dx * dx * rho) / 0.8   # masse volumique relative (1 = eau au repos), gain 1/0.8
+            else:
+                val = grid_v[i, j].norm() / 3.0        # vitesse (3 m/s -> couleur maximale)
+            val = ti.math.clamp(val, 0.0, 1.0)
+            if mode == 0:
+                img[i, j] = ti.Vector([0.02, 0.02, 0.08]) * (1 - val) + ti.Vector([0.35, 0.65, 1.0]) * val
+            else:
+                img[i, j] = ti.Vector([0.02, 0.02, 0.08]) * (1 - val) + ti.Vector([1.0, 0.75, 0.2]) * val
+
+
+# ---------------------------------------------------------------- Boucle principale
+def main():
+    window = ti.ui.Window("APIC 2D - eau quasi-incompressible", res=(512, 512))
+    canvas = window.get_canvas()
+    gui = window.get_gui()
+    mode = 0
+    init()
+    while window.running:
+        while window.get_event(ti.ui.PRESS):
+            if window.event.key == ti.ui.ESCAPE:
+                window.running = False
+            elif window.event.key == ti.ui.SPACE:
+                mode = 1 - mode
+            elif window.event.key == 'r':
+                init()
+        for _ in range(substeps):
+            p2g()
+            grid_step()
+            g2p()
+        render(mode)
+        canvas.set_image(img)
+        gui.begin("APIC 2D", 0.02, 0.02, 0.50, 0.16)
+        gui.text("Affichage : " + ("masse volumique" if mode == 0 else "vitesse"))
+        gui.text("ESPACE : basculer l'affichage")
+        gui.text("R : reset      ESC : quitter")
+        gui.end()
+        window.show()
+
+
+if __name__ == "__main__":
+    main()
+\end{lstlisting}
+
+\end{document}

@@ -4,5 +4,9 @@
     "python.defaultInterpreterPath": "C:\\Users\\lucas\\miniconda3\\python.exe",
     "code-runner.executorMap": {
         "python": "C:\\Users\\lucas\\miniconda3\\python.exe -u"
+    },
+
+    "python.analysis.diagnosticSeverityOverrides": {
+        "reportInvalidTypeForm": "none"
     }
 }
