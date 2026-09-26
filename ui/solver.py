@@ -18,8 +18,9 @@ import taichi as ti
 from Code_tuto.mpm_solid import (G2P_solid, P2G_solid, clear_eps, scatter_eps, solid_colors,
                                  solid_stats, update_damage)
 from ui import kernels as K
+from ui import kernels_inc as M
 
-STRUCTURAL = ("n", "bound", "ppc", "capacity", "seed", "res")   # tout le reste s'applique à chaud
+STRUCTURAL = ("n", "bound", "ppc", "capacity", "seed", "res", "incompressible")   # le reste s'applique à chaud
 
 _arch: str | None = None
 
@@ -95,6 +96,7 @@ class Solver:
         self.capacity = max(cap, 1)                    # dense(ti.i, 0) est invalide
         self.n_solid = len(xs)
         self.has_solid = self.n_solid > 0
+        self.incompressible = bool(p.get("incompressible", False))
         self._x0f = np.zeros((self.capacity, 2), np.float32)
         self._v0f = np.zeros((self.capacity, 2), np.float32)
         self._x0f[:self.n_fluid_init], self._v0f[:self.n_fluid_init] = xf, vf
@@ -106,7 +108,9 @@ class Solver:
         self.x_f, self.v_f = ti.Vector.field(2, ti.f32), ti.Vector.field(2, ti.f32)
         self.C_f, self.J_f = ti.Matrix.field(2, 2, ti.f32), ti.field(ti.f32)
         self.alive, self.free_stack = ti.field(ti.i32), ti.field(ti.i32)
-        fb.dense(ti.i, self.capacity).place(self.x_f, self.v_f, self.C_f, self.J_f, self.alive, self.free_stack)
+        self.sc_f = ti.field(ti.f32)                   # quantité colorée par particule (voir fluid_mode)
+        fb.dense(ti.i, self.capacity).place(self.x_f, self.v_f, self.C_f, self.J_f, self.alive, self.free_stack,
+                                            self.sc_f)
         self.free_top = ti.field(ti.i32)
         fb.dense(ti.i, 1).place(self.free_top)
 
@@ -122,12 +126,28 @@ class Solver:
                                       self.cells, self.cell_count, self.bc_v)
         self.img = ti.Vector.field(3, ti.u8)
         fb.dense(ti.ij, (p["res"], p["res"])).place(self.img)
+        if self.incompressible:                        # grille décalée + gradient conjugué
+            self.u, self.mu = ti.field(ti.f32), ti.field(ti.f32)
+            self.v, self.mv = ti.field(ti.f32), ti.field(ti.f32)
+            fb.dense(ti.ij, (n + 1, n)).place(self.u, self.mu)
+            fb.dense(ti.ij, (n, n + 1)).place(self.v, self.mv)
+            self.ctype = ti.field(ti.i32)
+            self.q, self.r, self.pd, self.Ap, self.rhs = (ti.field(ti.f32) for _ in range(5))
+            fb.dense(ti.ij, (n, n)).place(self.ctype, self.q, self.r, self.pd, self.Ap, self.rhs)
+            self.cg = ti.field(ti.f32)
+            fb.dense(ti.i, 3).place(self.cg)
+            self.fp = ti.Vector.field(2, ti.f32)      # accélération de pression sur les nœuds du solide
+            fb.dense(ti.ij, (n, n)).place(self.fp)
         self._tree = fb.finalize()
 
         self.cells.from_numpy(cells)
         self.bc_v.from_numpy(np.stack([m["inlet_vx"], m["inlet_vy"]], axis=-1).astype(np.float32))
         self.t = 0.0
         self.last_step_ms = 0.0
+        self.cg_last_iters = 0
+        self.fluid_mode = 0                            # indice dans kernels.FLUID_MODES
+        self.scalar_max = 0.0                          # échelle de couleur, mise à jour dans stats()
+        self._inlet_speed = float(np.hypot(m["inlet_vx"], m["inlet_vy"]).max()) if self.has_inlet else 0.0
         self.set_params(p)
         self.reset()
 
@@ -154,11 +174,18 @@ class Solver:
         if self.has_inlet:
             speeds.append(float(np.hypot(self.bc_v.to_numpy()[..., 0], self.bc_v.to_numpy()[..., 1]).max()))
         self.dt = p["cfl"] * self.dx / max(speeds)
-        self.tau_D = max(p["tau_D"], 2.0 * self.dt)    # dD <= dt / tau_D doit rester < 1 par pas
+        # pas de temps propre du solide (ondes élastiques) : en incompressible, le fluide avance au pas
+        # d'advection et le solide est sous-cyclé à dt_solid
+        c_s = ((self.la_s + 2 * self.mu_s) / p["solid_rho"]) ** 0.5
+        self.dt_solid = p["cfl"] * self.dx / c_s
+        self.tau_D = max(p["tau_D"], 2.0 * min(self.dt, self.dt_solid))   # dD <= dt / tau_D doit rester < 1 par pas
 
     # ------------------------------------------------------------ cycle de vie
     def reset(self) -> None:
         """État initial : un transfert CPU -> GPU des positions semées, puis kernels d'initialisation."""
+        if self.incompressible:
+            self.q.fill(0.0)
+            self.fp.fill(0.0)
         self.x_f.from_numpy(self._x0f)
         self.v_f.from_numpy(self._v0f)
         K.init_pool(self.alive, self.x_f, self.C_f, self.J_f, self.n_fluid_init, self.free_stack, self.free_top)
@@ -172,7 +199,76 @@ class Solver:
             self._tree.destroy()
             self._tree = None
 
-    # ------------------------------------------------------------ simulation
+    # ------------------------------------------------------------ simulation (incompressible)
+    def _adapt_dt(self) -> None:
+        """Pas de temps d'advection : CFL sur la vitesse max (plus de limite acoustique)."""
+        p = self.p
+        vmax = max(float(M.max_speed(self.v_f, self.alive)), self._inlet_speed, 0.25)
+        dt = p["cfl"] * self.dx / vmax
+        if p["gravity"] > 0:
+            dt = min(dt, 0.5 * (self.dx / p["gravity"]) ** 0.5)
+        self.dt = dt
+
+    def _project(self) -> None:
+        """Projection de pression : `cg_iters` itérations de gradient conjugué, entièrement sur le GPU,
+        sans aucune lecture (le point de départ est la pression du sous-pas précédent)."""
+        p = self.p
+        M.cg_init(self.q, self.r, self.pd, self.rhs, self.u, self.v, self.ctype, self.cg, self.dx, p["n"])
+        for _ in range(p["cg_iters"]):
+            M.cg_apply(self.pd, self.Ap, self.ctype, self.cg, p["n"])
+            M.cg_update(self.q, self.r, self.pd, self.Ap, self.ctype, self.cg)
+        self.cg_last_iters = p["cg_iters"]
+        M.mac_project(self.u, self.v, self.q, self.ctype, self.dx, p["n"])
+
+    def _solid_substep(self, dt_s: float, with_pressure: bool) -> None:
+        """Un pas MPM du solide seul sur la grille collocalisée (+ accélération de pression du fluide)."""
+        p, dx, inv_dx, n, bound = self.p, self.dx, self.inv_dx, self.p["n"], self.p["bound"]
+        self.grid_m.fill(0.0)
+        self.grid_v.fill(0.0)
+        P2G_solid(self.grid_m, self.grid_v, self.x_s, self.v_s, self.C_s, self.F_s, self.D_s, self.broken_s,
+                  inv_dx, dt_s, dx, self.mu_s, self.la_s, self.p_mass_s, self.p_vol, p["k_res"])
+        K.grid_update(self.grid_m, self.grid_v, self.cells, self.bc_v, dt_s, p["gravity"], bound, n)
+        if with_pressure:
+            M.add_accel(self.grid_v, self.grid_m, self.fp, dt_s)
+        G2P_solid(self.grid_v, self.x_s, self.v_s, self.C_s, self.F_s, self.broken_s, inv_dx, dt_s, dx, bound)
+        if p["use_damage"]:
+            clear_eps(self.grid_e, self.grid_w)
+            scatter_eps(self.grid_e, self.grid_w, self.x_s, self.F_s, self.broken_s, inv_dx)
+            update_damage(self.grid_e, self.grid_w, self.x_s, self.F_s, self.D_s, self.broken_s,
+                          inv_dx, dt_s, p["eps0"], p["epsf"], self.tau_D, int(p["use_rupture"]))
+
+    def _substep_incompressible(self) -> None:
+        """Couplage partitionné : le solide (sous-cyclé à dt_solid) impose sa vitesse aux faces des cellules
+        qu'il occupe ; la pression du fluide lui renvoie −∇p sur ses nœuds de bord (Archimède, chargement)."""
+        p, dt, dx, inv_dx, n, bound = self.p, self.dt, self.dx, self.inv_dx, self.p["n"], self.p["bound"]
+        if self.has_solid:
+            n_in = max(1, int(np.ceil(dt / self.dt_solid)))
+            dt_s = dt / n_in
+            for _ in range(n_in):
+                self._solid_substep(dt_s, True)
+            # grille collocalisée du solide (masse + vitesse) pour les faces des cellules MOVING
+            self.grid_m.fill(0.0)
+            self.grid_v.fill(0.0)
+            P2G_solid(self.grid_m, self.grid_v, self.x_s, self.v_s, self.C_s, self.F_s, self.D_s, self.broken_s,
+                      inv_dx, dt_s, dx, self.mu_s, self.la_s, self.p_mass_s, self.p_vol, p["k_res"])
+            K.grid_update(self.grid_m, self.grid_v, self.cells, self.bc_v, 0.0, 0.0, bound, n)
+        M.mac_p2g(self.x_f, self.v_f, self.C_f, self.alive, self.u, self.v, self.mu, self.mv, inv_dx, dx)
+        M.mac_classify(self.ctype, self.cells, self.x_f, self.alive, self.x_s, int(self.has_solid),
+                       inv_dx, n, bound, int(p["free_surface"]))
+        M.mac_bc(self.u, self.v, self.ctype, self.cells, self.bc_v, self.grid_v, self.grid_m, dt, p["gravity"], n, 1)
+        self._project()
+        M.mac_bc(self.u, self.v, self.ctype, self.cells, self.bc_v, self.grid_v, self.grid_m, dt, p["gravity"], n, 0)
+        if self.has_solid:
+            M.pressure_force(self.fp, self.grid_m, self.q, self.ctype, inv_dx,
+                             -(p["fluid_rho"] / p["solid_rho"]) / dt, n)
+        M.mac_g2p(self.x_f, self.v_f, self.C_f, self.alive, self.u, self.v, self.mu, self.mv, inv_dx, dx)
+        K.advect_fluid(self.x_f, self.v_f, self.alive, self.cells, self.cell_count, inv_dx, dt, bound, dx,
+                       n, self.free_stack, self.free_top)
+        if self.has_inlet:
+            K.emit(self.x_f, self.v_f, self.C_f, self.J_f, self.alive, self.cells, self.bc_v, self.cell_count,
+                   p["ppc"] * p["ppc"], self.free_stack, self.free_top, dx, bound)
+
+    # ------------------------------------------------------------ simulation (faiblement compressible)
     def _substep(self) -> None:
         p, dt, dx, inv_dx, n, bound = self.p, self.dt, self.dx, self.inv_dx, self.p["n"], self.p["bound"]
         if self.has_fluid:
@@ -204,11 +300,17 @@ class Solver:
 
     def step(self, substeps: int | None = None) -> None:
         t0 = time.perf_counter()
-        for _ in range(substeps or self.p["substeps"]):
-            self._substep()
+        n_sub = substeps or self.p["substeps"]
+        if self.incompressible:
+            self._adapt_dt()
+            for _ in range(n_sub):
+                self._substep_incompressible()
+        else:
+            for _ in range(n_sub):
+                self._substep()
         ti.sync()
         self.last_step_ms = (time.perf_counter() - t0) * 1000.0
-        self.t += (substeps or self.p["substeps"]) * self.dt
+        self.t += n_sub * self.dt
 
     # ------------------------------------------------------------ lectures (GPU -> CPU à la demande)
     def stats(self) -> dict:
@@ -216,9 +318,18 @@ class Solver:
         if self.has_solid:
             s = solid_stats(self.D_s, self.broken_s)
             n_broken, d_max = int(s[0]), float(s[1])
-        return {"t": self.t, "dt": self.dt, "n_fluid": int(K.count_alive(self.alive)) if self.has_fluid else 0,
-                "capacity": self.capacity, "n_solid": self.n_solid, "n_broken": n_broken, "D_max": d_max,
-                "ms": self.last_step_ms}
+        st = {"t": self.t, "dt": self.dt, "n_fluid": int(K.count_alive(self.alive)) if self.has_fluid else 0,
+              "capacity": self.capacity, "n_solid": self.n_solid, "n_broken": n_broken, "D_max": d_max,
+              "ms": self.last_step_ms}
+        if self.incompressible:                        # diagnostics, lus seulement quand stats() est appelé
+            st["cg_iters"] = self.cg_last_iters
+            st["cg_rr"] = float(M.cg_residual(self.cg))
+            st["div_max"] = float(M.divergence_max(self.u, self.v, self.ctype, self.dx))
+        if self.has_fluid and self.fluid_mode > 0:    # échelle de couleur lissée (max de la quantité affichée)
+            m = float(K.scalar_absmax(self.sc_f, self.alive))
+            self.scalar_max = m if self.scalar_max <= 0 else 0.7 * self.scalar_max + 0.3 * m
+        st["scalar_max"] = self.scalar_max
+        return st
 
     def positions(self) -> np.ndarray:
         """(N, 2) positions des particules fluides vivantes."""
@@ -240,7 +351,16 @@ class Solver:
         if self.has_solid:
             solid_colors(self.F_s, self.D_s, self.broken_s, self.col_s, int(self.p["color_mode"]), self.p["epsf"])
         r_px = max(0, int(0.5 * self.p_spacing * res * scale + 0.5))
+        mode = int(self.fluid_mode)
+        if self.has_fluid and mode > 0:
+            if self.incompressible:
+                K.fluid_scalar_inc(mode, self.x_f, self.v_f, self.alive, self.u, self.v, self.q, self.sc_f,
+                                   self.p["fluid_rho"] / self.dt, self.inv_dx, self.p["n"])
+            else:
+                K.fluid_scalar_wc(mode, self.x_f, self.v_f, self.J_f, self.alive, self.grid_v, self.sc_f,
+                                  self.p["fluid_E"], self.inv_dx, self.p["n"])
         K.render(self.img, res, x0, y0, scale, self.cells, self.p["n"], int(grid), int(tint),
                  self.x_f, self.alive, int(self.has_fluid), 0.35, 0.65, 1.0, r_px,
+                 self.sc_f, mode, 1.0 / max(self.scalar_max, 1e-9),
                  self.x_s, self.col_s, int(self.has_solid), r_px)
         return self.img.to_numpy()

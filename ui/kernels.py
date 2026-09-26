@@ -182,11 +182,95 @@ def emit(x: ti.template(), v: ti.template(), C: ti.template(), J: ti.template(),
                     ti.atomic_add(free_top[0], 1)     # plus de slot libre : on rend ce qu'on a pris
 
 
-# ---------------------------------------------------------------- 6. rendu
+# ---------------------------------------------------------------- 6. quantité colorée du fluide
+# modes : 0 uniforme, 1 |v|, 2 vx, 3 vy, 4 pression, 5 vorticité (1 : échelle 0..max ; 2-5 : ±max)
+FLUID_MODES = ["uniforme", "vitesse |v|", "vx", "vy", "pression", "vorticité"]
+
+
+@ti.func
+def cmap_jet(t):
+    """0..1 -> bleu, cyan, jaune, rouge."""
+    r = ti.math.clamp(1.5 - ti.abs(4.0 * t - 3.0), 0.0, 1.0)
+    g = ti.math.clamp(1.5 - ti.abs(4.0 * t - 2.0), 0.0, 1.0)
+    b = ti.math.clamp(1.5 - ti.abs(4.0 * t - 1.0), 0.0, 1.0)
+    return ti.Vector([r, g, b])
+
+
+@ti.func
+def cmap_signed(t):
+    """0..1 (0.5 = zéro) -> bleu, blanc, rouge."""
+    blue = ti.Vector([0.15, 0.35, 1.0])
+    white = ti.Vector([0.95, 0.95, 0.95])
+    red = ti.Vector([1.0, 0.2, 0.1])
+    c = blue * (1.0 - 2.0 * t) + white * (2.0 * t)
+    if t > 0.5:
+        c = white * (2.0 - 2.0 * t) + red * (2.0 * t - 1.0)
+    return c
+
+
+@ti.kernel
+def fluid_scalar_wc(mode: int, x: ti.template(), v: ti.template(), J: ti.template(), alive: ti.template(),
+                    grid_v: ti.template(), sc: ti.template(), E: float, inv_dx: float, n: int):
+    """Quantité par particule, mode faiblement compressible (pression = E (1 - J), vorticité sur la grille)."""
+    for p in x:
+        if alive[p] == 1:
+            s = 0.0
+            if mode == 1:
+                s = v[p].norm()
+            elif mode == 2:
+                s = v[p].x
+            elif mode == 3:
+                s = v[p].y
+            elif mode == 4:
+                s = E * (1.0 - J[p])
+            elif mode == 5:
+                c = cell_of(x[p], inv_dx, n)
+                i, j = ti.math.clamp(c.x, 1, n - 2), ti.math.clamp(c.y, 1, n - 2)
+                s = (grid_v[i + 1, j].y - grid_v[i - 1, j].y - grid_v[i, j + 1].x + grid_v[i, j - 1].x) * 0.5 * inv_dx
+            sc[p] = s
+
+
+@ti.kernel
+def fluid_scalar_inc(mode: int, x: ti.template(), v: ti.template(), alive: ti.template(),
+                     u: ti.template(), vv: ti.template(), q: ti.template(), sc: ti.template(),
+                     rho_over_dt: float, inv_dx: float, n: int):
+    """Quantité par particule, mode incompressible (pression = q rho / dt, vorticité depuis les faces)."""
+    for p in x:
+        if alive[p] == 1:
+            s = 0.0
+            if mode == 1:
+                s = v[p].norm()
+            elif mode == 2:
+                s = v[p].x
+            elif mode == 3:
+                s = v[p].y
+            else:
+                c = cell_of(x[p], inv_dx, n)
+                i, j = ti.math.clamp(c.x, 1, n - 2), ti.math.clamp(c.y, 1, n - 2)
+                if mode == 4:
+                    s = q[i, j] * rho_over_dt
+                elif mode == 5:
+                    dvdx = ((vv[i + 1, j] + vv[i + 1, j + 1]) - (vv[i - 1, j] + vv[i - 1, j + 1])) * 0.25 * inv_dx
+                    dudy = ((u[i, j + 1] + u[i + 1, j + 1]) - (u[i, j - 1] + u[i + 1, j - 1])) * 0.25 * inv_dx
+                    s = dvdx - dudy
+            sc[p] = s
+
+
+@ti.kernel
+def scalar_absmax(sc: ti.template(), alive: ti.template()) -> ti.f32:
+    m = 0.0
+    for p in sc:
+        if alive[p] == 1:
+            ti.atomic_max(m, ti.abs(sc[p]))
+    return m
+
+
+# ---------------------------------------------------------------- 7. rendu
 @ti.kernel
 def render(img: ti.template(), res: int, x0: float, y0: float, scale: float,
            cells: ti.template(), n: int, grid_on: int, tint_on: int,
            x_f: ti.template(), alive: ti.template(), has_fluid: int, fr: float, fg: float, fb: float, r_f: int,
+           sc: ti.template(), fluid_mode: int, inv_smax: float,
            x_s: ti.template(), col_s: ti.template(), has_solid: int, r_s: int):
     """Image (res, res) u8 indexée [ligne, colonne], ligne 0 en haut (format QImage RGB888).
 
@@ -226,10 +310,15 @@ def render(img: ti.template(), res: int, x0: float, y0: float, scale: float,
         if has_fluid == 1 and alive[p] == 1:
             col = int((x_f[p].x - x0) / k)
             row = res - 1 - int((x_f[p].y - y0) / k)
+            cp = ti.Vector([fr, fg, fb])
+            if fluid_mode == 1:
+                cp = cmap_jet(ti.math.clamp(sc[p] * inv_smax, 0.0, 1.0))
+            elif fluid_mode > 1:
+                cp = cmap_signed(ti.math.clamp(0.5 + 0.5 * sc[p] * inv_smax, 0.0, 1.0))
             for a, b in ti.ndrange((-r_f, r_f + 1), (-r_f, r_f + 1)):
                 rr, cc = row + a, col + b
                 if 0 <= rr < res and 0 <= cc < res:
-                    img[rr, cc] = ti.cast(ti.Vector([fr, fg, fb]) * 255, ti.u8)
+                    img[rr, cc] = ti.cast(cp * 255, ti.u8)
 
     for p in x_s:
         if has_solid == 1:

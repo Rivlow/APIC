@@ -5,6 +5,7 @@ SimulationRunner  (runner.py)  définit la simulation : paramètres plats + matr
 Solver            (solver.py)  reçoit paramètres + matrices, alloue les champs Taichi, calcule, rend l'image
 UI                (ui.py)      fenêtre Qt : viewport zoomable, sélection de cellules, paramètres, fichiers
 kernels.py                     les kernels Taichi (fluide avec réservoir, grille, émission, rendu)
+kernels_inc.py                 mode incompressible : grille MAC + gradient conjugué sur GPU
 ```
 
 Les kernels solides (MLS-MPM corotationnel, endommagement, rupture) viennent de `Code_tuto/mpm_solid.py`,
@@ -69,6 +70,10 @@ silencieuse sur Vulkan, « illegal address » sur CUDA).
   solide jaune, obstacle gris, entrée vert, sortie rouge).
 - **Cellules** (dock droit) : sur la sélection, Eau / Solide / Obstacle / Entrée (vx, vy) / Sortie /
   Vitesse initiale / Effacer. Toute modification allume le bandeau orange : `Reset` (R) reconstruit.
+  Liste « Couleur du fluide » : uniforme, |v| (échelle 0…max, bleu → rouge), vx, vy, pression, vorticité
+  (échelle ±max, bleu / blanc / rouge). L'échelle est le max courant lissé, recalculé toutes les 6 images
+  (`Solver.fluid_mode`, `Solver.scalar_max`). Pression : E (1 − J) en compressible, q ρ / dt en
+  incompressible ; vorticité : rotationnel de la vitesse de grille à la cellule de la particule.
 - **Paramètres** (dock gauche) : formulaire généré depuis `PARAMS` ; les clés marquées `*` demandent un
   Reset, les autres agissent immédiatement (gravité, matériaux, CFL…).
 - Toolbar : Play/Pause (Espace), Step (S), Reset (R), Vue entière (F), Ouvrir / Enregistrer (JSON).
@@ -83,6 +88,41 @@ GPU ; une seule copie GPU → CPU par image affichée (≈ 0,6 ms à 700²). Sta
 
 Arch : Vulkan, puis CUDA, puis CPU ; forcer avec `APIC_UI_ARCH=cuda`. Pour déboguer un accès mémoire
 douteux, CUDA lève une erreur là où Vulkan corrompt silencieusement.
+
+## Mode incompressible (`incompressible=True`)
+
+Grille décalée MAC (`u` sur les faces verticales, `v` sur les
+horizontales), transfert APIC particules ↔ faces, projection de pression par gradient conjugué
+(`kernels_inc.py`) :
+
+- cellules : **air** (p = 0 : surface libre et sorties), **fluide** (inconnue), **solide** (bande de paroi,
+  obstacles, entrées : vitesse imposée sur les faces, Neumann) ;
+- système A q = −dx (u_e − u_w + v_n − v_s) sur les cellules fluides, A = laplacien à 5 points (un voisin
+  solide est exclu, un voisin air compte avec q = 0), puis u −= ∇q ;
+- `cg_iters` itérations fixes par sous-pas, entièrement sur le GPU (α, β et les produits scalaires
+  vivent dans un champ de 3 flottants ; aucune lecture dans la boucle). Point de départ : la pression du
+  sous-pas précédent. `stats()` donne `cg_rr` (résidu) et `div_max` (divergence) comme diagnostics ;
+- pas de temps : CFL d'advection sur la vitesse max (plus de limite acoustique), donc `substeps=2` à 4
+  suffisent au lieu de 20.
+
+**Couplage fluide-structure** (solide MPM + fluide incompressible), partitionné et explicite :
+- le solide garde son pas de temps élastique `dt_solid = cfl·dx/c_s` et est sous-cyclé à l'intérieur de
+  chaque pas d'advection du fluide (`_solid_substep`) ;
+- les cellules occupées par des particules solides sont classées `MOVING` : leurs faces reçoivent la
+  vitesse du solide (moyenne pondérée par la masse des deux nœuds de sa grille collocalisée), donc
+  non-pénétration et entraînement du fluide ; elles sont exclues du Laplacien comme un solide fixe ;
+- en retour, `pressure_force` calcule −∇p / ρ_s sur les nœuds massiques du solide (p = q ρ_f / dt, q pris
+  dans les cellules fluides voisines, 0 ailleurs) et cette accélération est appliquée à chaque sous-pas
+  du solide. Elle donne la poussée d'Archimède (vérifiée dans le smoke test) et le chargement
+  hydrodynamique (flexion du pont sous la chute d'eau : `pont_incompressible.json`).
+- Limites : couplage explicite, donc instable si le solide est beaucoup plus léger que le fluide avec un
+  grand pas fluide (masse ajoutée) ; quelques particules fluides peuvent se retrouver dans les cellules
+  solides (elles suivent alors la vitesse du solide) ; la surface du solide est résolue à la cellule près.
+
+Coût : ~0,5 ms par itération à 256² (limité par le lancement des kernels) ; 2 sous-pas × 150 itérations
+≈ 120 ms par image. Une lecture GPU → CPU coûte ~4 ms sur Vulkan : c'est pour ça que la boucle n'en fait
+aucune. Réduire `n` ou `cg_iters` pour l'interactivité ; 150 itérations donnent un résidu ~1e-9 à 256²
+grâce au démarrage à chaud.
 
 ## JSON
 

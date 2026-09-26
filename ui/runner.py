@@ -31,6 +31,7 @@ class SimulationRunner:
         "solid_rho": 2.0, "solid_E": 3000.0, "solid_nu": 0.3,
         "eps0": 0.05, "epsf": 0.2, "tau_D": 2e-3, "k_res": 1e-3,
         "use_damage": True, "use_rupture": True, "color_mode": 0,
+        "incompressible": False, "cg_iters": 150, "free_surface": True,
     }
     LABELS = {
         "n": "Grille n × n", "bound": "Cellules de bord", "ppc": "Particules / côté de cellule",
@@ -40,8 +41,10 @@ class SimulationRunner:
         "solid_rho": "Solide : densité", "solid_E": "Solide : module E", "solid_nu": "Solide : Poisson ν",
         "eps0": "ε0 (début endommagement)", "epsf": "εf (rupture)", "tau_D": "τ_D", "k_res": "Raideur résiduelle",
         "use_damage": "Endommagement", "use_rupture": "Rupture", "color_mode": "Couleur solide (0 dégât, 1 déformation)",
+        "incompressible": "Fluide incompressible (MAC + CG, fluide seul)", "cg_iters": "CG : itérations par sous-pas",
+        "free_surface": "Surface libre (cellule vide = air, p = 0)",
     }
-    STRUCTURAL = ("n", "bound", "ppc", "capacity", "seed", "res")
+    STRUCTURAL = ("n", "bound", "ppc", "capacity", "seed", "res", "incompressible")
     BOOL = ("fluid", "solid", "obstacle", "inlet", "outlet")
     FLOAT = ("vx0", "vy0", "inlet_vx", "inlet_vy")
 
@@ -127,7 +130,7 @@ class SimulationRunner:
 
     def resize(self, n: int) -> None:
         """Change la grille en rééchantillonnant toutes les matrices (plus proche voisin)."""
-        old = self.n
+        old = self.m["fluid"].shape[0]                # taille réelle des matrices (p["n"] peut déjà avoir changé)
         idx = np.minimum((np.arange(n) * old / n).astype(int), old - 1)
         self.m = {k: np.ascontiguousarray(v[idx][:, idx]) for k, v in self.m.items()}
         self.p["n"] = int(n)

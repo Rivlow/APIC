@@ -65,6 +65,37 @@ def main() -> int:
     assert len(x) == st["n_fluid"] and x.min() >= 0.0, "positions incohérentes"
     assert (x[:, 0] < 0.97).all(), "la sortie ne détruit pas"
     s.release()
+
+    # ---- incompressible : rupture de barrage, la divergence doit être ~0 après projection
+    r = SimulationRunner(n=64, incompressible=True, substeps=2, cg_iters=200)
+    r.set_fluid(r.rect(0.05, 0.05, 0.4, 0.6))
+    r.set_obstacle(r.circle(0.7, 0.2, 0.08))
+    s = r.solver()
+    for _ in range(15):
+        s.step()
+    st = s.stats()
+    x = s.positions()
+    print(f"[smoke] incompressible : t = {st['t']:.3f}  dt = {st['dt']:.2e}  cg = {st['cg_iters']} it  "
+          f"div max = {st['div_max']:.2e}  x moyen = {x[:, 0].mean():.3f}")
+    assert st["div_max"] < 1e-2, "projection non convergée"
+    assert x[:, 0].mean() > 0.23, "le barrage ne s'effondre pas"
+    assert np.isfinite(x).all() and x.max() <= 1.0
+    s.release()
+
+    # ---- incompressible + solide : poutre légère immergée, elle doit remonter (Archimède)
+    r = SimulationRunner(n=64, incompressible=True, substeps=2, cg_iters=150, solid_rho=0.5, solid_E=2000.0)
+    r.set_fluid(r.rect(0.05, 0.05, 0.95, 0.7))
+    r.set_solid(r.rect(0.35, 0.25, 0.65, 0.32))
+    s = r.solver()
+    y0 = s.solid_positions()[:, 1].mean()
+    for _ in range(25):
+        s.step()
+    st = s.stats()
+    y1 = s.solid_positions()[:, 1].mean()
+    print(f"[smoke] fluide-structure : t = {st['t']:.3f}  poutre y {y0:.3f} -> {y1:.3f}  D max {st['D_max']:.2f}  "
+          f"div max = {st['div_max']:.2e}")
+    assert np.isfinite(s.solid_positions()).all() and y1 > y0 + 0.01, "la poutre légère ne remonte pas"
+    s.release()
     print("[smoke] OK")
     return 0
 

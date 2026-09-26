@@ -12,10 +12,11 @@ import os
 import numpy as np
 from PySide6.QtCore import QRect, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QImage, QKeySequence, QPainter, QPen
-from PySide6.QtWidgets import (QApplication, QCheckBox, QDockWidget, QDoubleSpinBox, QFileDialog, QFormLayout,
-                               QGridLayout, QLabel, QMainWindow, QMessageBox, QPushButton, QScrollArea, QSpinBox,
-                               QToolBar, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDockWidget, QDoubleSpinBox, QFileDialog,
+                               QGridLayout, QHeaderView, QLabel, QMainWindow, QMessageBox, QPushButton, QSpinBox,
+                               QToolBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
+from ui.kernels import FLUID_MODES
 from ui.runner import SimulationRunner
 
 INT_RANGES = {"n": (16, 1024), "bound": (1, 16), "ppc": (1, 4), "substeps": (1, 1000), "seed": (0, 10**9),
@@ -180,9 +181,9 @@ class UI(QMainWindow):
         self.viewport.selectionChanged.connect(self._on_selection)
         self.viewport.hoverChanged.connect(lambda i, j, x, y: self.lbl_hover.setText(f"cellule ({i}, {j})  x={x:.3f} y={y:.3f}"))
 
-        self.statusBar().showMessage("Compilation des kernels…")
-        self.solver = runner.solver()
-        self.statusBar().clearMessage()
+        self.solver = None                                # construit après l'affichage de la fenêtre
+        self.statusBar().showMessage("Semis et compilation des kernels…")
+        QTimer.singleShot(0, self._rebuild)
         self._update_title()
 
         self.timer = QTimer(self)
@@ -192,43 +193,108 @@ class UI(QMainWindow):
 
         secs = os.environ.get("APIC_UI_AUTOQUIT")        # diagnostic sans intervention
         if secs:
-            self._set_playing(True)
             QTimer.singleShot(int(float(secs) * 1000), self._autoquit)
+            QTimer.singleShot(200, self._autoplay)
 
     # ------------------------------------------------------------ construction
+    def _make_editor(self, key: str):
+        default, value = SimulationRunner.PARAMS[key], self.runner.p[key]
+        if isinstance(default, bool):
+            w = QCheckBox()
+            w.setChecked(bool(value))
+            w.toggled.connect(lambda v, k=key: self._on_param(k, bool(v)))
+        elif isinstance(default, int):
+            w = QSpinBox()
+            w.setRange(*INT_RANGES.get(key, (0, 10**9)))
+            w.setValue(int(value))
+            w.setKeyboardTracking(False)
+            w.valueChanged.connect(lambda v, k=key: self._on_param(k, int(v)))
+        else:
+            w = QDoubleSpinBox()
+            w.setDecimals(6 if abs(default) < 0.01 else 3)
+            w.setRange(-1e6, 1e9)
+            w.setSingleStep(abs(default) / 10 if default else 0.1)
+            w.setValue(float(value))
+            w.setKeyboardTracking(False)
+            w.valueChanged.connect(lambda v, k=key: self._on_param(k, float(v)))
+        self._editors[key] = w
+        return w
+
     def _build_params_dock(self) -> None:
-        form_widget = QWidget()
-        form = QFormLayout(form_widget)
-        for key, default in SimulationRunner.PARAMS.items():
-            value = self.runner.p[key]
-            if isinstance(default, bool):
-                w = QCheckBox()
-                w.setChecked(bool(value))
-                w.toggled.connect(lambda v, k=key: self._on_param(k, bool(v)))
-            elif isinstance(default, int):
-                w = QSpinBox()
-                w.setRange(*INT_RANGES.get(key, (0, 10**9)))
-                w.setValue(int(value))
-                w.setKeyboardTracking(False)
-                w.valueChanged.connect(lambda v, k=key: self._on_param(k, int(v)))
-            else:
-                w = QDoubleSpinBox()
-                w.setDecimals(6 if abs(default) < 0.01 else 3)
-                w.setRange(-1e6, 1e9)
-                w.setSingleStep(abs(default) / 10 if default else 0.1)
-                w.setValue(float(value))
-                w.setKeyboardTracking(False)
-                w.valueChanged.connect(lambda v, k=key: self._on_param(k, float(v)))
-            self._editors[key] = w
-            label = SimulationRunner.LABELS.get(key, key)
-            form.addRow(label + (" *" if key in SimulationRunner.STRUCTURAL else ""), w)
-        form.addRow(QLabel("* : appliqué au Reset"))
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(form_widget)
+        """Arbre de paramètres rangé par dossiers ; les dossiers « État initial » et « Conditions aux
+        limites » résument les matrices courantes (mis à jour à chaque modification)."""
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(2)
+        self.tree.setHeaderLabels(["Paramètre", "Valeur"])
+        self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.tree.header().setStretchLastSection(True)
+
+        def folder(parent, name):
+            item = QTreeWidgetItem(parent or self.tree, [name])
+            item.setExpanded(True)
+            item.setFirstColumnSpanned(True) if parent is None else None
+            return item
+
+        def add_params(parent, keys):
+            for key in keys:
+                label = SimulationRunner.LABELS.get(key, key) + (" *" if key in SimulationRunner.STRUCTURAL else "")
+                item = QTreeWidgetItem(parent, [label])
+                self.tree.setItemWidget(item, 1, self._make_editor(key))
+
+        add_params(folder(None, "Domaine"), ["n", "bound", "ppc", "res", "seed", "capacity"])
+        add_params(folder(None, "Solveur"), ["cfl", "substeps", "gravity", "incompressible", "free_surface",
+                                             "cg_iters", "use_damage", "use_rupture", "color_mode"])
+        mats = folder(None, "Matériaux")
+        add_params(folder(mats, "Fluide"), ["fluid_rho", "fluid_E"])
+        add_params(folder(mats, "Solide"), ["solid_rho", "solid_E", "solid_nu", "eps0", "epsf", "tau_D", "k_res"])
+        self.item_ic = folder(None, "État initial")
+        self.item_bc = folder(None, "Conditions aux limites")
+        note = QTreeWidgetItem(self.tree, ["* : appliqué au Reset"])
+        note.setFirstColumnSpanned(True)
+        self._refresh_summaries()
+
         dock = QDockWidget("Paramètres", self)
-        dock.setWidget(scroll)
+        dock.setWidget(self.tree)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, dock)
+        self.resizeDocks([dock], [360], Qt.Orientation.Horizontal)
+
+    def _refresh_summaries(self) -> None:
+        """Dossiers « État initial » et « Conditions aux limites » d'après les matrices du runner."""
+        m, p = self.runner.m, self.runner.p
+        for item in (self.item_ic, self.item_bc):
+            item.takeChildren()
+
+        def row(parent, name, text):
+            QTreeWidgetItem(parent, [name, text])
+
+        def vel_groups(mask, vx, vy):
+            """Regroupe les cellules d'un masque par vitesse (vx, vy) identique."""
+            if not mask.any():
+                return []
+            pairs = np.stack([vx[mask], vy[mask]], axis=1)
+            uniq, counts = np.unique(pairs, axis=0, return_counts=True)
+            return [((float(a), float(b)), int(c)) for (a, b), c in zip(uniq, counts)]
+
+        n_f, n_s = int(m["fluid"].sum()), int(m["solid"].sum())
+        row(self.item_ic, "Fluide", f"{n_f} cellules" if n_f else "aucune")
+        for (vx, vy), c in vel_groups(m["fluid"], m["vx0"], m["vy0"]):
+            if vx or vy:
+                row(self.item_ic, "   vitesse", f"({vx:g}, {vy:g}) sur {c} cellules")
+        row(self.item_ic, "Solide", f"{n_s} cellules" if n_s else "aucune")
+        for (vx, vy), c in vel_groups(m["solid"], m["vx0"], m["vy0"]):
+            if vx or vy:
+                row(self.item_ic, "   vitesse", f"({vx:g}, {vy:g}) sur {c} cellules")
+
+        row(self.item_bc, "Parois", f"glissantes, bande de {p['bound']} cellules")
+        n_o = int(m["obstacle"].sum())
+        row(self.item_bc, "Obstacles", f"{n_o} cellules" if n_o else "aucun")
+        groups = vel_groups(m["inlet"], m["inlet_vx"], m["inlet_vy"])
+        if not groups:
+            row(self.item_bc, "Entrées", "aucune")
+        for k, ((vx, vy), c) in enumerate(groups, start=1):
+            row(self.item_bc, f"Entrée {k}", f"v = ({vx:g}, {vy:g}), {c} cellules")
+        n_out = int(m["outlet"].sum())
+        row(self.item_bc, "Sorties", f"{n_out} cellules (p = 0, particules détruites)" if n_out else "aucune")
 
     def _build_cells_dock(self) -> None:
         w = QWidget()
@@ -262,9 +328,17 @@ class UI(QMainWindow):
         self.chk_grid.setChecked(True)
         self.chk_tint = QCheckBox("Teintes des cellules initiales")
         self.chk_tint.setChecked(True)
-        grid.addWidget(self.chk_grid, 3 + len(actions), 0, 1, 2)
-        grid.addWidget(self.chk_tint, 4 + len(actions), 0, 1, 2)
-        grid.setRowStretch(5 + len(actions), 1)
+        base = 3 + len(actions)
+        grid.addWidget(self.chk_grid, base, 0, 1, 2)
+        grid.addWidget(self.chk_tint, base + 1, 0, 1, 2)
+        grid.addWidget(QLabel("Couleur du fluide"), base + 2, 0)
+        self.combo_color = QComboBox()
+        self.combo_color.addItems(FLUID_MODES)
+        self.combo_color.currentIndexChanged.connect(self._on_color_mode)
+        grid.addWidget(self.combo_color, base + 2, 1)
+        self.lbl_scale = QLabel("")
+        grid.addWidget(self.lbl_scale, base + 3, 0, 1, 2)
+        grid.setRowStretch(base + 4, 1)
         dock = QDockWidget("Cellules", self)
         dock.setWidget(w)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
@@ -304,14 +378,23 @@ class UI(QMainWindow):
 
     # ------------------------------------------------------------ boucle
     def _tick(self) -> None:
+        if self.solver is None:
+            return
         if self.playing:
             self.solver.step()
         vp = self.viewport
+        self.solver.fluid_mode = self.combo_color.currentIndex()
         img = self.solver.render(vp.x0, vp.y0, vp.scale, self.chk_grid.isChecked(), self.chk_tint.isChecked())
         vp.set_image(img)
         self._frames += 1
         if self._frames % 6 == 0:
             st = self.solver.stats()
+            mode = self.solver.fluid_mode
+            if mode == 0:
+                self.lbl_scale.setText("")
+            else:
+                rng = f"0 … {st['scalar_max']:.3g}" if mode == 1 else f"−{st['scalar_max']:.3g} … +{st['scalar_max']:.3g}"
+                self.lbl_scale.setText(f"échelle : {rng} (auto)")
             self.lbl_time.setText(f"t = {st['t']:.3f} s   dt = {st['dt']:.2e}")
             cap = f" / {st['capacity']}" if st["capacity"] != st["n_fluid"] else ""
             self.lbl_particles.setText(f"fluide {st['n_fluid']}{cap}   solide {st['n_solid']}   "
@@ -319,10 +402,16 @@ class UI(QMainWindow):
             self.lbl_perf.setText(f"{self.solver.arch} · {st['ms']:.1f} ms/image" if self.playing else f"{self.solver.arch} · pause")
 
     def _rebuild(self) -> None:
-        self.statusBar().showMessage("Construction des champs et compilation des kernels…")
+        self.statusBar().showMessage("Semis et compilation des kernels…")
         self.statusBar().repaint()
-        self.solver.release()
-        self.solver = self.runner.solver()
+        QApplication.processEvents()                      # laisse la fenêtre se peindre avant le calcul bloquant
+        if self.solver is not None:
+            self.solver.release()
+            self.solver = None
+        solver = self.runner.solver()
+        solver.step(1)                                    # compile les kernels de simulation maintenant,
+        solver.reset()                                    # pas au premier clic sur Play
+        self.solver = solver
         self.viewport.n = self.runner.n
         self.dirty = False
         self.banner.hide()
@@ -331,11 +420,12 @@ class UI(QMainWindow):
     def _mark_dirty(self) -> None:
         self.dirty = True
         self.banner.show()
+        self._refresh_summaries()
         self._update_title(modified=True)
 
     # ------------------------------------------------------------ actions
     def _set_playing(self, on: bool) -> None:
-        self.playing = bool(on)
+        self.playing = bool(on) and self.solver is not None
         if self.act_play.isChecked() != self.playing:
             self.act_play.blockSignals(True)
             self.act_play.setChecked(self.playing)
@@ -348,10 +438,11 @@ class UI(QMainWindow):
         self._set_playing(False)
         if self.dirty:
             self._rebuild()
-        self.solver.step()
+        if self.solver is not None:
+            self.solver.step()
 
     def _reset(self) -> None:
-        if self.dirty:
+        if self.dirty or self.solver is None:
             self._rebuild()
         else:
             self.solver.reset()
@@ -365,8 +456,13 @@ class UI(QMainWindow):
             self._mark_dirty()
         else:
             self.runner.p[key] = value
-            self.solver.set_params({key: value})
+            if self.solver is not None:
+                self.solver.set_params({key: value})
             self._update_title(modified=True)
+
+    def _on_color_mode(self, _index: int) -> None:
+        if self.solver is not None:
+            self.solver.scalar_max = 0.0             # l'échelle se recalcule sur la nouvelle quantité
 
     def _vel(self) -> tuple[float, float]:
         return self.spin_vx.value(), self.spin_vy.value()
@@ -402,6 +498,7 @@ class UI(QMainWindow):
         self.viewport.sel = None
         self.viewport.reset_view()
         self._on_selection(None)
+        self._refresh_summaries()
         self._rebuild()
         self._update_title()
 
@@ -434,12 +531,19 @@ class UI(QMainWindow):
         self.setWindowTitle(f"{name}{'*' if modified else ''} — APIC / MPM")
 
     # ------------------------------------------------------------ fin
+    def _autoplay(self) -> None:
+        if self.solver is None:
+            QTimer.singleShot(200, self._autoplay)
+        else:
+            self._set_playing(True)
+
     def _autoquit(self) -> None:
-        st = self.solver.stats()
+        st = self.solver.stats() if self.solver is not None else {}
         print(f"[diag] frames={self._frames} stats={st} view={self.viewport.scale}", flush=True)
         self.close()
 
     def closeEvent(self, event) -> None:
         self.timer.stop()
-        self.solver.release()
+        if self.solver is not None:
+            self.solver.release()
         super().closeEvent(event)
