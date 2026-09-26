@@ -1,0 +1,1263 @@
+% tuto_mpm_beton.tex -- Tutoriel : reproduire le comportement du béton armé en MPM
+% Compiler avec pdfLaTeX (Overleaf : compilateur par défaut). Les images tuto_beton_*.png doivent
+% se trouver dans le même dossier.
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[french]{babel}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc}
+\usepackage{listings}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue!60!black,urlcolor=blue!60!black}
+
+% ---------------------------------------------------------------- style des listings
+\definecolor{codebg}{RGB}{247,247,250}
+\definecolor{codekw}{RGB}{0,80,160}
+\definecolor{codecomment}{RGB}{90,120,90}
+\definecolor{codestring}{RGB}{160,60,20}
+\lstset{
+  language=Python,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{codekw}\bfseries,
+  commentstyle=\color{codecomment}\itshape,
+  stringstyle=\color{codestring},
+  backgroundcolor=\color{codebg},
+  frame=single, framerule=0pt, rulecolor=\color{codebg},
+  xleftmargin=6pt, xrightmargin=6pt,
+  breaklines=true, breakatwhitespace=true,
+  showstringspaces=false, tabsize=4,
+  columns=fullflexible, keepspaces=true,
+  literate=
+    {é}{{\'e}}1 {è}{{\`e}}1 {ê}{{\^e}}1 {ë}{{\"e}}1
+    {à}{{\`a}}1 {â}{{\^a}}1 {î}{{\^i}}1 {ï}{{\"i}}1
+    {ô}{{\^o}}1 {ù}{{\`u}}1 {û}{{\^u}}1 {ç}{{\c{c}}}1
+    {É}{{\'E}}1 {È}{{\`E}}1 {À}{{\`A}}1 {œ}{{\oe}}1
+}
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+\newcommand{\bm}[1]{\boldsymbol{#1}}
+\newcommand{\tr}{\operatorname{tr}}
+
+\title{Le béton armé en MPM :\\ reproduire le comportement d'une poutre de la Rance}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent Un solide MPM dont on se contente de régler un seuil d'endommagement à 5~\% et une rupture
+à 20~\% de déformation se comporte comme un caoutchouc : il fléchit de façon spectaculaire, puis
+se pulvérise. Le béton, lui, fissure vers $10^{-4}$, s'écrase vers $4\cdot10^{-3}$, résiste
+treize fois moins bien en traction qu'en compression, et ne travaille jamais seul : il est armé. Ce
+tutoriel reprend les lois de comportement simplifiées de l'article de Cremona et Houde sur les
+poutres de la Rance (loi de Desayi en compression, raidissement en traction, acier bilinéaire,
+résistances aléatoires) et les traduit en MPM : endommagement unilatéral par direction principale,
+armatures noyées dans les particules, essai de flexion 4 points piloté en déplacement. Le résultat
+est comparé à une analyse de section à la manière de l'article. On y décrit aussi ce qui n'a pas
+marché.
+\end{abstract}
+
+\tableofcontents
+\bigskip
+
+% ================================================================
+\section{Pourquoi le solide paraissait flasque}
+
+Le solveur du tutoriel précédent (\code{tuto_mpm_solide}) utilise une loi corotationnelle avec un
+seuil d'endommagement $\varepsilon_0 = 0.05$ et une rupture à $\varepsilon_f = 0.20$, un module
+d'Young sans unité, et on le charge en multipliant la gravité. Comparé à l'article, c'est un autre
+matériau :
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+ & modèle précédent & béton (article, poutre 421) \\
+\midrule
+début de l'endommagement en traction & $0.05$ & $\varepsilon_{cr} = f_{cr}/E_c \approx 1.2\cdot10^{-4}$ \\
+rapport au modèle précédent & & $\div 430$ \\
+déformation d'écrasement & $0.20$ (rupture) & $\varepsilon_{cu} = 4\cdot10^{-3}$ ($\div 50$) \\
+résistance traction / compression & $1$ (critère symétrique) & $3.5/47.1 \approx 0.074$ \\
+après fissuration & la raideur tend vers 0 & l'acier prend le relais (plateau) \\
+chargement & $g$ multiplié par un facteur & vérins en déplacement imposé \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Un béton qui attendrait $5$~\% de déformation avant de s'endommager n'existe pas : c'est ce qui
+donnait la sensation de \og flasque \fg{}. Il ne suffit donc pas de raidir le module : il faut des
+seuils réalistes, une loi propre à chaque sens de sollicitation, des armatures, et un essai
+piloté comme en laboratoire.
+
+% ================================================================
+\section{Ce que l'article apporte}
+
+L'article modélise des poutres en béton armé ou précontraint (section de $200\times200$~mm) avec
+des outils de résistance des matériaux : analyse de section (couches de béton et d'acier), puis
+intégration des courbures le long de la poutre. On en retient les ingrédients suivants.
+
+\paragraph{Béton en compression (Desayi/Neville).} Avec $\varepsilon_{ult} = 1.8\,f_c/E_c$ la
+déformation au pic,
+\begin{equation}
+  \sigma = \frac{-2\,\varepsilon\, f_c}{\varepsilon_{ult}\,\big(1 + (\varepsilon/\varepsilon_{ult})^2\big)},
+  \qquad \varepsilon_{cu} = -0.004 .
+  \label{eq:desayi}
+\end{equation}
+
+\paragraph{Béton en traction (raidissement).} Linéaire jusqu'à la résistance $f_{cr}$, puis
+\begin{equation}
+  \sigma = \frac{f_{cr}}{1 + \sqrt{500\,\varepsilon}} .
+  \label{eq:tension}
+\end{equation}
+Cette décroissance lente représente l'apport du béton qui entoure les barres entre les
+fissures (\emph{tension stiffening}, Collins et Mitchell).
+
+\paragraph{Acier.} Loi bilinéaire, élastique jusqu'à $f_y$, puis parfaitement plastique, symétrique
+en traction et en compression, jusqu'à $\pm0.02$ (au-delà, l'article considère la barre rompue).
+
+\paragraph{Aléa.} Les résistances sont tirées au hasard (Monte-Carlo, lois lognormales
+indépendantes pour rester positives). Le tableau~3 de l'article donne moyenne et écart type de
+chaque poutre.
+
+\paragraph{Essai.} Flexion 4 points sur appuis simples : portée $L = 2.00$~m, charges espacées de
+$x_p = 0.60$~m des appuis (moment constant sur $0.80$~m au centre). Les poutres du type 4 ont
+quatre lits d'armatures (tableau~2 de l'article) ; on prend ici les données de la poutre 421
+($f_c = 47.1$~MPa, $f_{cr} = 3.5$~MPa, $E_c = 30.4$~GPa).
+
+\paragraph{Ce que l'article ne fait pas} (et nous non plus) : les cycles de chargement sont
+traités comme un chargement monotone, la corrosion est laissée de côté ici, et la précontrainte n'est
+pas reprise (poutre passive).
+
+% ================================================================
+\section{De la résistance des matériaux au MPM}
+
+La RDM raisonne sur une \emph{section} et une loi uniaxiale $\sigma(\varepsilon)$ ; le MPM travaille
+sur des \emph{particules} qui portent un gradient de déformation $\mathbf F$ (2D). Il faut donc
+traduire chaque ingrédient :
+
+\begin{center}
+\begin{tabular}{@{}p{5.3cm}p{9.5cm}@{}}
+\toprule
+Article (RDM) & Ici (MPM) \\
+\midrule
+couches de béton d'une section & particules ; les lois s'appliquent par \emph{direction principale} \\
+loi non linéaire $\sigma(\varepsilon)$ & raideur \emph{sécante} $r(\kappa)$ pilotée par la plus grande déformation $\kappa$ atteinte (historique, irréversible) \\
+traction et compression différentes & deux facteurs $r_t$ et $r_c$, choisis selon le signe de la contrainte principale \\
+barres d'armature & fraction volumique d'acier $\phi$ dans une rangée de particules, loi de barre uniaxiale \\
+effet raidisseur & on garde la loi~\eqref{eq:tension} telle quelle \\
+Monte-Carlo & résistances lognormales tirées \emph{par particule} \\
+essai 4 points & appuis glissants, vérins en vitesse imposée, mesure de la réaction $P$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ================================================================
+\section{Le modèle de matériau}
+
+\subsection{Contraintes élastiques principales}
+
+À chaque pas, on décompose $\mathbf F = \mathbf U\,\mathrm{diag}(s_1, s_2)\,\mathbf V^{\mathsf T}$ (SVD,
+\code{ti.svd}) et on prend les déformations de Hencky $e_i = \ln s_i$. La contrainte élastique
+principale (déformations planes, coefficients de Lamé $\mu$ et $\lambda$) est
+\begin{equation}
+  \sigma_i^{\rm el} = 2\mu\, e_i + \lambda\,(e_1 + e_2),\qquad i = 1, 2 ,
+\end{equation}
+et la contrainte de Kirchhoff déposée sur la grille vaut $\bm\tau = \sum_i \sigma_i\,\mathbf u_i\mathbf u_i^{\mathsf T}$
+où $\mathbf u_i$ sont les colonnes de $\mathbf U$. Sans endommagement, $\sigma_i = \sigma_i^{\rm el}$.
+
+\subsection{Déformation équivalente : un critère en contrainte}
+
+Pour décider si le béton est sollicité en traction ou en compression, on utilise
+\begin{equation}
+  \varepsilon_t = \frac{\max(\sigma_1^{\rm el},\, \sigma_2^{\rm el},\, 0)}{E_c},
+  \qquad
+  \varepsilon_c = \frac{\max(-\sigma_1^{\rm el},\, -\sigma_2^{\rm el},\, 0)}{E_c}.
+\end{equation}
+C'est un critère de Rankine écrit en déformation : sous compression uniaxiale, la contrainte
+transversale est nulle, donc $\varepsilon_t = 0$. Un critère sur la plus grande \emph{déformation}
+principale détecterait de la traction dans une zone comprimée, par effet Poisson (le béton comprimé
+s'allonge dans la direction transverse), et risquerait de produire de fausses fissures sous les
+vérins (choix de conception, non comparé). On ajoute l'historique irréversible
+\begin{equation}
+  \kappa_t \leftarrow \max(\kappa_t, \bar\varepsilon_t),\qquad
+  \kappa_c \leftarrow \max(\kappa_c, \bar\varepsilon_c),
+\end{equation}
+où la barre désigne la valeur lissée sur la grille (\S\ref{sec:nonlocal}).
+
+\subsection{Raideurs sécantes}
+
+Les lois~\eqref{eq:desayi} et~\eqref{eq:tension} deviennent des facteurs multiplicatifs
+$r = \sigma_{\rm loi}(\kappa)/(E_c\,\kappa)$ de la contrainte élastique. En traction, avec
+$\varepsilon_{cr} = f_{cr}/E_c$ :
+\begin{equation}
+  r_t(\kappa) =
+  \begin{cases}
+    1 & \kappa \le \varepsilon_{cr},\\[2pt]
+    \min\!\Big(1,\ \dfrac{f_{cr}}{(1+\sqrt{500\,\kappa})\,E_c\,\kappa}\Big) & \kappa > \varepsilon_{cr},
+  \end{cases}
+  \qquad r_t \ge r_{\min} = 10^{-3}.
+\end{equation}
+En compression, avec $x = \kappa/\varepsilon_{ult}$ :
+\begin{equation}
+  r_c(\kappa) = \min\!\Big(1,\ \frac{2/1.8}{1 + x^2}\Big),
+\end{equation}
+puis, au-delà de $\varepsilon_{cu} = 4\cdot10^{-3}$, une décroissance linéaire jusqu'à
+$r_{\rm crush} = 0.1$ sur $[\varepsilon_{cu},\,1.5\,\varepsilon_{cu}]$. Deux remarques :
+\begin{itemize}
+  \item la tangente initiale de la loi de Desayi vaut $2f_c/\varepsilon_{ult} \approx 1.11\,E_c$,
+        donc supérieure à $E_c$ : le \code{min(1, ...)} conserve un début linéaire de module exact $E_c$ ;
+  \item l'article coupe la contrainte à $\varepsilon_{cu}$ ; on adoucit sur $[\varepsilon_{cu}, 1.5\varepsilon_{cu}]$
+        pour ne pas créer de saut de contrainte d'une particule à l'autre.
+\end{itemize}
+Valeurs (poutre 421, $E_c = 30.4$~GPa, $f_c = 47.1$ et $f_{cr} = 3.5$~MPa) :
+
+\begin{center}
+\begin{tabular}{@{}rrr@{\qquad}rrr@{}}
+\toprule
+\multicolumn{3}{c}{traction} & \multicolumn{3}{c}{compression} \\
+$\kappa$ & $\sigma$ (MPa) & $r_t$ & $\kappa$ & $\sigma$ (MPa) & $r_c$ \\
+\midrule
+$2\cdot10^{-4}$ & 2.66 & 0.437 & $10^{-3}$ & 29.9 & 0.985 \\
+$5\cdot10^{-4}$ & 2.33 & 0.154 & $2\cdot10^{-3}$ & 44.6 & 0.734 \\
+$10^{-3}$ & 2.05 & 0.067 & $2.79\cdot10^{-3}$ (pic) & 47.1 & 0.556 \\
+$1.5\cdot10^{-3}$ & 1.88 & 0.041 & $4\cdot10^{-3}$ & 44.2 & 0.363 \\
+$10^{-2}$ & 1.08 & 0.004 & $5\cdot10^{-3}$ & 27.6 & 0.182 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Unilatéralité : les fissures se referment}
+
+Chaque contrainte principale reçoit le facteur de \emph{son} signe :
+\begin{equation}
+  \sigma_i = \begin{cases} r_t(\kappa_t)\ \sigma_i^{\rm el} & \sigma_i^{\rm el} > 0,\\[2pt]
+                            r_c(\kappa_c)\ \sigma_i^{\rm el} & \sigma_i^{\rm el} \le 0. \end{cases}
+\end{equation}
+Une particule fissurée en traction ($r_t \approx 0$) garde donc sa raideur en compression : la
+fissure se referme quand on recharge dans l'autre sens, comme dans le béton réel.
+
+\subsection{Lissage non local}
+\label{sec:nonlocal}
+
+On reprend sans changement l'idée du tutoriel précédent : $\varepsilon_t$ et $\varepsilon_c$ sont
+déposés sur la grille (moyenne pondérée par les poids B-spline) puis relus, ce qui donne une
+déformation lissée sur environ cinq cellules. Sans ce lissage, chaque particule s'endommage seule et
+la fissure n'a pas de largeur. Ici la largeur vaut quelques $\Delta x = 1.56$~cm, du même ordre que
+l'espacement des fissures de flexion sur une section de $20$~cm.
+
+\subsection{Les armatures}
+
+Les barres d'un lit ne sont pas maillées : la rangée de particules située à leur hauteur porte une
+fraction volumique d'acier $\phi$ (matériau composite, comme une \og nappe d'armatures \fg{} d'un
+calcul aux éléments finis). L'aire d'acier par mètre de profondeur est $A_s/b$ ; pour un espacement
+de particules $\Delta_p = \Delta x/2 = 7.8$~mm,
+\[
+  \phi = \frac{A_s/b}{\Delta_p}.
+\]
+Les lits du type 4 (tableau~2 de l'article) donnent ($b = 0.2$~m) :
+
+\begin{center}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+lit & hauteur (mm) & $A_s$ (mm$^2$) & rangée de particules & $\phi$ \\
+\midrule
+4 (bas) & 19 & $4\times113.1$ & 2 & 0.290 \\
+3 & 72 & $2\times56.5$ & 9 & 0.072 \\
+2 & 128 & $2\times56.5$ & 16 & 0.072 \\
+1 (haut) & 181 & $4\times113.1$ & 23 & 0.290 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Sur la particule armée, la contrainte est la moyenne pondérée entre béton et barre :
+\begin{equation}
+  \bm\tau = (1-\phi)\,\bm\tau_{\rm béton} + \phi\,\sigma_s\ \mathbf n\otimes\mathbf n,
+  \qquad \mathbf n = \frac{\mathbf F\mathbf e_x}{|\mathbf F\mathbf e_x|},\qquad
+  \varepsilon_s = \ln|\mathbf F\mathbf e_x| .
+\end{equation}
+La barre suit la direction $x$ du matériau (elle tourne avec $\mathbf F$). Sa loi est élastique
+parfaitement plastique ; la plasticité utilise un retour radial avec une variable d'état
+$\varepsilon_p$ :
+\begin{equation}
+  \sigma_s^{\rm essai} = E_s(\varepsilon_s - \varepsilon_p),\quad
+  \sigma_s = \operatorname{clamp}(\sigma_s^{\rm essai},\,-f_y,\,f_y),\quad
+  \varepsilon_p \leftarrow \varepsilon_p + \frac{\sigma_s^{\rm essai} - \sigma_s}{E_s}.
+\end{equation}
+Les barres sont supposées parfaitement adhérentes : elles partagent la vitesse nodale du béton.
+
+\subsection{Résistances aléatoires}
+
+Chaque particule reçoit ses propres $f_{cr}$ et $f_c$, lognormales de moyenne celle du
+tableau~3 de l'article et de coefficients de variation $0.26$ ($0.9/3.5$) et $0.11$ ($5.1/47.1$) :
+\[
+  X = m\,\exp\!\big(\sigma_{\ln}\,z - \tfrac12\sigma_{\ln}^2\big),\quad z\sim\mathcal N(0,1),\quad
+  \sigma_{\ln} = \sqrt{\ln(1 + c_v^2)},
+\]
+tronquée pour éviter les valeurs aberrantes. Le tirage est reproductible (\code{random_seed=1}).
+Il casse la symétrie parfaite : sans lui, toutes les particules d'une même fibre fissureraient au
+même pas.
+
+% ================================================================
+\section{Pièges numériques}
+
+\subsection{Unités et pas de temps}
+
+Tout est en unités SI (m, kg, s, Pa). La poutre de $2.4$~m est placée dans un domaine de
+$3\times0.625$~m ($192\times40$ n\oe uds, $\Delta x = 1.56$~cm), soit $7\,982$ particules
+($307\times26$). Le pas de temps explicite doit tenir compte de la raideur \emph{axiale}
+maximale, béton plus acier :
+\[
+  c_{\max} = \sqrt{\frac{\lambda + 2\mu + \phi_{\max} E_s}{\rho}} \approx 6.5\ \mathrm{km/s}
+  \quad(c_p \text{ du béton seul : } 3.75\ \mathrm{km/s}),\qquad
+  \Delta t = 0.3\,\frac{\Delta x}{c_{\max}} \approx 7\cdot10^{-7}\ \mathrm{s}.
+\]
+
+\subsection{Précision en \code{float32}}
+
+Une déformation de $10^{-4}$ (fissuration) se joue à la quatrième décimale de $\mathbf F$, et un
+pas de temps de $7\cdot10^{-7}$~s ajoute à $\mathbf F$ des incréments de l'ordre de $10^{-8}$ à $10^{-7}$,
+soit la précision relative de \code{float32} autour de $1$ ($\approx 6\cdot10^{-8}$). Le code stocke donc
+$\mathbf F_m = \mathbf F - \mathbf I$ (petit, donc précis) et le déplacement $\mathbf u = \mathbf x - \mathbf X_0$ plutôt
+que les positions ; on reconstruit $\mathbf F$ et $\mathbf x$ au moment de s'en servir :
+\begin{lstlisting}
+Fm[p] += dt * C_new @ (I + Fm[p])       # dF/dt = (grad v) F  <=>  Fm <- Fm + dt C (I + Fm)
+Up[p] += dt * v_s[p]                    # x = X0 + Up
+\end{lstlisting}
+C'est un raisonnement de précaution : nous n'avons pas mesuré l'erreur qu'on obtiendrait sans cela.
+
+\subsection{Appuis et vérins glissants}
+
+Une première version imposait une vitesse \emph{nulle} aux n\oe uds des appuis et une vitesse
+imposée aux n\oe uds des vérins, dans toutes les directions. La poutre était alors partiellement
+encastrée : la raideur mesurée valait environ $270$~kN/mm, contre environ $43$~kN/mm avec des
+contacts glissants, où seule la composante normale est contrainte :
+\begin{lstlisting}
+if mask[i, j] == 1 and grid_v[i, j].y < 0:            # appui : la poutre ne peut pas descendre
+    grid_v[i, j].y = 0.0
+...
+if in_plateau and grid_v[i, j].y > -v_load:           # verin : plateau qui descend a v_load
+    react[None] += grid_m[i, j] * (grid_v[i, j].y + v_load) / dt
+    grid_v[i, j].y = -v_load
+\end{lstlisting}
+La force que le vérin exerce est la quantité de mouvement qu'il doit retirer aux n\oe uds pour
+imposer sa vitesse, $\sum_i m_i\,(v_{i,y} + v_{\rm load})/\Delta t$, accumulée dans \code{react}
+et moyennée sur les pas d'une image. Elle est \emph{par mètre de profondeur} ; on multiplie par
+la largeur $b = 0.2$~m pour obtenir des kN.
+
+\subsection{Essai quasi statique}
+
+On pilote les vérins en déplacement (vitesse $0.2$~m/s par défaut, soit $25$~mm en $\approx0.13$~s),
+avec une montée en vitesse en \emph{smoothstep} sur $20$~ms, pour ne pas donner un choc à la poutre.
+D'après une estimation d'ordre de grandeur, l'énergie cinétique de la poutre devient petite devant
+l'énergie de déformation une fois la poutre chargée ; au début de l'essai, l'inertie fausse un peu la
+raideur (voir les résultats). Un
+amortissement de grille de $100$~s$^{-1}$ éteint les vibrations.
+
+% ================================================================
+\section{Le code, pas à pas}
+
+Le programme complet (\code{MpM/beton.py}) est en annexe. On en commente ici les morceaux
+qui portent la physique.
+
+\subsection{Lois sécantes}
+
+\begin{lstlisting}
+@ti.func
+def r_tension(kap, fcr_i):
+    r = 1.0
+    if kap > fcr_i / E_c:
+        r = ti.min(1.0, fcr_i / (1.0 + ti.sqrt(500.0 * kap)) / (E_c * kap))
+    return ti.max(r, r_min)
+
+@ti.func
+def r_compression(kap, fc_i):
+    x = kap / (1.8 * fc_i / E_c)
+    r = ti.min(1.0, (2.0 / 1.8) / (1.0 + x * x))
+    if kap > eps_cu:
+        t = ti.min((kap - eps_cu) / (0.5 * eps_cu), 1.0)
+        r = r * (1.0 - t) + r_crush * t
+    return ti.max(r, r_min)
+\end{lstlisting}
+
+\subsection{Contrainte de Kirchhoff}
+
+\begin{lstlisting}
+@ti.func
+def stress_kirchhoff(F, kt, kc, ph, ep, fcr_i, fc_i, nl: int):
+    U, sig, V = ti.svd(F)
+    e1 = ti.log(ti.max(sig[0, 0], 0.05))
+    e2 = ti.log(ti.max(sig[1, 1], 0.05))
+    tr = e1 + e2
+    s1 = 2.0 * mu_c * e1 + la_c * tr                 # contraintes elastiques principales
+    s2 = 2.0 * mu_c * e2 + la_c * tr
+    if nl == 1:                                      # facteur selon le signe (unilateral)
+        rt = r_tension(kt, fcr_i)
+        rc = r_compression(kc, fc_i)
+        if s1 > 0.0: s1 *= rt
+        else:        s1 *= rc
+        if s2 > 0.0: s2 *= rt
+        else:        s2 *= rc
+    S = ti.Matrix([[s1, 0.0], [0.0, s2]])
+    tau = U @ S @ U.transpose()
+    if ph > 0.0:                                     # particule armee : barre uniaxiale
+        n = ti.Vector([F[0, 0], F[1, 0]])
+        lam = n.norm()
+        n = n / lam
+        ss = E_s * ti.log(lam)
+        if nl == 1:
+            ss = ti.math.clamp(E_s * (ti.log(lam) - ep), -fy, fy)
+        tau = (1.0 - ph) * tau + ph * ss * n.outer_product(n)
+    return tau
+\end{lstlisting}
+Le paramètre \code{nl} bascule entre le modèle \emph{élastique linéaire} (touche 1) et le modèle
+\emph{béton armé non linéaire} (touche 2).
+
+\subsection{Lissage et historique}
+
+\code{scatter_eps} calcule $\varepsilon_t$ et $\varepsilon_c$ par particule et les dépose sur la grille ;
+\code{update_state} les relit, met à jour $\kappa_t$, $\kappa_c$ (jamais décroissants) et la plasticité de
+l'acier :
+\begin{lstlisting}
+kap_t[p] = ti.max(kap_t[p], et)
+kap_c[p] = ti.max(kap_c[p], ec)
+if phi[p] > 0.0:
+    eps = ti.log(ti.Vector([Fm[p][0, 0] + 1.0, Fm[p][1, 0]]).norm())
+    trial = E_s * (eps - eps_p[p])
+    ss = ti.math.clamp(trial, -fy, fy)
+    eps_p[p] += (trial - ss) / E_s                    # retour radial
+\end{lstlisting}
+
+\subsection{Un pas de temps}
+
+\begin{lstlisting}
+def substep(v_load, model):
+    s = smoothstep(State.t)                 # montee en charge progressive
+    v_eff = v_load * s
+    nl = 1 if model >= 2 else 0
+    clear_grid()
+    P2G_solid(dt, nl)
+    grid_update(dt, g * s, v_eff, State.u)  # appuis, verins, reaction
+    G2P_solid(dt)
+    if nl == 1:
+        scatter_eps()
+        update_state()
+    State.t += dt
+    State.u += v_eff * dt                   # course des verins
+\end{lstlisting}
+
+% ================================================================
+\section{Résultats}
+
+\subsection{Courbe charge--flèche}
+
+\begin{center}
+\includegraphics[width=0.78\linewidth]{tuto_beton_courbe.png}
+\end{center}
+
+La courbe en tirets est l'analyse de section de \code{MpM/beton_section.py}, qui applique les mêmes lois
+à la manière de l'article (couches de béton, quatre lits d'acier, courbure intégrée le long de la
+poutre) et s'arrête au pic du moment. Chiffres relevés (charge $P$ totale en kN) :
+
+\begin{center}
+\begin{tabular}{@{}lrrrrrrr@{}}
+\toprule
+flèche à mi-portée (mm) & 0.5 & 1 & 2 & 3 & 5 & 10 & 15 \\
+\midrule
+MPM & 29.1 & 44.1 & 65.1 & 84.7 & 124.5 & 131.0 & 123.7 \\
+analyse de section & 20.8 & 33.3 & 51.5 & 68.1 & 101.0 & 110.5 & 113.1 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Trois régimes apparaissent, comme sur les courbes de l'article : une phase élastique
+(pente initiale de l'analyse de section : $41.5$~kN/mm), une phase fissurée de raideur réduite, où
+l'acier prend le relais du béton tendu, puis un \emph{plateau} de plastification des aciers
+tendus. Dans l'analyse de section, le plateau est à $113$~kN (moment $34$~kN\,m) ; le MPM le
+dépasse d'environ $16$~\% ($\approx131$~kN). À $25$~mm de course de vérin, aucune particule n'a
+atteint $\varepsilon_{cu}$ : le béton comprimé n'est pas encore écrasé, donc on ne voit pas la
+ruine, seulement le début de l'adoucissement (charge autour de $115$ à $120$~kN).
+
+\paragraph{Écarts et ce qu'on peut en dire.} Le MPM est plus raide au début (pente $\approx 54$~kN/mm
+mesurée entre $0.15$ et $0.45$~mm, pour $41.5$ en section). Nous avons vérifié qu'à vitesse de
+vérin plus faible ($0.05$~m/s), avec le modèle élastique linéaire, la pente descend à
+$38$--$48$~kN/mm : une partie de l'écart vient donc de l'inertie et de la montée en charge. Les
+autres écarts (plateau plus haut de $16$~\%, transition plus tardive) ne sont pas élucidés ici ;
+pistes plausibles, non testées : la loi de raidissement~\eqref{eq:tension} appliquée à tout le
+béton tendu (dans l'article, elle ne concerne que la zone proche des barres), les déformations planes
+($E/(1-\nu^2)$), et la modélisation d'une barre par une simple rangée de particules. Notons que
+l'article observe aussi une surestimation systématique de la capacité portante. Un pic isolé de
+$138$~kN vers $17$~mm est un artefact numérique (une seule série de pas).
+
+\subsection{Cartes d'endommagement et de contraintes}
+
+Couleurs du mode \og endommagement \fg{} : gris (intact) $\to$ jaune (béton fissuré) $\to$ rouge
+($d_t = 1 - r_t > 0.95$), cyan si la compression est endommagée, violet si écrasé ; les lits
+d'acier sont bleus, et oranges lorsqu'ils ont plastifié.
+
+\begin{center}
+\includegraphics[width=\linewidth]{tuto_beton_endo_a.png}\\[2pt]
+\includegraphics[width=\linewidth]{tuto_beton_endo_b.png}
+\end{center}
+
+En haut, course de vérin de $4$~mm (flèche $5.1$~mm, $P = 125$~kN) : les premières fissures de
+flexion (rouge) sont dans la fibre inférieure, sur toute la zone de moment constant, avec une
+bande jaune au-dessus. En bas, course de $14$~mm (flèche $16.4$~mm, $P = 118$~kN) : la zone
+fissurée a gagné presque toute la hauteur au centre, avec des limites obliques dans les travées
+d'effort tranchant, et les lits d'armatures inférieurs sont orange (plastifiés) dans la zone centrale. La
+fissuration est \emph{diffuse} : on voit une zone endommagée épaisse, pas des fissures isolées
+(voir les limites).
+
+Le mode \og contrainte principale \fg{} (touche Espace) montre la traction en rouge sous
+l'axe neutre et la compression en bleu au-dessus, le diagramme de flexion classique :
+
+\begin{center}
+\includegraphics[width=\linewidth]{tuto_beton_contrainte_a.png}
+\end{center}
+
+% ================================================================
+\section{Ce qui n'a pas marché}
+
+\paragraph{Rupture cohésive : instable.} Le tutoriel précédent faisait passer une particule
+totalement endommagée à l'état \og rompu \fg{} (perte de cohésion, allongements principaux écrêtés à $1$).
+Appliqué ici (rupture dès que $\kappa_t \ge 1.5\cdot10^{-3}$ pour le béton non armé, écrasement
+à $\kappa_c \ge \varepsilon_{cu}$), le calcul se déroulait normalement jusqu'à $P \approx 112$~kN, puis
+la fissuration se propageait sur toute la hauteur en quelques pas : la vitesse maximale des
+particules passait de $0.14$ à plus de $50$~m/s, la flèche de $4.5$ à $50$~mm en $5$~ms et la
+poutre était pulvérisée. Ce n'est pas une rupture de barre : en désactivant la rupture des
+barres, l'effondrement était identique. En revanche, le modèle sans rupture cohésive (endommagement
+unilatéral seul, celui décrit plus haut) est stable sur toute la course. Le mécanisme de
+la rupture cohésive, pertinent pour un solide qui doit se \emph{fragmenter}, est donc retiré ici.
+La cause exacte de l'instabilité n'a pas été établie ; l'hypothèse la plus probable est la perte
+brutale des $\approx 20$~kN que fournissait le béton tendu (raidissement) au moment où la fissure traverse
+la zone tendue, l'énergie libérée étant amplifiée par l'écrêtage de $\mathbf F$.
+
+\paragraph{Appuis collants.} Voir plus haut : $270$~kN/mm au lieu de $43$~kN/mm.
+
+\paragraph{Rupture des barres à $2$~\%.} Nous n'avons pas implémenté la rupture des barres à
+$\varepsilon = 0.02$. Cette valeur de l'article est une déformation \emph{moyenne} d'une section, alors
+que dans une simulation où la fissure se localise sur une ou deux colonnes de particules, la
+déformation de la barre y dépasse $2$~\% presque immédiatement. Il faudrait la lisser sur une longueur
+d'adhérence ; ce n'est pas fait, et sans elle, la poutre ne \og casse \fg{} qu'en compression.
+
+\paragraph{Rate limiting.} Le paramètre $\tau_D$ (vitesse d'endommagement limitée) du tutoriel précédent
+n'est pas repris : l'essai étant piloté en déplacement, il n'a pas été nécessaire. Ce n'est pas
+démontré pour un chargement dynamique.
+
+% ================================================================
+\section{Limites et pour aller plus loin}
+
+\begin{enumerate}
+  \item \textbf{Fissuration diffuse.} Le modèle est un modèle de fissures \emph{réparties} (comme
+        l'article, qui calcule des courbures moyennes par section). Pour des fissures discrètes,
+        il faudrait un critère de rupture avec énergie de fissuration régularisée, ou une
+        méthode dédiée (CPIC, réseau de liaisons).
+  \item \textbf{Ruine.} Aucune particule n'a atteint $\varepsilon_{cu}$ sur les $25$~mm simulés : la ruine
+        par écrasement du béton comprimé n'a pas été observée. Il faut prolonger la course des vérins
+        (le comportement après $\varepsilon_{cu}$ n'est donc pas validé).
+  \item \textbf{Poutres précontraintes.} L'article traite aussi la précontrainte (pré- et
+        post-tension, loi empirique de Collins et Mitchell). Elle s'ajouterait comme une déformation
+        initiale dans les rangées d'acier.
+  \item \textbf{Cycles et écrouissage.} Non pris en compte ici ni dans l'article.
+  \item \textbf{2D en déformations planes.} Une barre est une rangée de particules, non un cylindre ;
+        le confinement des étriers et l'adhérence acier--béton (glissement) sont ignorés.
+  \item \textbf{Monte-Carlo.} On tire une réalisation. Pour retrouver une moyenne et un écart type de
+        capacité portante comme dans l'article, il faut lancer beaucoup de tirages (\code{random_seed} variable) ;
+        chaque essai coûte quelques minutes.
+\end{enumerate}
+
+\paragraph{Expériences.} Pour vérifier que chaque ingrédient joue son rôle, essayez :
+\begin{itemize}
+  \item mettre \code{cv_fcr = 0} : les fissures de la fibre inférieure naissent plus régulièrement ;
+  \item supprimer les armatures (\code{phi_np[:] = 0}) : la poutre n'a plus de plateau et perd sa
+        capacité peu après la fissuration ;
+  \item passer à $f_{cr} = 7$~MPa ou à $E_c$ différent ;
+  \item augmenter la vitesse des vérins (curseur) pour voir apparaître les effets dynamiques ;
+  \item comparer touche~1 (élastique) et touche~2 (béton armé) à la même charge.
+\end{itemize}
+
+% ================================================================
+\appendix
+\section{Code complet : \texttt{MpM/beton.py}}
+
+\begin{lstlisting}
+# MpM/beton.py -- Poutre en béton armé en flexion 4 points, MLS-MPM 2D
+#
+# Inspiré de Cremona & Houde, "Modélisation déterministe et probabiliste du comportement
+# mécanique simplifié des corps d'épreuve" (poutres de la Rance) :
+#   - béton en compression : loi de Desayi/Neville, écrasement vers -0.004
+#   - béton en traction    : linéaire jusqu'à fcr, puis fcr / (1 + sqrt(500 eps))  (raidissement)
+#   - acier                : bilinéaire (élastique parfaitement plastique)
+#   - résistances aléatoires par particule (lois lognormales, comme dans l'approche Monte-Carlo)
+#   - essai de flexion 4 points sur appuis simples, portée 2 m, charges à 0.6 m des appuis
+#
+# Unités SI (m, kg, s, Pa). Le calcul est 2D en déformations planes : les efforts sont par mètre de
+# profondeur ; on les multiplie par la largeur de la poutre b = 0.2 m pour retrouver des kN.
+#
+# Lancer :  python MpM/beton.py                 (fenêtre interactive)
+#           python MpM/beton.py --headless 25   (course de vérin 25 mm, écrit beton_courbe.csv)
+
+import sys
+import numpy as np
+import taichi as ti
+
+ti.init(arch=ti.gpu, random_seed=1)
+
+# ---------------------------------------------------------------- domaine (rectangle Lx x Ly)
+Lx, Ly = 3.0, 0.625
+nx, ny = 192, 40
+dx = Lx / nx                          # 1.56 cm
+inv_dx = 1.0 / dx
+bound = 3
+render_substep = 50
+
+# ---------------------------------------------------------------- béton (poutre 421 de la Rance)
+rho_c = 2400.0
+E_c = 30.4e9                          # module d'Young
+nu_c = 0.2
+fc = 47.1e6                           # résistance en compression
+fcr = 3.5e6                           # résistance en traction
+cv_fc, cv_fcr = 0.11, 0.26            # coefficients de variation (écart type / moyenne, tableau 3)
+eps_cu = 0.004                        # déformation d'écrasement
+r_min = 1e-3                          # raideur résiduelle en traction (béton fissuré)
+r_crush = 0.1                         # raideur résiduelle en compression (béton écrasé)
+mu_c = E_c / (2 * (1 + nu_c))
+la_c = E_c * nu_c / ((1 + nu_c) * (1 - 2 * nu_c))
+
+# ---------------------------------------------------------------- acier d'armature
+E_s = 230e9
+fy = 309e6                            # limite d'élasticité
+
+# ---------------------------------------------------------------- amortissement et chargement
+damp = 100.0                          # amortissement de la vitesse de grille (1/s)
+g = 9.81
+t_ramp = 0.02                         # durée de la montée en charge (s)
+b_depth = 0.2                         # largeur de la poutre (m) : passage N/m -> N
+
+# ---------------------------------------------------------------- géométrie
+beam_x0, beam_x1 = 0.3, 2.7           # la poutre fait 2.4 m
+beam_y0 = 0.25
+xs1, xs2 = 0.5, 2.5                   # appuis : portée 2.0 m
+xp1, xp2 = 1.1, 1.9                   # charges à 0.6 m des appuis
+hw = 0.05                             # demi-largeur des appuis et des vérins
+h_target = 0.2
+
+p_spacing = 0.5 * dx                  # 2 x 2 particules par cellule
+p_vol = p_spacing ** 2
+p_mass = p_vol * rho_c
+n_px = int(round((beam_x1 - beam_x0) / p_spacing))
+n_py = int(round(h_target / p_spacing))
+n_solid = n_px * n_py
+h_beam = n_py * p_spacing
+beam_y1 = beam_y0 + h_beam
+x_mid = 0.5 * (xs1 + xs2)
+
+# lits d'armatures du type 4 de l'article : (distance à la base en m, aire totale en m2)
+rebars = [(0.019, 4 * 113.1e-6), (0.072, 2 * 56.5e-6), (0.128, 2 * 56.5e-6), (0.181, 4 * 113.1e-6)]
+phi_np = np.zeros(n_py, dtype=np.float32)
+for dist, area in rebars:
+    phi_np[int(dist / p_spacing)] += (area / b_depth) / p_spacing      # fraction volumique d'acier
+phi_max = float(phi_np.max())
+
+# pas de temps explicite : dt < dx / c avec la raideur axiale maximale (béton + acier)
+c_max = ((la_c + 2 * mu_c + phi_max * E_s) / rho_c) ** 0.5
+dt = 0.3 * dx / c_max
+
+sl_cr = float(np.log(1 + cv_fcr ** 2) ** 0.5)      # écarts types des logarithmes (lognormale)
+sl_fc = float(np.log(1 + cv_fc ** 2) ** 0.5)
+
+# ---------------------------------------------------------------- champs
+X0 = ti.Vector.field(2, ti.f32, n_solid)          # position initiale
+Up = ti.Vector.field(2, ti.f32, n_solid)          # déplacement (x = X0 + Up, voir précision float32)
+v_s = ti.Vector.field(2, ti.f32, n_solid)
+C_s = ti.Matrix.field(2, 2, ti.f32, n_solid)      # matrice affine APIC
+Fm = ti.Matrix.field(2, 2, ti.f32, n_solid)       # F - I (l'écart à l'identité garde la précision)
+kap_t = ti.field(ti.f32, n_solid)                 # plus grande déformation de traction équivalente
+kap_c = ti.field(ti.f32, n_solid)                 # plus grande déformation de compression équivalente
+phi = ti.field(ti.f32, n_solid)                   # fraction volumique d'acier de la particule
+eps_p = ti.field(ti.f32, n_solid)                 # déformation plastique de l'acier
+fcr_p = ti.field(ti.f32, n_solid)                 # résistance en traction de la particule
+fc_p = ti.field(ti.f32, n_solid)                  # résistance en compression de la particule
+phi_row = ti.field(ti.f32, n_py)
+phi_row.from_numpy(phi_np)
+
+grid_v = ti.Vector.field(2, ti.f32, (nx, ny))
+grid_m = ti.field(ti.f32, (nx, ny))
+grid_et = ti.field(ti.f32, (nx, ny))              # déformation de traction lissée (non local)
+grid_ec = ti.field(ti.f32, (nx, ny))
+grid_w = ti.field(ti.f32, (nx, ny))
+mask = ti.field(ti.i32, (nx, ny))                 # 1 = appui
+react = ti.field(ti.f32, ())                      # réaction des vérins (N/m)
+
+W, H = 1200, 250
+Image = ti.Vector.field(3, ti.f32, (W, H))
+
+
+# ---------------------------------------------------------------- lois de comportement
+@ti.func
+def r_tension(kap, fcr_i):
+    """Raideur sécante en traction : 1 avant fissuration, puis fcr/(1+sqrt(500 eps)) / (E eps)."""
+    r = 1.0
+    if kap > fcr_i / E_c:
+        r = ti.min(1.0, fcr_i / (1.0 + ti.sqrt(500.0 * kap)) / (E_c * kap))
+    return ti.max(r, r_min)
+
+
+@ti.func
+def r_compression(kap, fc_i):
+    """Raideur sécante en compression : loi de Desayi, puis écrasement progressif après eps_cu."""
+    x = kap / (1.8 * fc_i / E_c)
+    r = ti.min(1.0, (2.0 / 1.8) / (1.0 + x * x))
+    if kap > eps_cu:
+        t = ti.min((kap - eps_cu) / (0.5 * eps_cu), 1.0)
+        r = r * (1.0 - t) + r_crush * t
+    return ti.max(r, r_min)
+
+
+@ti.func
+def stress_kirchhoff(F, kt, kc, ph, ep, fcr_i, fc_i, nl: int):
+    """Contrainte de Kirchhoff : béton (Hencky, raideurs sécantes par direction principale)
+    + acier (barre uniaxiale suivant la direction x du matériau, élastique parfaitement plastique)."""
+    U, sig, V = ti.svd(F)
+    e1 = ti.log(ti.max(sig[0, 0], 0.05))
+    e2 = ti.log(ti.max(sig[1, 1], 0.05))
+    tr = e1 + e2
+    s1 = 2.0 * mu_c * e1 + la_c * tr
+    s2 = 2.0 * mu_c * e2 + la_c * tr
+    if nl == 1:
+        rt = r_tension(kt, fcr_i)
+        rc = r_compression(kc, fc_i)
+        if s1 > 0.0:
+            s1 *= rt
+        else:
+            s1 *= rc
+        if s2 > 0.0:
+            s2 *= rt
+        else:
+            s2 *= rc
+    S = ti.Matrix([[s1, 0.0], [0.0, s2]])
+    tau = U @ S @ U.transpose()
+    if ph > 0.0:
+        n = ti.Vector([F[0, 0], F[1, 0]])
+        lam = n.norm()
+        n = n / lam
+        ss = E_s * ti.log(lam)
+        if nl == 1:
+            ss = ti.math.clamp(E_s * (ti.log(lam) - ep), -fy, fy)
+        tau = (1.0 - ph) * tau + ph * ss * n.outer_product(n)
+    return tau
+
+
+# ---------------------------------------------------------------- 1. particules -> grille
+@ti.kernel
+def P2G_solid(dt: float, nl: int):
+    for p in X0:
+        xp = X0[p] + Up[p]
+        base = (xp * inv_dx - 0.5).cast(int)
+        fx = xp * inv_dx - base
+        w = [0.5 * (1.5 - fx)**2, 0.75 - (fx - 1.0)**2, 0.5 * (fx - 0.5)**2]
+
+        F = ti.Matrix.identity(ti.f32, 2) + Fm[p]
+        tau = stress_kirchhoff(F, kap_t[p], kap_c[p], phi[p], eps_p[p], fcr_p[p], fc_p[p], nl)
+        affine = (-dt * p_vol * 4.0 * inv_dx * inv_dx) * tau + p_mass * C_s[p]
+
+        for i, j in ti.static(ti.ndrange(3, 3)):
+            offset = ti.Vector([i, j])
+            d_pos = (offset - fx) * dx
+            weight = w[i].x * w[j].y
+            grid_m[base + offset] += weight * p_mass
+            grid_v[base + offset] += weight * (p_mass * v_s[p] + affine @ d_pos)
+
+
+# ---------------------------------------------------------------- 2. grille : appuis, vérins
+@ti.kernel
+def grid_update(dt: float, g_eff: float, v_load: float, u_load: float):
+    for i, j in grid_m:
+        if grid_m[i, j] > 0:
+            grid_v[i, j] /= grid_m[i, j]
+            grid_v[i, j] *= 1.0 - damp * dt
+            grid_v[i, j].y -= dt * g_eff
+
+            if i < bound and grid_v[i, j].x < 0:
+                grid_v[i, j].x = 0.0
+            if i > nx - bound and grid_v[i, j].x > 0:
+                grid_v[i, j].x = 0.0
+            if j < bound and grid_v[i, j].y < 0:
+                grid_v[i, j].y = 0.0
+            if j > ny - bound and grid_v[i, j].y > 0:
+                grid_v[i, j].y = 0.0
+
+            # appuis : contact glissant sans frottement (seule la composante normale est contrainte)
+            if mask[i, j] == 1 and grid_v[i, j].y < 0:
+                grid_v[i, j].y = 0.0
+
+            # vérins : plateaux glissants qui descendent à la vitesse v_load (composante normale imposée),
+            # noeuds situés sous la face inférieure des plateaux
+            pos = ti.Vector([i, j]) * dx
+            if (ti.abs(pos.x - xp1) <= hw or ti.abs(pos.x - xp2) <= hw) and pos.y >= beam_y1 - u_load:
+                if grid_v[i, j].y > -v_load:
+                    react[None] += grid_m[i, j] * (grid_v[i, j].y + v_load) / dt    # force sur la poutre
+                    grid_v[i, j].y = -v_load
+
+
+@ti.kernel
+def init_mask():
+    for i, j in mask:
+        pos = ti.Vector([i, j]) * dx
+        support = (ti.abs(pos.x - xs1) <= hw or ti.abs(pos.x - xs2) <= hw) and pos.y <= beam_y0
+        mask[i, j] = 1 if support else 0
+
+
+# ---------------------------------------------------------------- 3. grille -> particules
+@ti.kernel
+def G2P_solid(dt: float):
+    I = ti.Matrix.identity(ti.f32, 2)
+    for p in X0:
+        xp = X0[p] + Up[p]
+        base = (xp * inv_dx - 0.5).cast(int)
+        fx = xp * inv_dx - base
+        w = [0.5 * (1.5 - fx)**2, 0.75 - (fx - 1.0)**2, 0.5 * (fx - 0.5)**2]
+
+        v_new = ti.Vector.zero(ti.f32, 2)
+        C_new = ti.Matrix.zero(ti.f32, 2, 2)
+        for i, j in ti.static(ti.ndrange(3, 3)):
+            offset = ti.Vector([i, j])
+            d_pos = (offset - fx) * dx
+            weight = w[i].x * w[j].y
+            v_new += weight * grid_v[base + offset]
+            C_new += weight * grid_v[base + offset].outer_product(d_pos) * (4.0 * inv_dx * inv_dx)
+        v_s[p] = v_new
+        C_s[p] = C_new
+
+        # F = I + Fm, dF/dt = (grad v) F   ->   Fm <- Fm + dt C (I + Fm)
+        Fm[p] += dt * C_new @ (I + Fm[p])
+
+        Up[p] += dt * v_s[p]
+        xn = X0[p] + Up[p]
+        xc = ti.math.clamp(xn, ti.Vector([bound * dx, bound * dx]),
+                           ti.Vector([Lx - bound * dx, Ly - bound * dx]))
+        Up[p] += xc - xn
+
+
+# ---------------------------------------------------------------- 4. endommagement non local
+@ti.kernel
+def clear_grid():
+    for i, j in grid_m:
+        grid_v[i, j] = [0.0, 0.0]
+        grid_m[i, j] = 0.0
+        grid_et[i, j] = 0.0
+        grid_ec[i, j] = 0.0
+        grid_w[i, j] = 0.0
+
+
+@ti.kernel
+def scatter_eps():
+    """Étale sur la grille les déformations équivalentes (contrainte principale élastique / E)."""
+    for p in X0:
+        xp = X0[p] + Up[p]
+        base = (xp * inv_dx - 0.5).cast(int)
+        fx = xp * inv_dx - base
+        w = [0.5 * (1.5 - fx)**2, 0.75 - (fx - 1.0)**2, 0.5 * (fx - 0.5)**2]
+
+        Us, sg, Vs = ti.svd(ti.Matrix.identity(ti.f32, 2) + Fm[p])
+        e1 = ti.log(ti.max(sg[0, 0], 0.05))
+        e2 = ti.log(ti.max(sg[1, 1], 0.05))
+        s1 = 2.0 * mu_c * e1 + la_c * (e1 + e2)
+        s2 = 2.0 * mu_c * e2 + la_c * (e1 + e2)
+        et = ti.max(ti.max(s1, s2), 0.0) / E_c
+        ec = ti.max(ti.max(-s1, -s2), 0.0) / E_c
+
+        for i, j in ti.static(ti.ndrange(3, 3)):
+            weight = w[i].x * w[j].y
+            node = base + ti.Vector([i, j])
+            grid_et[node] += weight * et
+            grid_ec[node] += weight * ec
+            grid_w[node] += weight
+
+
+@ti.kernel
+def update_state():
+    """Historique de déformation (irréversible) du béton, plasticité de l'acier."""
+    for p in X0:
+        xp = X0[p] + Up[p]
+        base = (xp * inv_dx - 0.5).cast(int)
+        fx = xp * inv_dx - base
+        w = [0.5 * (1.5 - fx)**2, 0.75 - (fx - 1.0)**2, 0.5 * (fx - 0.5)**2]
+
+        et = 0.0
+        ec = 0.0
+        for i, j in ti.static(ti.ndrange(3, 3)):
+            node = base + ti.Vector([i, j])
+            if grid_w[node] > 0:
+                weight = w[i].x * w[j].y
+                et += weight * grid_et[node] / grid_w[node]
+                ec += weight * grid_ec[node] / grid_w[node]
+        kap_t[p] = ti.max(kap_t[p], et)
+        kap_c[p] = ti.max(kap_c[p], ec)
+
+        if phi[p] > 0.0:
+            eps = ti.log(ti.Vector([Fm[p][0, 0] + 1.0, Fm[p][1, 0]]).norm())
+            trial = E_s * (eps - eps_p[p])
+            ss = ti.math.clamp(trial, -fy, fy)
+            eps_p[p] += (trial - ss) / E_s                  # retour radial : écoulement plastique
+
+
+# ---------------------------------------------------------------- initialisation, mesures
+@ti.kernel
+def init_beam():
+    for p in X0:
+        i = p % n_px
+        j = p // n_px
+        X0[p] = [beam_x0 + (i + 0.5) * p_spacing, beam_y0 + (j + 0.5) * p_spacing]
+        Up[p] = [0.0, 0.0]
+        v_s[p] = [0.0, 0.0]
+        C_s[p] = ti.Matrix.zero(ti.f32, 2, 2)
+        Fm[p] = ti.Matrix.zero(ti.f32, 2, 2)
+        kap_t[p] = 0.0
+        kap_c[p] = 0.0
+        eps_p[p] = 0.0
+        phi[p] = phi_row[j]
+        # résistances aléatoires par particule : lognormales de moyenne fcr, fc
+        fcr_p[p] = fcr * ti.min(ti.max(ti.exp(sl_cr * ti.randn() - 0.5 * sl_cr**2), 0.3), 3.0)
+        fc_p[p] = fc * ti.min(ti.max(ti.exp(sl_fc * ti.randn() - 0.5 * sl_fc**2), 0.5), 2.0)
+
+
+@ti.kernel
+def bottom_mid_uy() -> ti.types.vector(2, ti.f32):
+    """Somme et nombre des déplacements verticaux de la fibre inférieure à mi-portée."""
+    s = 0.0
+    n = 0.0
+    for p in X0:
+        if p // n_px == 0 and ti.abs(X0[p].x - x_mid) < 0.1:
+            s += Up[p].y
+            n += 1.0
+    return ti.Vector([s, n])
+
+
+@ti.kernel
+def damage_counts() -> ti.types.vector(2, ti.f32):
+    """Nombre de particules de béton fissurées (d_t > 0.9) et écrasées (eps_c > eps_cu)."""
+    nt = 0.0
+    nc = 0.0
+    for p in X0:
+        if phi[p] == 0.0:
+            if 1.0 - r_tension(kap_t[p], fcr_p[p]) > 0.9:
+                nt += 1.0
+            if kap_c[p] > eps_cu:
+                nc += 1.0
+    return ti.Vector([nt, nc])
+
+
+# ---------------------------------------------------------------- affichage
+@ti.func
+def particle_color(p: int, mode: int):
+    col = ti.Vector([0.75, 0.75, 0.75])
+    if mode == 0:
+        if phi[p] > 0.0:
+            col = ti.Vector([0.25, 0.45, 1.0])                           # armature élastique
+            if ti.abs(eps_p[p]) > 1e-4:
+                col = ti.Vector([1.0, 0.55, 0.10])                       # armature plastifiée
+        else:
+            d_t = 1.0 - r_tension(kap_t[p], fcr_p[p])
+            d_c = ti.min(1.0, (1.0 - r_compression(kap_c[p], fc_p[p])) / 0.6)
+            col = ti.Vector([0.75, 0.75, 0.75]) * (1 - d_t) + ti.Vector([1.0, 0.85, 0.1]) * d_t
+            if d_t > 0.95:
+                col = ti.Vector([0.90, 0.15, 0.15])                      # fissure
+            col = col * (1 - d_c) + ti.Vector([0.3, 0.85, 0.95]) * d_c   # compression endommagée
+            if kap_c[p] > eps_cu:
+                col = ti.Vector([0.60, 0.20, 0.80])                      # écrasement
+    else:
+        Us, sg, Vs = ti.svd(ti.Matrix.identity(ti.f32, 2) + Fm[p])
+        e1 = ti.log(ti.max(sg[0, 0], 0.05))
+        e2 = ti.log(ti.max(sg[1, 1], 0.05))
+        s1 = 2.0 * mu_c * e1 + la_c * (e1 + e2)
+        s2 = 2.0 * mu_c * e2 + la_c * (e1 + e2)
+        a = ti.math.clamp(ti.max(s1, s2) / fcr, 0.0, 1.0)
+        b = ti.math.clamp(-ti.min(s1, s2) / fc, 0.0, 1.0)
+        t = 0.5 + 0.5 * (a - b)
+        col = ti.Vector([0.2, 0.4, 1.0]) * (1 - t) + ti.Vector([1.0, 0.25, 0.1]) * t
+    return col
+
+
+@ti.kernel
+def render(mode: int, u_load: float):
+    for i, j in Image:
+        pos = ti.Vector([(i + 0.5) * Lx / W, (j + 0.5) * Ly / H])
+        col = ti.Vector([0.02, 0.02, 0.08])
+        if (ti.abs(pos.x - xs1) <= hw or ti.abs(pos.x - xs2) <= hw) and pos.y <= beam_y0:
+            col = ti.Vector([0.35, 0.35, 0.35])
+        if (ti.abs(pos.x - xp1) <= hw or ti.abs(pos.x - xp2) <= hw) and pos.y >= beam_y1 - u_load:
+            col = ti.Vector([0.55, 0.55, 0.60])
+        Image[i, j] = col
+    for p in X0:
+        xp = X0[p] + Up[p]
+        ci = int(xp.x / Lx * W)
+        cj = int(xp.y / Ly * H)
+        col = particle_color(p, mode)
+        for a, b in ti.static(ti.ndrange(4, 4)):            # carré de 4 x 4 pixels (pas de trous)
+            ii = ci + a - 1
+            jj = cj + b - 1
+            if 0 <= ii < W and 0 <= jj < H:
+                Image[ii, jj] = col
+
+
+# ---------------------------------------------------------------- simulation
+class State:
+    t = 0.0
+    u = 0.0          # course des vérins (m)
+
+
+def reset():
+    init_beam()
+    init_mask()
+    State.t = 0.0
+    State.u = 0.0
+
+
+def smoothstep(t):
+    s = min(t / t_ramp, 1.0)
+    return s * s * (3.0 - 2.0 * s)
+
+
+def substep(v_load, model):
+    """Un pas de temps. model : 1 élastique linéaire, 2 béton armé non linéaire."""
+    s = smoothstep(State.t)
+    v_eff = v_load * s
+    nl = 1 if model >= 2 else 0
+    clear_grid()
+    P2G_solid(dt, nl)
+    grid_update(dt, g * s, v_eff, State.u)
+    G2P_solid(dt)
+    if nl == 1:
+        scatter_eps()
+        update_state()
+    State.t += dt
+    State.u += v_eff * dt
+
+
+def advance(n, v_load, model):
+    """n pas de temps ; retourne (P en kN moyenné sur la série, flèche à mi-portée en mm)."""
+    react[None] = 0.0
+    for _ in range(n):
+        substep(v_load, model)
+    P = react[None] / n * b_depth / 1000.0
+    sn = bottom_mid_uy()
+    delta = -sn[0] / max(sn[1], 1.0) * 1000.0
+    return P, delta
+
+
+HEADER = "t_s,course_verin_mm,fleche_mm,P_kN,n_fissurees,n_ecrasees"
+
+
+def run_headless(u_max_mm, v_load=0.2, model=2, csv="beton_courbe.csv"):
+    reset()
+    rows = []
+    while State.u * 1000.0 < u_max_mm:
+        P, delta = advance(render_substep, v_load, model)
+        dc = damage_counts()
+        rows.append((State.t, State.u * 1000.0, delta, P, dc[0], dc[1]))
+    np.savetxt(csv, np.array(rows), delimiter=",", header=HEADER, comments="")
+    return np.array(rows)
+
+
+def main():
+    window = ti.ui.Window("MPM 2D - poutre en béton armé, flexion 4 points", res=(W, H))
+    canvas = window.get_canvas()
+    gui = window.get_gui()
+    model = 2
+    color_mode = 0
+    v_load = 0.2
+    P_max = 0.0
+    reset()
+    hist = []
+
+    while window.running:
+        while window.get_event(ti.ui.PRESS):
+            k = window.event.key
+            if k == ti.ui.ESCAPE:
+                window.running = False
+            elif k == ti.ui.SPACE:
+                color_mode = 1 - color_mode
+            elif k == 'r':
+                reset()
+                P_max = 0.0
+                hist = []
+            elif k in ('1', '2'):
+                model = int(k)
+            elif k == 's' and hist:
+                np.savetxt("beton_courbe.csv", np.array(hist), delimiter=",", header=HEADER, comments="")
+
+        P, delta = advance(render_substep, v_load, model)
+        P_max = max(P_max, P)
+        dc = damage_counts()
+        hist.append((State.t, State.u * 1000.0, delta, P, dc[0], dc[1]))
+
+        render(color_mode, State.u)
+        canvas.set_image(Image)
+
+        gui.begin("Flexion 4 points", 0.01, 0.01, 0.42, 0.40)
+        v_load = gui.slider_float("vitesse des vérins (m/s)", v_load, 0.05, 0.5)
+        gui.text(f"modèle : {['', 'élastique linéaire', 'béton armé non linéaire'][model]}   (touches 1/2)")
+        gui.text(f"t = {State.t * 1000:.1f} ms   course = {State.u * 1000:.1f} mm")
+        gui.text(f"charge P = {P:.1f} kN   (max {P_max:.1f} kN)")
+        gui.text(f"flèche à mi-portée = {delta:.2f} mm")
+        gui.text(f"béton fissuré = {int(dc[0])}   écrasé = {int(dc[1])}   (sur {n_solid})")
+        gui.text("couleur : " + ("endommagement, acier" if color_mode == 0 else "contrainte principale") + "  (ESPACE)")
+        gui.text("R : reset   S : sauver la courbe   ESC : quitter")
+        gui.end()
+        window.show()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) >= 2 and sys.argv[1] == "--headless":
+        umax = float(sys.argv[2]) if len(sys.argv) >= 3 else 25.0
+        res = run_headless(umax)
+        step = max(1, len(res) // 25)
+        print(" t(ms)  course(mm)  fleche(mm)  P(kN)  fissurees  ecrasees")
+        for r in res[::step]:
+            print(f"{r[0]*1000:7.1f} {r[1]:9.2f} {r[2]:10.2f} {r[3]:8.1f} {int(r[4]):9d} {int(r[5]):9d}")
+    else:
+        main()
+\end{lstlisting}
+
+\section{Référence RDM : \texttt{MpM/beton\_section.py}}
+
+\begin{lstlisting}
+# MpM/beton_section.py -- Référence "résistance des matériaux" à comparer au calcul MPM
+#
+# Analyse de section à la manière de l'article (2.1) : pour une courbure phi donnée, on cherche la
+# déformation au centre de gravité qui annule l'effort normal N, puis on calcule le moment M(phi).
+# On intègre ensuite les courbures le long de la poutre (flexion 4 points) pour obtenir la flèche.
+#
+# Lancer :  python MpM/beton_section.py [beton_courbe.csv]   (trace la comparaison si le csv existe)
+
+import sys
+import numpy as np
+
+# mêmes données que MpM/beton.py
+b, h = 0.2, 0.2
+E_c, fc, fcr, eps_cu = 30.4e9, 47.1e6, 3.5e6, 0.004
+E_s, fy = 230e9, 309e6
+rebars = [(0.019, 4 * 113.1e-6), (0.072, 2 * 56.5e-6), (0.128, 2 * 56.5e-6), (0.181, 4 * 113.1e-6)]
+L, a = 2.0, 0.6
+
+ny = 400
+y = (np.arange(ny) + 0.5) * h / ny                # fibres de béton, y mesuré depuis la base
+dy = h / ny
+yc = h / 2
+
+
+def sigma_concrete(eps):
+    """Loi du béton de l'article : Desayi en compression (nul après eps_cu), raidissement en traction."""
+    eps = np.asarray(eps, dtype=float)
+    s = np.zeros_like(eps)
+    ecr = fcr / E_c
+    t = eps > 0
+    lin = t & (eps <= ecr)
+    s[lin] = E_c * eps[lin]
+    soft = t & (eps > ecr)
+    s[soft] = fcr / (1.0 + np.sqrt(500.0 * eps[soft]))
+    eu = 1.8 * fc / E_c
+    c = (eps < 0) & (-eps <= eps_cu)
+    x = -eps[c]
+    s[c] = -2.0 * fc * x / (eu * (1.0 + (x / eu) ** 2))
+    return s
+
+
+def sigma_steel(eps):
+    return np.clip(E_s * eps, -fy, fy)
+
+
+def forces(eps0, phi):
+    """Effort normal N et moment M (autour du centre de gravité) pour la déformation eps0 et la courbure phi."""
+    e = eps0 + phi * (y - yc)                       # phi > 0 : fibre inférieure tendue
+    sc = sigma_concrete(e)
+    N = np.sum(sc) * b * dy
+    M = np.sum(sc * (y - yc)) * b * dy
+    for d, A in rebars:
+        es = eps0 + phi * (d - yc)
+        ss = sigma_steel(es)
+        sc_lost = sigma_concrete(np.array([es]))[0]  # le béton déplacé par la barre
+        N += (ss - sc_lost) * A
+        M += (ss - sc_lost) * A * (d - yc)
+    return N, M
+
+
+def moment_curvature(phis):
+    Ms = []
+    e0 = 0.0
+    for phi in phis:
+        lo, hi = -0.02, 0.02
+        for _ in range(60):                          # dichotomie sur eps0 : N(eps0) croissant
+            mid = 0.5 * (lo + hi)
+            if forces(mid, phi)[0] > 0:
+                hi = mid
+            else:
+                lo = mid
+        e0 = 0.5 * (lo + hi)
+        Ms.append(forces(e0, phi)[1])
+    return np.array(Ms)
+
+
+def load_deflection():
+    phis = np.linspace(1e-6, 0.06, 600)
+    Ms = moment_curvature(phis)
+    imax = int(np.argmax(Ms))                        # on reste avant le pic du moment
+    phis, Ms = phis[:imax + 1], Ms[:imax + 1]
+    # courbure le long de la demi-poutre (symétrie), moment de flexion 4 points M(x) = P/2 * min(x, a)
+    xs = np.linspace(0.0, L / 2, 201)
+    shape = np.minimum(xs, a) / 2.0                  # M(x) / P
+    m_unit = xs / 2.0                                # moment dû à une charge unitaire à mi-portée
+    Ps = np.linspace(0.0, Ms[-1] / (a / 2.0), 300)
+    out = []
+    for P in Ps:
+        kappa = np.interp(P * shape, Ms, phis)       # courbure en chaque x
+        delta = 2.0 * np.trapezoid(kappa * m_unit, xs)   # théorème de la charge unitaire
+        out.append((delta, P))
+    out = np.array(out)
+    return out[:, 0] * 1000.0, out[:, 1] / 1000.0, phis, Ms
+
+
+if __name__ == "__main__":
+    d, P, phis, Ms = load_deflection()
+    # rigidité initiale, moment de fissuration et moment/charge maximaux
+    k0 = (P[5] / d[5])
+    icr = np.argmax(np.abs(np.gradient(P, d)) < 0.6 * np.gradient(P, d)[3])
+    print(f"raideur initiale (section)      : {k0:.1f} kN/mm")
+    print(f"charge à la rupture de pente   : {P[icr]:.1f} kN a {d[icr]:.2f} mm")
+    print(f"moment max de la section       : {Ms.max() / 1000:.1f} kN.m  ->  P = {Ms.max() / (a / 2) / 1000:.1f} kN")
+    np.savetxt("beton_section.csv", np.column_stack([d, P]), delimiter=",", header="fleche_mm,P_kN", comments="")
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(6.4, 4.0))
+        ax.plot(d, P, "k--", lw=1.4, label="analyse de section (RDM)")
+        if len(sys.argv) > 1:
+            r = np.genfromtxt(sys.argv[1], delimiter=",", names=True)
+            ax.plot(r["fleche_mm"], r["P_kN"], color="tab:blue", lw=1.4, label="MPM")
+        ax.set_xlabel("flèche à mi-portée (mm)")
+        ax.set_ylabel("charge P (kN)")
+        ax.set_xlim(0, 26)
+        ax.set_ylim(0, 160)
+        ax.grid(alpha=0.3)
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig("tuto_beton_courbe.png", dpi=170)
+        print("figure : tuto_beton_courbe.png")
+    except ImportError:
+        print("matplotlib absent : pas de figure")
+\end{lstlisting}
+
+\section*{Référence}
+
+Cremona C., Houde M.-J., \emph{Modélisation déterministe et probabiliste du comportement mécanique
+simplifié des corps d'épreuve}, RFGC, projet RGC\&U \og benchmark des poutres de la Rance \fg{}.
+
+\end{document}

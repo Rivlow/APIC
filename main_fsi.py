@@ -9,14 +9,16 @@
 #   2. P2G_solid  (solide)  : ajoute masse, quantité de mouvement, force élastique
 #   3. grid_step            : vitesse = quantité de mouvement / masse, gravité, parois, piliers
 #   4. G2P        (fluide)  : v, C, J
-#   5. G2P_solid  (solide)  : v, C, F, endommagement, rupture, advection
-#   6. advect_fluid         : advection du fluide avec le même dt
+#   5. G2P_solid  (solide)  : v, C, F (écrêtage des particules rompues), advection
+#   6. scatter_eps + update_damage : endommagement non local, à vitesse limitée, rupture
+#   7. advect_fluid         : advection du fluide avec le même dt
 #
 # Touches : ESPACE couleur du solide (endommagement / déformation), R reset, ESC quitter.
 
 import taichi as ti
 from APIC.APIC import P2G, G2P, grid_step
-from Code_tuto.mpm_solid import (P2G_solid, G2P_solid, init_beam, solid_colors, solid_stats)
+from Code_tuto.mpm_solid import (P2G_solid, G2P_solid, clear_eps, scatter_eps, update_damage,
+                                 init_beam, solid_colors, solid_stats)
 
 ti.init(arch=ti.gpu)
 
@@ -46,6 +48,8 @@ nu_s = 0.3
 mu_s = E_s / (2 * (1 + nu_s))
 la_s = E_s * nu_s / ((1 + nu_s) * (1 - 2 * nu_s))
 eps0, epsf = 0.05, 0.20
+tau_D = 2e-3                                 # endommagement à vitesse limitée (dD <= dt / tau_D)
+k_res = 1e-3                                 # raideur résiduelle
 use_damage, use_rupture = 1, 1
 
 p_spacing = 0.5 * dx
@@ -83,6 +87,8 @@ col_s = ti.Vector.field(3, ti.f32, n_solid)
 # ---------------------------------------------------------------- grille commune
 grid_v = ti.Vector.field(2, ti.f32, (n_grid, n_grid))
 grid_m = ti.field(ti.f32, (n_grid, n_grid))
+grid_e = ti.field(ti.f32, (n_grid, n_grid))           # allongement lissé (endommagement non local du solide)
+grid_w = ti.field(ti.f32, (n_grid, n_grid))
 solid = ti.field(ti.f32, (n_grid, n_grid))            # 1 = pilier (masque d'obstacle du fluide)
 img = ti.Vector.field(3, ti.f32, (n_grid, n_grid))
 
@@ -127,12 +133,15 @@ def init_scene():
 def substep():
     P2G(grid_m, grid_v, x_f, v_f, C_f, J_f, inv_dx, dt, dx, E_f, p_mass_f, p_vol_f)      # 1 (remet la grille à zéro)
     P2G_solid(grid_m, grid_v, x_s, v_s, C_s, F_s, D_s, broken_s,
-              inv_dx, dt, dx, mu_s, la_s, p_mass_s, p_vol_s)                              # 2
+              inv_dx, dt, dx, mu_s, la_s, p_mass_s, p_vol_s, k_res)                       # 2
     grid_step(grid_m, grid_v, solid, dt, g, bound, n_grid)                                # 3
     G2P(grid_m, grid_v, x_f, v_f, C_f, J_f, inv_dx, dt, dx, E_f, p_mass_f, p_vol_f)      # 4
-    G2P_solid(grid_v, x_s, v_s, C_s, F_s, D_s, broken_s,
-              inv_dx, dt, dx, bound, eps0, epsf, use_damage, use_rupture)                 # 5
-    advect_fluid()                                                                        # 6
+    G2P_solid(grid_v, x_s, v_s, C_s, F_s, broken_s, inv_dx, dt, dx, bound)                # 5
+    clear_eps(grid_e, grid_w)                                                             # 6
+    scatter_eps(grid_e, grid_w, x_s, F_s, broken_s, inv_dx)
+    update_damage(grid_e, grid_w, x_s, F_s, D_s, broken_s, inv_dx, dt,
+                  eps0, epsf, tau_D, use_rupture)
+    advect_fluid()                                                                        # 7
 
 
 # ---------------------------------------------------------------- boucle principale

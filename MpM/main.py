@@ -20,6 +20,10 @@ g = 9.81
 
 eps0 = 0.05                          # début de l'endommagement (allongement principal)
 epsf = 0.20                          # rupture complète (petit = fragile, grand = ductile)
+tau_D = 2e-3                         # temps caractéristique d'endommagement : D croît au plus de dt/tau_D par pas
+k_res = 1e-3                         # raideur résiduelle (1-D >= k_res) pour éviter les particules sans raideur
+damp = 20.0                          # amortissement de la vitesse de grille (1/s), dissipe l'énergie cinétique
+ramp_rate = 2000.0                   # montée de la charge (en x g par seconde simulée), évite le choc initial
 
 # Pas de temps explicite : dt < dx / c_p avec c_p = sqrt((la + 2 mu) / rho) (ondes de compression)
 c_p = (( la_s + 2 * mu_s) / rho_s) ** 0.5
@@ -51,6 +55,8 @@ col_s    = ti.Vector.field(3, ti.f32, n_solid)
 grid_v   = ti.Vector.field(2, ti.f32, (n_grid, n_grid))
 grid_m   = ti.field(ti.f32, (n_grid, n_grid))
 mask     = ti.field(ti.i32, (n_grid, n_grid))
+grid_e   = ti.field(ti.f32, (n_grid, n_grid))            # allongement pondéré (endommagement non local)
+grid_w   = ti.field(ti.f32, (n_grid, n_grid))            # somme des poids associée
 
 Image = ti.Vector.field(3, ti.f32, (n_grid, n_grid))
 
@@ -69,8 +75,8 @@ def kirchhoff_stress(F, mu: float, la: float):
 def P2G_solid(grid_m:ti.template(), grid_v:ti.template(), x:ti.template(), v:ti.template(),
               C:ti.template(), F:ti.template(), D:ti.template(), broken:ti.template(),
               inv_dx:float, dt:float, dx:float,
-              mu:float, la:float, p_mass:float, p_vol:float):
-    
+              mu:float, la:float, p_mass:float, p_vol:float, k_res:float):
+
     for p in x:
 
         base = (x[p]*inv_dx - 0.5).cast(int)
@@ -80,8 +86,8 @@ def P2G_solid(grid_m:ti.template(), grid_v:ti.template(), x:ti.template(), v:ti.
              0.75 - (fx-1.0)**2,
              0.5*(fx-0.5)**2]
 
-        k = 1.0 - D[p]       # effective stiffness (1-D)*E
-        if broken[p] == 1.0:
+        k = ti.max(1.0 - D[p], k_res)       # effective stiffness (1-D)*E, with a residual floor
+        if broken[p] == 1:
             k = 1.0
         tau = kirchhoff_stress(F[p], k*mu, k*la)
 
@@ -99,12 +105,13 @@ def P2G_solid(grid_m:ti.template(), grid_v:ti.template(), x:ti.template(), v:ti.
 
 @ti.kernel
 def grid_update(grid_m:ti.template(), grid_v:ti.template(), mask:ti.template(),
-                dt:float, g:float, bound:int, n_grid:int):
+                dt:float, g:float, damp:float, bound:int, n_grid:int):
 
     for i,j in grid_m:
 
         if grid_m[i,j] > 0:
             grid_v[i,j] /= grid_m[i,j]
+            grid_v[i,j] *= 1.0 - damp*dt
             grid_v[i,j].y -= dt*g
 
             if i < bound and grid_v[i,j].x < 0:
@@ -134,9 +141,8 @@ def init_mask():
 
 @ti.kernel
 def G2P_solid(grid_v:ti.template(), x:ti.template(), v:ti.template(),
-              C:ti.template(), F:ti.template(), D:ti.template(), broken:ti.template(),
-              inv_dx:float, dt:float, dx:float, bound:int,
-              eps0:float, epsf:float, use_damage:int, use_rupture:int):
+              C:ti.template(), F:ti.template(), broken:ti.template(),
+              inv_dx:float, dt:float, dx:float, bound:int):
 
     I = ti.Matrix.identity(ti.f32, 2)
 
@@ -172,22 +178,61 @@ def G2P_solid(grid_v:ti.template(), x:ti.template(), v:ti.template(),
                 sigma[d,d] = ti.math.clamp(sigma[d,d], 0.1, 1.0)
             F_new = U @ sigma @ V.transpose()
 
-        elif use_damage == 1:
-            U, sigma, V = ti.svd(F_new)
-            
-            eps = ti.max(sigma[0,0], sigma[1,1]) - 1.0
-            D_new = ti.math.clamp((eps-eps0)/(epsf-eps0), 0.0, 1.0)
-
-            D[p] = ti.max(D[p], D_new)
-
-            if use_rupture == 1 and D[p] >= 1.0:
-
-                broken[p] = 1
-                F_new = I
-
         F[p] = F_new
         x[p] += dt*v[p]
         x[p] = ti.math.clamp(x[p], bound*dx, 1.0 - bound*dx)
+
+@ti.kernel
+def scatter_eps(grid_e:ti.template(), grid_w:ti.template(), x:ti.template(), F:ti.template(),
+                broken:ti.template(), inv_dx:float):
+    """Étale l'allongement principal des particules saines sur la grille (moyenne pondérée)."""
+
+    for p in x:
+        if broken[p] == 0:
+            base = (x[p]*inv_dx - 0.5).cast(int)
+            fx = x[p]*inv_dx - base
+            w = [0.5*(1.5-fx)**2,
+                 0.75 - (fx-1.0)**2,
+                 0.5*(fx-0.5)**2]
+
+            U, sigma, V = ti.svd(F[p])
+            eps = ti.max(sigma[0,0], sigma[1,1]) - 1.0
+
+            for i,j in ti.static(ti.ndrange(3, 3)):
+                weight = w[i].x * w[j].y
+                grid_e[base + ti.Vector([i,j])] += weight * eps
+                grid_w[base + ti.Vector([i,j])] += weight
+
+@ti.kernel
+def update_damage(grid_e:ti.template(), grid_w:ti.template(), x:ti.template(), F:ti.template(),
+                  D:ti.template(), broken:ti.template(), inv_dx:float, dt:float,
+                  eps0:float, epsf:float, tau_D:float, use_rupture:int):
+    """Endommagement non local (eps lissé sur ~2 cellules) et à vitesse limitée (dD <= dt/tau_D)."""
+
+    for p in x:
+        if broken[p] == 0:
+            base = (x[p]*inv_dx - 0.5).cast(int)
+            fx = x[p]*inv_dx - base
+            w = [0.5*(1.5-fx)**2,
+                 0.75 - (fx-1.0)**2,
+                 0.5*(fx-0.5)**2]
+
+            eps = 0.0
+            for i,j in ti.static(ti.ndrange(3, 3)):
+                node = base + ti.Vector([i,j])
+                if grid_w[node] > 0:
+                    eps += w[i].x * w[j].y * grid_e[node] / grid_w[node]
+
+            D_new = ti.math.clamp((eps-eps0)/(epsf-eps0), 0.0, 1.0)
+            D[p] = ti.max(D[p], ti.min(D_new, D[p] + dt/tau_D))
+
+            if use_rupture == 1 and D[p] >= 1.0:
+                broken[p] = 1
+                # on retire la traction tout de suite (au lieu de F = I) : la compression est conservée
+                U, sigma, V = ti.svd(F[p])
+                for d in ti.static(range(2)):
+                    sigma[d,d] = ti.math.clamp(sigma[d,d], 0.1, 1.0)
+                F[p] = U @ sigma @ V.transpose()
 
 @ti.kernel
 def init_beam(x: ti.template(), v: ti.template(), C: ti.template(), F: ti.template(),
@@ -208,14 +253,20 @@ def clear_grid():
     for i, j in grid_m:
         grid_v[i, j] = [0.0, 0.0]
         grid_m[i, j] = 0.0
+        grid_e[i, j] = 0.0
+        grid_w[i, j] = 0.0
 
 def substep(load, use_damage, use_rupture):
     clear_grid()
     P2G_solid(grid_m, grid_v, x_s, v_s, C_s, F_s, D_s, broken_s,
-    inv_dx, dt, dx, mu_s, la_s, p_mass, p_vol)
-    grid_update(grid_m, grid_v, mask, dt, load * g, bound, n_grid)
-    G2P_solid(grid_v, x_s, v_s, C_s, F_s, D_s, broken_s,
-    inv_dx, dt, dx, bound, eps0, epsf, use_damage, use_rupture)
+    inv_dx, dt, dx, mu_s, la_s, p_mass, p_vol, k_res)
+    grid_update(grid_m, grid_v, mask, dt, load * g, damp, bound, n_grid)
+    G2P_solid(grid_v, x_s, v_s, C_s, F_s, broken_s,
+    inv_dx, dt, dx, bound)
+    if use_damage == 1:
+        scatter_eps(grid_e, grid_w, x_s, F_s, broken_s, inv_dx)
+        update_damage(grid_e, grid_w, x_s, F_s, D_s, broken_s, inv_dx, dt,
+                      eps0, epsf, tau_D, use_rupture)
 
 @ti.kernel
 def render_background():
@@ -247,7 +298,8 @@ def main():
     gui = window.get_gui()
     model = 3                # 1 élastique, 2 endommagement, 3 endommagement + rupture
     color_mode = 0
-    load = 1.0
+    load_target = 1.0
+    load = 0.0               # charge effective : rejoint load_target en rampe (évite le choc)
     t_sim = 0.0
     
     init_beam(x_s, v_s, C_s, F_s, D_s, broken_s, beam_x0, beam_y0, n_px, p_spacing)
@@ -267,12 +319,14 @@ def main():
                 init_mask()
 
                 t_sim = 0.0
+                load = 0.0
             elif k in ('1', '2', '3'):
                 model = int(k)
 
         use_damage = 1 if model >= 2 else 0
         use_rupture = 1 if model == 3 else 0
         for _ in range(render_substep):
+            load = min(load + ramp_rate * dt, load_target) if load < load_target else load_target
             substep(load, use_damage, use_rupture)
             t_sim += dt
 
@@ -281,7 +335,7 @@ def main():
         canvas.circles(x_s, radius=0.6 * p_spacing, per_vertex_color=col_s)
 
         gui.begin("MPM solide", 0.02, 0.02, 0.46, 0.30)
-        load = gui.slider_float("charge (x g)", load, 0.0, 250.0)
+        load_target = gui.slider_float("charge (x g)", load_target, 0.0, 250.0)
         gui.text(f"modele : {['', 'elastique', 'endommagement', 'endommagement + rupture'][model]}   (touches 1/2/3)")
         gui.text(f"dt = {dt:.2e}   t = {t_sim:.3f} s")
         gui.text("couleur : " + ("endommagement" if color_mode == 0 else "deformation principale") + "  (ESPACE)")

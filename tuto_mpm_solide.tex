@@ -80,7 +80,7 @@ transfert affine $C_p$, formule $D_p^{-1} = 4/\Delta x^2$). Le projet est organi
 Fichier & Rôle \\
 \midrule
 \code{APIC/APIC.py} & fluide : \code{P2G}, \code{grid_step}, \code{G2P} (inchangé) \\
-\code{MpM/mpm_solid.py} & solide : \code{P2G_solid}, \code{grid_update}, \code{G2P_solid}, utilitaires \\
+\code{MpM/mpm_solid.py} & solide : \code{P2G_solid}, \code{grid_update}, \code{G2P_solid}, endommagement non local, utilitaires \\
 \code{MpM/demo_solid.py} & partie I : la poutre seule, avec curseur de charge \\
 \code{main_fsi.py} & partie II : eau + pont sur la grille commune \\
 \bottomrule
@@ -131,13 +131,14 @@ Le reste du cycle est identique :
   \item \textbf{Élastique} : $\mathbf F_p$ est mis à jour à chaque pas, une loi hyperélastique donne la
         contrainte, la force interne est déposée sur la grille. La poutre fléchit, vibre, revient.
   \item \textbf{Endommagement} : une variable $D_p$ croît de façon irréversible quand l'allongement
-        dépasse un seuil ; la raideur devient $(1-D_p)E$. La poutre s'assouplit là où elle est
-        trop sollicitée.
+        (lissé sur quelques cellules) dépasse un seuil ; la raideur devient $(1-D_p)E$. La poutre
+        s'assouplit là où elle est trop sollicitée.
   \item \textbf{Rupture} : quand $D_p = 1$ la particule perd toute cohésion : elle ne transmet plus de
         traction, seulement de la compression. Les morceaux se séparent et tombent.
 \end{enumerate}
-On implémente les trois d'un coup dans \code{G2P_solid} avec deux drapeaux \code{use_damage} et
-\code{use_rupture}, pour pouvoir les comparer au clavier.
+On implémente les trois avec deux drapeaux \code{use_damage} et \code{use_rupture}, pour pouvoir les
+comparer au clavier : l'élasticité vit dans \code{P2G_solid} / \code{G2P_solid}, l'endommagement et
+la rupture dans deux kernels dédiés qui suivent le \code{G2P_solid} (voir \S\ref{sec:damage}).
 
 \subsection{Par rapport au code MPM classique}
 
@@ -257,16 +258,58 @@ un pilier comprimé s'endommagerait autant qu'un tablier tendu. Pour un matéria
 \paragraph{Loi d'évolution.} Deux seuils, $\varepsilon_0$ (début de l'endommagement) et
 $\varepsilon_f$ (rupture), et une interpolation linéaire entre les deux :
 \[
-  D_p \leftarrow \max\!\Big(D_p,\ \operatorname{clamp}\Big(\frac{\varepsilon_p - \varepsilon_0}{\varepsilon_f - \varepsilon_0},\,0,\,1\Big)\Big).
+  D_{\rm cible} = \operatorname{clamp}\Big(\frac{\bar\varepsilon_p - \varepsilon_0}{\varepsilon_f - \varepsilon_0},\,0,\,1\Big),
+  \qquad
+  D_p \leftarrow \max\!\Big(D_p,\ \min\big(D_{\rm cible},\ D_p + \tfrac{\Delta t}{\tau_D}\big)\Big).
 \]
-Le $\max$ rend $D_p$ \textbf{irréversible} : une fissure ne se referme pas. La raideur effective
-est
+Trois choses se lisent dans cette formule.
+\begin{itemize}
+  \item Le $\max$ rend $D_p$ \textbf{irréversible} : une fissure ne se referme pas.
+  \item $\bar\varepsilon_p$ est un allongement \emph{lissé} (non local), pas celui de la particule
+        seule ; voir plus bas.
+  \item $D_p$ ne peut croître que de $\Delta t/\tau_D$ par pas : la raideur ne s'effondre pas
+        instantanément.
+\end{itemize}
+La raideur effective est
 \[
-  E_{\rm eff} = (1 - D_p)\,E \quad\Longleftrightarrow\quad \mu_{\rm eff} = (1-D_p)\mu,\ \lambda_{\rm eff} = (1-D_p)\lambda.
+  E_{\rm eff} = \max(1 - D_p,\,k_{\rm res})\,E \quad\Longleftrightarrow\quad
+  \mu_{\rm eff} = \max(1-D_p,\,k_{\rm res})\,\mu,\ \lambda_{\rm eff} = \max(1-D_p,\,k_{\rm res})\,\lambda,
 \]
+où le plancher $k_{\rm res} = 10^{-3}$ évite qu'une particule complètement endommagée n'ait plus
+aucune raideur (elle se comporterait comme de la poussière).
 C'est un \emph{adoucissement} : plus la particule est endommagée, moins elle résiste, donc plus elle
-s'allonge, donc plus $D_p$ croît. La déformation se localise d'elle-même dans une bande étroite :
-c'est la fissure.
+s'allonge, donc plus $D_p$ croît.
+
+\paragraph{Le piège : un solide qui éclate comme du verre.} Cet adoucissement est une instabilité.
+Dans la version la plus naïve (allongement de la particule seule, $D_p = D_{\rm cible}$ à chaque
+pas), toutes les particules d'une zone tendue ont presque la même déformation : elles franchissent
+le seuil ensemble, se déchargent ensemble, et l'énergie élastique qu'elles stockaient part en onde
+de choc qui surcharge et rompt les voisines au pas suivant. On n'obtient pas une fissure mais une
+poutre entière qui se pulvérise. Il manque deux ingrédients : une \emph{longueur} interne (la
+largeur d'une fissure) et un \emph{temps} interne (la durée d'une rupture). Le
+\S\ref{sec:shatter} chiffre l'effet de chacun.
+
+\paragraph{Longueur interne : endommagement non local.} On remplace l'allongement $\varepsilon_p$ de la
+particule par sa moyenne pondérée sur un voisinage de quelques cellules. MPM la fournit presque
+gratuitement, avec la grille : un dépôt (scatter) des allongements, puis une relecture (gather),
+avec les mêmes poids que d'habitude,
+\[
+  \hat\varepsilon_i = \frac{\sum_q w_{iq}\,\varepsilon_q}{\sum_q w_{iq}},
+  \qquad
+  \bar\varepsilon_p = \sum_i w_{ip}\,\hat\varepsilon_i .
+\]
+Le support est d'environ cinq cellules (deux passes du stencil $3\times3$). Le pic d'allongement est
+étalé : l'endommagement croît sur une bande de largeur à peu près fixe, au lieu de chaque particule
+indépendamment. Les particules déjà rompues sont exclues de la somme, pour qu'elles ne diluent
+pas l'allongement à la pointe de la fissure. Cette largeur est fixée par la grille (elle vaut
+quelques $\Delta x$) : à résolution plus fine, la fissure est plus fine.
+
+\paragraph{Temps interne : vitesse d'endommagement limitée.} Avec $D_p \leftarrow D_p + \Delta t/\tau_D$
+au plus, la raideur passe de 1 à $k_{\rm res}$ en au moins $\tau_D$ (quelques dizaines de pas ; dans
+le code $\tau_D = 2\cdot10^{-3}$~s, du même ordre que le temps $h/c_p \approx 1.3\cdot10^{-3}$~s que
+met une onde à traverser l'épaisseur de la poutre). Le champ de contrainte a le temps de se
+réorganiser pendant que le matériau s'adoucit. Trop grand, le matériau devient visqueux et ne
+casse plus ; trop petit, on retrouve la rupture en cascade.
 
 \subsection{La rupture : supprimer la cohésion}
 \label{sec:rupture}
@@ -277,9 +320,11 @@ par le champ de vitesse commun. Il faut lui donner un comportement de matériau 
 cohésion} (du sable) : il résiste à la compression, jamais à la traction. Concrètement, à chaque
 pas et pour chaque particule rompue :
 \begin{enumerate}
-  \item à l'instant de la rupture, $\mathbf F_p \leftarrow \mathbf I$ : la particule oublie la
-        déformation accumulée (l'énergie élastique de traction est perdue, comme dans une vraie
-        fissure) ;
+  \item à l'instant de la rupture, on écrête \emph{immédiatement} $\mathbf F_p$ (même formule qu'au
+        point suivant) : la traction disparaît, la compression éventuelle est conservée. La version
+        naïve remettait $\mathbf F_p \leftarrow \mathbf I$ ; cela efface aussi l'état de compression
+        (le contact) de la particule et ajoute un saut de configuration à chaque rupture
+        (\S\ref{sec:shatter}, tableau) ;
   \item après la mise à jour $\mathbf F_p \leftarrow (\mathbf I + \Delta t C_p)\mathbf F_p$, on écrête
         les allongements principaux :
         \[
@@ -302,6 +347,53 @@ particules initialement voisines (cassées quand leur allongement
 $\epsilon_{pq} = |\mathbf x_p - \mathbf x_q|/d^0_{pq} - 1$ dépasse un seuil). Pour un premier
 solveur, le modèle continu ci-dessus donne déjà des fissures nettes.
 
+\subsection{Éviter l'éclatement \og comme du verre \fg{}}
+\label{sec:shatter}
+
+Une première version de ce solveur cassait bien, mais trop bien : au moindre dépassement du seuil,
+la poutre entière volait en éclats. Les corrections du \S\ref{sec:damage} viennent de là. Pour
+savoir lesquelles comptent vraiment, on a désactivé chacune à tour de rôle sur la poutre de
+\code{MpM/main.py} ($n = 256$, $E = 3\cdot10^4$, charge $70\,g$), puis mesuré, à $t \approx 0.26$~s,
+après la chute et le choc contre le sol, la part de particules rompues et le nombre de morceaux
+(composantes connexes de plus de 5 particules) :
+
+\begin{center}
+\begin{tabular}{@{}lrr@{}}
+\toprule
+Version & particules rompues & morceaux \\
+\midrule
+naïve (aucune des corrections ci-dessous) & 47.6~\% & 24 \\
+naïve, mais avec rampe de charge et amortissement & 21.3~\% & 6 \\
+sans rampe de charge ni amortissement & 22.1~\% & 14 \\
+sans lissage non local & 14.1~\% & 4 \\
+sans limite de vitesse ($\tau_D \to 0$) & 10.6~\% & 14 \\
+avec $\mathbf F \leftarrow \mathbf I$ à la rupture & 4.1~\% & 5 \\
+sans raideur résiduelle $k_{\rm res}$ & 2.6~\% & 4 \\
+\textbf{version du tutoriel (tout activé)} & \textbf{2.5~\%} & \textbf{4} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Une seule simulation par ligne : ce sont des ordres de grandeur, pas des statistiques. On en tire :
+\begin{itemize}
+  \item \textbf{Trois causes se dégagent} : l'énergie cinétique injectée d'un coup
+        (charge appliquée instantanément, sans amortissement), l'absence de longueur interne
+        (sans lissage non local) et l'absence de temps interne (sans limite de vitesse).
+        Chacune, retirée seule, multiplie par 4 à 9 la part de particules rompues.
+  \item Le \code{F = I} à la rupture et le plancher $k_{\rm res}$ ont un effet faible, mais le
+        premier est pénalisant et le second ne coûte rien : on les garde.
+  \item Le choc contre le sol casse toujours \emph{quelque chose}. La vitesse d'impact $v$ est
+        d'autant plus grande qu'on a dû charger la poutre pour la casser, et l'allongement produit
+        est de l'ordre de $v/c_p$ ; la charge nécessaire pour casser croît comme $E$, donc
+        (estimation, non mesurée) ce rapport varie peu avec $E$. Il ne s'agit donc pas de supprimer toute rupture au choc, seulement d'éviter
+        qu'elle ne se propage de proche en proche à toute la poutre.
+\end{itemize}
+
+Réglages pratiques : $\tau_D$ de l'ordre du temps de traversée de l'épaisseur ; charge en rampe
+plutôt qu'appliquée d'un coup (surtout au-delà de la centaine de $g$) ; un amortissement de grille
+de quelques dizaines de s$^{-1}$, suffisant pour dissiper l'énergie des fragments sans écraser la
+dynamique.
+
 \subsection{Stabilité et choix des paramètres}
 \label{sec:stab}
 
@@ -322,6 +414,10 @@ $\rho_s$ & 2 & masse volumique (2 fois l'eau : les morceaux coulent) \\
 $E$, $\nu$ & 3000, 0.3 & $\mu = 1154$, $\lambda = 1731$, $c_p \approx 45$ \\
 $\Delta t$ & $0.4\,\Delta x/c_p \approx 7\cdot10^{-5}$ & calculé \\
 $\varepsilon_0$, $\varepsilon_f$ & 0.05, 0.20 & seuils d'endommagement et de rupture \\
+$\tau_D$ & $2\cdot10^{-3}$~s & durée minimale du passage de $D=0$ à $D=1$ \\
+$k_{\rm res}$ & $10^{-3}$ & raideur résiduelle $(1-D \ge k_{\rm res})$ \\
+amortissement & 20~s$^{-1}$ & fraction de vitesse de grille retirée par seconde \\
+rampe de charge & 50~$g$/s & la charge monte progressivement jusqu'à la valeur du curseur \\
 $V_p$ & $(\Delta x/2)^2$ & 4 particules par cellule, sur un réseau régulier \\
 poutre & $[0.15, 0.85]\times[0.55, 0.61]$ & extrémités noyées dans des piliers de largeur 0.06 \\
 \bottomrule
@@ -333,7 +429,8 @@ qui rend la flèche visible à l'\oe il ; de même $\varepsilon_f = 0.2$ est duc
 grandeur qui compte est la déformation de flexion d'une poutre encastrée sous son poids,
 $\varepsilon \approx \rho_s g L^2 / (2 h E)$ : avec $L = 0.58$, $h = 0.06$, on trouve
 $\varepsilon \approx 0.02$ par unité de charge, à comparer aux seuils. Le curseur de charge
-multiplie $g$ et permet de balayer $\varepsilon$ de 0 à $0.1$.
+multiplie $g$ (de 0 à 12) ; comme l'allongement est lissé, la rupture n'apparaît que vers une
+charge de 8.
 
 % ================================================================
 \part{Le solide seul}
@@ -357,7 +454,11 @@ col_s = ti.Vector.field(3, ti.f32, n_solid)    # couleur d'affichage
 grid_v = ti.Vector.field(2, ti.f32, (n_grid, n_grid))
 grid_m = ti.field(ti.f32, (n_grid, n_grid))
 mask = ti.field(ti.i32, (n_grid, n_grid))      # 1 = pilier rigide
+grid_e = ti.field(ti.f32, (n_grid, n_grid))    # allongement lissé (endommagement non local)
+grid_w = ti.field(ti.f32, (n_grid, n_grid))    # poids associés
 \end{lstlisting}
+
+Les deux champs \code{grid_e} et \code{grid_w} ne servent qu'à l'endommagement non local (étape 5).
 
 La loi de comportement est une fonction Taichi (\code{@ti.func}) appelable depuis un kernel.
 Elle reçoit $\mathbf F$ et les coefficients de Lamé (éventuellement déjà réduits par $1-D$) et
@@ -390,13 +491,13 @@ def P2G_solid(grid_m: ti.template(), grid_v: ti.template(),
               x: ti.template(), v: ti.template(), C: ti.template(), F: ti.template(),
               D: ti.template(), broken: ti.template(),
               inv_dx: float, dt: float, dx: float,
-              mu: float, la: float, p_mass: float, p_vol: float):
+              mu: float, la: float, p_mass: float, p_vol: float, k_res: float):
     for p in x:
         base = (x[p] * inv_dx - 0.5).cast(int)
         fx = x[p] * inv_dx - base
         w = [0.5 * (1.5 - fx)**2, 0.75 - (fx - 1.0)**2, 0.5 * (fx - 0.5)**2]
 
-        k = 1.0 - D[p]                 # raideur effective (1 - D) E
+        k = ti.max(1.0 - D[p], k_res)  # raideur effective (1 - D) E, avec un plancher
         if broken[p] == 1:
             k = 1.0                    # rompue : raideur pleine, F écrêté dans G2P
         tau = kirchhoff_stress(F[p], k * mu, k * la)
@@ -413,8 +514,8 @@ def P2G_solid(grid_m: ti.template(), grid_v: ti.template(),
 
 \paragraph{Ligne par ligne.}
 \begin{itemize}
-  \item \code{k} : le facteur $(1-D_p)$ du \S\ref{sec:damage}, forcé à 1 pour une particule
-        rompue (\S\ref{sec:rupture}, point 3).
+  \item \code{k} : le facteur $(1-D_p)$ du \S\ref{sec:damage}, borné par le plancher \code{k_res},
+        forcé à 1 pour une particule rompue (\S\ref{sec:rupture}, point 3).
   \item \code{affine} : la matrice $-\Delta t\,\frac{4V_p^0}{\Delta x^2}\bm\tau_p + m_p C_p$. Notez
         que \code{p_vol} est le volume de \emph{repos} $V_p^0$ : c'est $\bm\tau$ (et non $\bm\sigma$)
         qui va avec.
@@ -425,22 +526,30 @@ def P2G_solid(grid_m: ti.template(), grid_v: ti.template(),
 % ================================================================
 \section{Étape 3 : grille et encastrement}
 
-La mise à jour de la grille est \emph{identique} à celle du fluide : on la recopie dans
+La mise à jour de la grille est \emph{presque identique} à celle du fluide (un terme
+d'amortissement en plus, voir plus bas) : on la recopie dans
 \code{mpm_solid.py} sous le nom \code{grid_update} pour que la partie I soit autonome (en partie II
 on utilisera directement \code{grid_step} du fluide).
 
 \begin{lstlisting}
 @ti.kernel
 def grid_update(grid_m: ti.template(), grid_v: ti.template(), mask: ti.template(),
-                dt: float, g: float, bound: int, n_grid: int):
+                dt: float, g: float, damp: float, bound: int, n_grid: int):
     for i, j in grid_m:
         if grid_m[i, j] > 0:
             grid_v[i, j] /= grid_m[i, j]
+            grid_v[i, j] *= 1.0 - damp * dt         # amortissement léger
             grid_v[i, j].y -= dt * g
             # parois glissantes du domaine (comme le fluide) ...
             if mask[i, j] == 1:
                 grid_v[i, j] = [0.0, 0.0]
 \end{lstlisting}
+
+\paragraph{Amortissement.} La ligne \code{grid_v[i, j] *= 1.0 - damp * dt} retire à chaque pas une
+fraction \code{damp * dt} de la vitesse de grille (\code{damp} $= 20$~s$^{-1}$). C'est une
+dissipation numérique volontaire : elle absorbe l'énergie cinétique des fragments et évite qu'ils
+ne continuent de vibrer et de se rompre. En partie II, le fluide utilise \code{grid_step}, sans
+ce terme, et le solide n'en a donc pas non plus.
 
 \paragraph{Encastrement.} Un n\oe ud du masque a une vitesse nulle. Une particule dont les 9
 n\oe uds du stencil sont dans le masque ne bouge donc jamais : c'est un encastrement parfait, sans
@@ -466,16 +575,16 @@ piliers sous la poutre.
 
 La première moitié est le \code{G2P} du fluide (vitesse et $C_p$). Ensuite, à la place de
 $J_p \leftarrow J_p(1+\Delta t\,\tr C_p)$, on met à jour $\mathbf F_p$. Voici le kernel complet ;
-les deux blocs \code{if broken} / \code{elif use_damage} sont expliqués aux étapes suivantes
-et sont inactifs en mode élastique.
+le bloc \code{if broken} est expliqué à l'étape 6 et est inactif en mode élastique.
+L'endommagement n'y figure plus : il a besoin d'un lissage sur la grille et fait l'objet de
+kernels séparés (étape 5).
 
 \begin{lstlisting}
 @ti.kernel
 def G2P_solid(grid_v: ti.template(),
               x: ti.template(), v: ti.template(), C: ti.template(), F: ti.template(),
-              D: ti.template(), broken: ti.template(),
-              inv_dx: float, dt: float, dx: float, bound: int,
-              eps0: float, epsf: float, use_damage: int, use_rupture: int):
+              broken: ti.template(),
+              inv_dx: float, dt: float, dx: float, bound: int):
     I = ti.Matrix.identity(ti.f32, 2)
     for p in x:
         base = (x[p] * inv_dx - 0.5).cast(int)
@@ -496,20 +605,11 @@ def G2P_solid(grid_v: ti.template(),
         # --- gradient de déformation : dF/dt = (grad v) F, grad v ~ C
         F_new = (I + dt * C_new) @ F[p]
 
-        if broken[p] == 1:                          # étape 6 : rupture
+        if broken[p] == 1:                          # étape 6 : particule rompue
             U, sig, V = ti.svd(F_new)
             for d in ti.static(range(2)):
                 sig[d, d] = ti.math.clamp(sig[d, d], 0.1, 1.0)
             F_new = U @ sig @ V.transpose()
-
-        elif use_damage == 1:                       # étape 5 : endommagement
-            U, sig, V = ti.svd(F_new)
-            eps = ti.max(sig[0, 0], sig[1, 1]) - 1.0
-            D_new = ti.math.clamp((eps - eps0) / (epsf - eps0), 0.0, 1.0)
-            D[p] = ti.max(D[p], D_new)
-            if use_rupture == 1 and D[p] >= 1.0:
-                broken[p] = 1
-                F_new = I
 
         F[p] = F_new
         x[p] += dt * v[p]
@@ -518,7 +618,7 @@ def G2P_solid(grid_v: ti.template(),
 
 \paragraph{Ce que l'on doit voir (touche 1, charge 1).} La poutre fléchit d'environ une cellule
 à mi-portée, oscille quelques fois et se stabilise (la dissipation numérique de PIC/APIC amortit
-les vibrations). Avec le curseur de charge à 3, la flèche triple, sans jamais casser : un solide
+les vibrations). Avec le curseur de charge à 3, la flèche est multipliée par 2.5, sans jamais casser : un solide
 élastique pur revient toujours. En mode couleur \og déformation \fg{} (Espace), la fibre
 inférieure à mi-portée et les fibres supérieures aux encastrements apparaissent en rouge
 (traction), les fibres opposées en bleu (compression) : c'est le diagramme des moments d'une
@@ -527,33 +627,88 @@ poutre bi-encastrée, dessiné par la simulation.
 % ================================================================
 \section{Étape 5 : endommagement}
 
-Le bloc \code{elif use_damage == 1} est la loi du \S\ref{sec:damage}, mot pour mot :
-\begin{itemize}
-  \item \code{eps} : allongement principal maximal, lu sur la SVD du \emph{nouveau} $\mathbf F$ ;
-  \item \code{D_new} : interpolation linéaire entre $\varepsilon_0$ et $\varepsilon_f$, bornée à $[0,1]$ ;
-  \item \code{ti.max(D[p], D_new)} : irréversibilité.
-\end{itemize}
-Et $D_p$ est consommé dans \code{P2G_solid} via \code{k = 1 - D[p]}. C'est tout : l'endommagement
-tient en quatre lignes.
+L'endommagement est calculé \emph{après} le \code{G2P_solid}, en trois kernels qui suivent la loi du
+\S\ref{sec:damage} : remise à zéro de la grille de lissage, dépôt des allongements, puis relecture
+et mise à jour de $D_p$. On abrège les arguments \code{ti.template()} :
 
-\paragraph{Ce que l'on doit voir (touche 2).} À charge 1, rien ne change ($\varepsilon < \varepsilon_0$,
-$D_{\max} = 0$ dans le panneau). À charge 2, les particules jaunissent aux encastrements (dessus)
-et à mi-portée (dessous), $D_{\max}$ monte vers $0.3$ et la flèche augmente un peu : la poutre est
-fissurée mais tient. Ramenez la charge à 1 : la flèche diminue mais la couleur reste, $D$ ne
-redescend jamais. À charge 3, $D_{\max}$ atteint 1 par endroits et la poutre s'affaisse sans se
-séparer : les particules de raideur nulle restent \og accrochées \fg{} par la grille. C'est le
-problème annoncé au \S\ref{sec:rupture}, et la raison de l'étape suivante.
+\begin{lstlisting}
+@ti.kernel
+def clear_eps(grid_e, grid_w):
+    for i, j in grid_e:
+        grid_e[i, j] = 0.0
+        grid_w[i, j] = 0.0
+
+@ti.kernel
+def scatter_eps(grid_e, grid_w, x, F, broken, inv_dx: float):
+    for p in x:
+        if broken[p] == 0:                              # les particules rompues ne comptent pas
+            base = (x[p] * inv_dx - 0.5).cast(int)
+            fx = x[p] * inv_dx - base
+            w = [0.5 * (1.5 - fx)**2, 0.75 - (fx - 1.0)**2, 0.5 * (fx - 0.5)**2]
+            U, sig, V = ti.svd(F[p])
+            eps = ti.max(sig[0, 0], sig[1, 1]) - 1.0    # allongement principal maximal
+            for i, j in ti.static(ti.ndrange(3, 3)):
+                weight = w[i].x * w[j].y
+                grid_e[base + ti.Vector([i, j])] += weight * eps
+                grid_w[base + ti.Vector([i, j])] += weight
+
+@ti.kernel
+def update_damage(grid_e, grid_w, x, F, D, broken, inv_dx: float, dt: float,
+                  eps0: float, epsf: float, tau_D: float, use_rupture: int):
+    for p in x:
+        if broken[p] == 0:
+            base = (x[p] * inv_dx - 0.5).cast(int)
+            fx = x[p] * inv_dx - base
+            w = [0.5 * (1.5 - fx)**2, 0.75 - (fx - 1.0)**2, 0.5 * (fx - 0.5)**2]
+            eps = 0.0                                   # allongement lissé (gather)
+            for i, j in ti.static(ti.ndrange(3, 3)):
+                node = base + ti.Vector([i, j])
+                if grid_w[node] > 0:
+                    eps += w[i].x * w[j].y * grid_e[node] / grid_w[node]
+            D_new = ti.math.clamp((eps - eps0) / (epsf - eps0), 0.0, 1.0)
+            D[p] = ti.max(D[p], ti.min(D_new, D[p] + dt / tau_D))
+            # (étape 6 : rupture)
+\end{lstlisting}
+
+\paragraph{Ligne par ligne.}
+\begin{itemize}
+  \item \code{scatter_eps} : même stencil et mêmes poids que le P2G ; la grille reçoit
+        $\sum_q w_{iq}\varepsilon_q$ dans \code{grid_e} et $\sum_q w_{iq}$ dans \code{grid_w}. On
+        ne pondère pas par la masse : toutes les particules solides ont la même.
+  \item \code{update_damage} : le \code{gather} relit $\hat\varepsilon_i = \code{grid_e}/\code{grid_w}$
+        aux 9 n\oe uds et le repondère, ce qui donne $\bar\varepsilon_p$. Le test
+        \code{grid_w[node] > 0} évite une division par zéro (cas impossible pour un n\oe ud du
+        stencil d'une particule saine, mais le garde-fou ne coûte rien).
+  \item \code{D_new} : interpolation linéaire entre $\varepsilon_0$ et $\varepsilon_f$, bornée à $[0,1]$.
+  \item \code{ti.max(D[p], ti.min(D_new, D[p] + dt / tau_D))} : irréversibilité \emph{et} vitesse
+        limitée, en une ligne.
+\end{itemize}
+Et $D_p$ est consommé dans \code{P2G_solid} via \code{k}. On ne passe par ces kernels qu'en modes 2
+et 3 (\code{if use_damage == 1} dans \code{substep}, voir l'étape 7). En mode 1, \code{D} reste nul.
+
+\paragraph{Ce que l'on doit voir (touche 2).} La charge monte en rampe jusqu'à la valeur du
+curseur. À charge 3, $D_{\max}$ reste voisin de $0.05$ : rien ne bouge. À charge 4, $D_{\max}$
+atteint $0.16$, à charge 6 environ $0.35$ et à charge 7 environ $0.5$ : les particules jaunissent
+et la flèche augmente (de $0.02$ à $0.045$ entre les charges 3 et 7), mais la poutre tient. Ramenez la
+charge à 1 : la flèche diminue mais la couleur reste, $D$ ne redescend jamais. À charge 8 ou plus,
+$D_{\max}$ atteint 1 et toute la poutre s'effondre d'un bloc sans se séparer : les particules de
+raideur quasi nulle restent \og accrochées \fg{} par la grille. C'est le problème annoncé au
+\S\ref{sec:rupture}, et la raison de l'étape suivante.
 
 % ================================================================
 \section{Étape 6 : rupture}
 
-Deux morceaux de code. D'abord la \emph{transition}, dans le bloc d'endommagement :
+Deux morceaux de code. D'abord la \emph{transition}, à la fin de \code{update_damage} (là où l'étape 5
+avait mis un commentaire) :
 \begin{lstlisting}
             if use_rupture == 1 and D[p] >= 1.0:
                 broken[p] = 1
-                F_new = I
+                U, sig, V = ti.svd(F[p])            # on retire la traction tout de suite
+                for d in ti.static(range(2)):
+                    sig[d, d] = ti.math.clamp(sig[d, d], 0.1, 1.0)
+                F[p] = U @ sig @ V.transpose()
 \end{lstlisting}
-Ensuite le comportement \emph{permanent} d'une particule rompue, en tête du \code{if} :
+Ensuite le comportement \emph{permanent} d'une particule rompue, en tête du \code{if} de \code{G2P_solid} :
 \begin{lstlisting}
         if broken[p] == 1:
             U, sig, V = ti.svd(F_new)
@@ -563,27 +718,31 @@ Ensuite le comportement \emph{permanent} d'une particule rompue, en tête du \co
 \end{lstlisting}
 La boucle \code{for d in ti.static(range(2))} est déroulée à la compilation et écrête les deux
 allongements principaux ; \code{U @ sig @ V.transpose()} recompose $\mathbf F$ avec la même
-rotation. Une particule rompue ne repasse jamais par le bloc d'endommagement (\code{elif}).
+rotation. Une particule rompue ne repasse jamais par \code{update_damage} (test
+\code{broken[p] == 0}).
 
-\paragraph{Ce que l'on doit voir (touche 3).} Chargez progressivement. Vers 2.5 à 3, les premières
-particules rouges apparaissent \emph{aux encastrements}, sur la fibre supérieure : c'est là que le
-moment fléchissant d'une poutre bi-encastrée est maximal ($qL^2/12$ contre $qL^2/24$ à
-mi-portée). La poutre se détache des piliers, devient une poutre sur appuis, puis se fissure
-\emph{à mi-portée} par le dessous : trois rotules, mécanisme de ruine classique. Les deux moitiés
-tombent, tournent, heurtent le sol et s'y brisent en éclats (l'impact à plusieurs mètres par
-seconde sur une paroi rigide impose des déformations bien supérieures à $\varepsilon_f$).
+\paragraph{Ce que l'on doit voir (touche 3).} Chargez progressivement. Jusqu'à 7, rien ne
+casse. À 8, la première particule rompue apparaît vers $t \approx 0.18$~s près d'un encastrement,
+sur la fibre supérieure : c'est là que le moment fléchissant d'une poutre bi-encastrée est maximal
+($qL^2/12$ contre $qL^2/24$ à mi-portée). La poutre se détache des piliers et tombe. Au bout d'une
+seconde, seules 60 particules sur 2685 (2~\%) sont rompues, choc contre le sol compris : la poutre
+se rompt, elle n'éclate pas (comparez avec le \S\ref{sec:shatter}).
 
-Mesures faites sur ce code, avec les paramètres de la table du \S\ref{sec:stab}, sur 1~s :
+Mesures faites sur ce code, avec les paramètres de la table du \S\ref{sec:stab} (charge en rampe de
+50~$g$/s), sur 1~s ; la flèche est la moyenne de $0.58 - y$ sur une bande de $\pm0.03$ autour de
+mi-portée :
 
 \begin{center}
 \begin{tabular}{@{}llll@{}}
 \toprule
 Charge & Modèle & $D_{\max}$ & Comportement \\
 \midrule
-1 & 3 & 0 & flèche $\approx 0.014$, aucune particule endommagée \\
-2 & 3 & 0.28 & fissuration visible, la poutre tient \\
-3 & 3 & 1 & rupture aux encastrements à $t\approx0.1$~s, à mi-portée vers $t\approx0.2$~s, chute \\
-3 & 1 & -- & (élastique) flèche $\approx 0.04$, oscille, ne casse pas \\
+1 & 3 & 0 & flèche $\approx 0.01$, aucune particule endommagée \\
+4 & 3 & 0.16 & flèche $\approx 0.03$, la poutre tient \\
+6 & 3 & 0.35 & flèche $\approx 0.04$, la poutre tient \\
+7 & 3 & 0.48 & flèche $\approx 0.045$, la poutre tient \\
+8 & 3 & 1 & rupture près de l'encastrement à $t\approx0.18$~s, 60 particules rompues à 1~s, chute \\
+3 & 1 & -- & (élastique) flèche $\approx 0.023$, ne casse pas \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -615,11 +774,25 @@ Un pas de temps, avec la charge \code{load} comme multiplicateur de gravité et 
 def substep(load, use_damage, use_rupture):
     clear_grid()
     P2G_solid(grid_m, grid_v, x_s, v_s, C_s, F_s, D_s, broken_s,
-              inv_dx, dt, dx, mu_s, la_s, p_mass, p_vol)
-    grid_update(grid_m, grid_v, mask, dt, load * g, bound, n_grid)
-    G2P_solid(grid_v, x_s, v_s, C_s, F_s, D_s, broken_s,
-              inv_dx, dt, dx, bound, eps0, epsf, use_damage, use_rupture)
+              inv_dx, dt, dx, mu_s, la_s, p_mass, p_vol, k_res)
+    grid_update(grid_m, grid_v, mask, dt, load * g, damp, bound, n_grid)
+    G2P_solid(grid_v, x_s, v_s, C_s, F_s, broken_s,
+              inv_dx, dt, dx, bound)
+    if use_damage == 1:
+        clear_eps(grid_e, grid_w)
+        scatter_eps(grid_e, grid_w, x_s, F_s, broken_s, inv_dx)
+        update_damage(grid_e, grid_w, x_s, F_s, D_s, broken_s, inv_dx, dt,
+                      eps0, epsf, tau_D, use_rupture)
 \end{lstlisting}
+
+\paragraph{Rampe de charge.} Le curseur fixe une charge \emph{cible} \code{load_target} ; la charge
+effective \code{load} part de 0 et la rejoint à \code{ramp_rate} $= 50\,g$/s :
+\begin{lstlisting}
+            load = min(load + ramp_rate * dt, load_target) if load < load_target else load_target
+            substep(load, use_damage, use_rupture)
+\end{lstlisting}
+Une charge appliquée d'un coup injecte de l'énergie cinétique qui fait éclater la poutre
+(\S\ref{sec:shatter}) ; la touche R remet \code{load} à 0.
 
 \paragraph{Affichage.} On ne peut plus se contenter d'une image de la grille : il faut voir les
 particules solides et leur couleur. GGUI dessine des disques depuis un champ de positions avec
@@ -635,6 +808,9 @@ Le curseur de charge est un \code{gui.slider_float}. Le code complet est en anne
   \item Matériau ductile : $\varepsilon_f = 0.5$. La poutre pend comme du caoutchouc avant de céder.
   \item Appui simple : piliers arrêtés sous la poutre (\code{pos.y <= beam_y0}). La rupture se
         produit alors d'abord à mi-portée.
+  \item Retrouvez l'éclatement : mettez \code{tau_D = 1e-9} (plus de limite de vitesse), ou
+        \code{ramp_rate = 1e9} et \code{damp = 0} (charge instantanée), et comparez la couleur
+        \og endommagement \fg{} à charge 8 : la rupture se propage à toute la poutre.
   \item Console : supprimez le pilier droit. Une poutre encastrée-libre casse à l'encastrement.
   \item Critère de Von Mises : calculez $\bm\sigma = \bm\tau/J$ dans \code{G2P_solid}, puis
         $\sigma_{\rm eq}$, et remplacez \code{eps} par $\sigma_{\rm eq}/E$. Observez que les zones
@@ -682,7 +858,7 @@ physiques :
   \node[stp,fill=orange!10, right=0.5cm of a] (b) {2. \code{P2G_solid}\\ s'ajoute};
   \node[stp,fill=gray!10, right=0.5cm of b] (c) {3. \code{grid_step}\\ $v_i$, gravité, parois, piliers};
   \node[stp,fill=blue!5, below=0.6cm of c] (d) {4. \code{G2P} fluide\\ $v, C, J$};
-  \node[stp,fill=orange!10, left=0.5cm of d] (e) {5. \code{G2P_solid}\\ $v, C, \mathbf F, D$, advection};
+  \node[stp,fill=orange!10, left=0.5cm of d] (e) {5. \code{G2P_solid}\\ $v, C, \mathbf F$, advection};
   \node[stp,fill=blue!5, left=0.5cm of e] (f) {6. \code{advect_fluid}\\ $x \mathrel{+}= \Delta t\, v$};
   \draw[arr] (a) -- (b); \draw[arr] (b) -- (c); \draw[arr] (c) -- (d);
   \draw[arr] (d) -- (e); \draw[arr] (e) -- (f);
@@ -695,6 +871,10 @@ physiques :
         modification de \code{APIC/APIC.py} n'est nécessaire.
   \item \code{grid_step} du fluide sert tel quel : son masque \code{solid} (obstacles) devient le
         masque des piliers.
+  \item L'endommagement (\code{clear_eps}, \code{scatter_eps}, \code{update_damage}) s'exécute juste
+        après le \code{G2P_solid}. Il utilise ses propres champs de grille \code{grid_e} et
+        \code{grid_w} : seules les particules solides y contribuent, le fluide n'est pas lissé avec
+        le solide.
   \item Le \code{G2P} du fluide n'avance pas les particules (c'était le rôle de
         \code{time_integration}) ; un kernel \code{advect_fluid} de trois lignes le fait avec le
         \emph{même} $\Delta t$.
@@ -745,7 +925,8 @@ d'eau lâché au-dessus du tablier :
 \begin{lstlisting}
 import taichi as ti
 from APIC.APIC import P2G, G2P, grid_step
-from MpM.mpm_solid import (P2G_solid, G2P_solid, init_beam, solid_colors, solid_stats)
+from MpM.mpm_solid import (P2G_solid, G2P_solid, clear_eps, scatter_eps, update_damage,
+                           init_beam, solid_colors, solid_stats)
 
 ti.init(arch=ti.gpu)
 
@@ -770,6 +951,7 @@ rho_s, E_s, nu_s = 2.0, 3000.0, 0.3
 mu_s = E_s / (2 * (1 + nu_s))
 la_s = E_s * nu_s / ((1 + nu_s) * (1 - 2 * nu_s))
 eps0, epsf = 0.05, 0.20
+tau_D, k_res = 2e-3, 1e-3
 use_damage, use_rupture = 1, 1
 p_spacing = 0.5 * dx
 p_vol_s = p_spacing ** 2
@@ -809,6 +991,8 @@ col_s = ti.Vector.field(3, ti.f32, n_solid)
 
 grid_v = ti.Vector.field(2, ti.f32, (n_grid, n_grid))
 grid_m = ti.field(ti.f32, (n_grid, n_grid))
+grid_e = ti.field(ti.f32, (n_grid, n_grid))    # allongement lissé (endommagement non local)
+grid_w = ti.field(ti.f32, (n_grid, n_grid))
 solid = ti.field(ti.f32, (n_grid, n_grid))     # 1 = pilier
 img = ti.Vector.field(3, ti.f32, (n_grid, n_grid))
 \end{lstlisting}
@@ -847,18 +1031,22 @@ def init_scene():
 
 \subsection{Le pas de temps couplé}
 
-C'est le c\oe ur de la partie II, et il tient en six appels dans l'ordre du schéma :
+C'est le c\oe ur de la partie II, et il tient en sept étapes dans l'ordre du schéma (l'endommagement,
+qui n'existe pas côté fluide, se glisse entre le \code{G2P_solid} et l'advection du fluide) :
 
 \begin{lstlisting}
 def substep():
     P2G(grid_m, grid_v, x_f, v_f, C_f, J_f, inv_dx, dt, dx, E_f, p_mass_f, p_vol_f)   # 1
     P2G_solid(grid_m, grid_v, x_s, v_s, C_s, F_s, D_s, broken_s,
-              inv_dx, dt, dx, mu_s, la_s, p_mass_s, p_vol_s)                           # 2
+              inv_dx, dt, dx, mu_s, la_s, p_mass_s, p_vol_s, k_res)                    # 2
     grid_step(grid_m, grid_v, solid, dt, g, bound, n_grid)                             # 3
     G2P(grid_m, grid_v, x_f, v_f, C_f, J_f, inv_dx, dt, dx, E_f, p_mass_f, p_vol_f)   # 4
-    G2P_solid(grid_v, x_s, v_s, C_s, F_s, D_s, broken_s,
-              inv_dx, dt, dx, bound, eps0, epsf, use_damage, use_rupture)              # 5
-    advect_fluid()                                                                     # 6
+    G2P_solid(grid_v, x_s, v_s, C_s, F_s, broken_s, inv_dx, dt, dx, bound)             # 5
+    clear_eps(grid_e, grid_w)                                                          # 6
+    scatter_eps(grid_e, grid_w, x_s, F_s, broken_s, inv_dx)
+    update_damage(grid_e, grid_w, x_s, F_s, D_s, broken_s, inv_dx, dt,
+                  eps0, epsf, tau_D, use_rupture)
+    advect_fluid()                                                                     # 7
 \end{lstlisting}
 
 \paragraph{Ce qui se passe sur un n\oe ud sous le tablier quand l'eau arrive.} Après l'appel 1, le
@@ -869,6 +1057,11 @@ masses : le n\oe ud descend, moins vite que l'eau. À l'appel 4 l'eau relit cett
 est freinée (et $J_f$ diminue, la pression monte). À l'appel 5 le tablier relit la même vitesse :
 il est poussé vers le bas, son $\mathbf F$ se met à fléchir, et au pas suivant sa force élastique
 repoussera le n\oe ud vers le haut. L'équilibre dynamique s'établit en quelques pas.
+
+\paragraph{L'endommagement dans le couplage.} Les étapes 6 relisent l'allongement de chaque
+particule solide, le lissent sur la grille (\code{grid_e}, \code{grid_w}, propres au solide) et mettent
+à jour $D_p$ à vitesse limitée ; l'eau n'intervient qu'à travers la vitesse nodale commune, donc à
+travers $\mathbf F_p$. La grille commune \code{grid_m} n'est pas modifiée par ces trois appels.
 
 \subsection{Affichage et boucle}
 
@@ -888,36 +1081,36 @@ l'annexe~\ref{app:fsi}.
 \subsection{Ce que l'on doit voir}
 
 Le bloc d'eau tombe pendant $0.2$~s et frappe le tablier à environ $2$~m/s. Le tablier fléchit
-(en mode déformation : rouge dessous à mi-portée, rouge dessus aux piliers), jaunit, puis vers
-$t \approx 0.3$~s les premières particules rouges apparaissent aux encastrements. Le tablier se
+(en mode déformation : rouge dessous à mi-portée, rouge dessus aux piliers), jaunit, puis entre
+$0.2$ et $0.3$~s les premières particules rouges apparaissent aux encastrements. Le tablier se
 décroche des deux piliers, tombe d'un bloc dans le bassin en entraînant l'eau qui le recouvrait,
 et coule (il est deux fois plus dense que l'eau). L'eau du bloc déferle sur les piliers et
 rejoint le bassin. Mesures sur ce code ($n = 128$, environ $20\,000$ particules de fluide et
-$2\,700$ de solide, 15~s de calcul par seconde simulée sur GPU) :
+$2\,700$ de solide) :
 
 \begin{center}
 \begin{tabular}{@{}lllll@{}}
 \toprule
 $t$ (s) & $D_{\max}$ & rompues & $y$ mi-portée & commentaire \\
 \midrule
-0.10 & 0 & 0 & 0.418 & chute libre de l'eau, tablier au repos sous son poids \\
-0.20 & 0.20 & 0 & 0.398 & impact, flexion, début de l'endommagement \\
-0.30 & 1 & 65 & 0.256 & rupture aux deux encastrements, le tablier tombe \\
-0.50 & 1 & 272 & 0.299 & tablier dans le bassin, éclats aux extrémités \\
-1.00 & 1 & 290 & 0.254 & tablier au fond, l'eau se calme \\
+0.10 & 0 & 0 & 0.417 & chute libre de l'eau, tablier au repos sous son poids \\
+0.20 & 0.05 & 0 & 0.397 & impact, flexion, début de l'endommagement \\
+0.30 & 1 & 61 & 0.298 & rupture aux deux encastrements, le tablier tombe \\
+0.50 & 1 & 64 & 0.242 & tablier dans le bassin \\
+1.00 & 1 & 64 & 0.233 & tablier au fond, l'eau se calme \\
 \bottomrule
 \end{tabular}
 \end{center}
 
 La masse totale sur la grille (fluide $+$ solide) est conservée à la précision machine, $J_f$
-reste dans $[0.65, 1.25]$ (les valeurs extrêmes sont des particules d'eau coincées entre le
+reste dans $[0.46, 1.51]$ (les valeurs extrêmes sont des particules d'eau coincées entre le
 tablier qui tombe et un pilier) et la simulation reste stable indéfiniment. À $n = 256$ le
 programme tourne tel quel : $\Delta t$ est divisé par deux automatiquement.
 
 \paragraph{Expériences.}
 \begin{itemize}
   \item Rendez le tablier plus résistant ($E_s = 10^4$ ou $\varepsilon_f = 0.4$) : il encaisse la
-        vague et vibre. Plus fragile ($\varepsilon_f = 0.08$) : il se brise en plusieurs morceaux.
+        vague et vibre. Plus fragile ($\varepsilon_f = 0.08$) : la rupture est plus précoce et plus nette.
   \item Remplacez le bloc qui tombe par une rupture de barrage (colonne d'eau à gauche,
         \code{water_x0, water_x1 = 0.03, 0.30}, du sol au sommet) : la vague frappe le pilier et
         passe sous le tablier ; observez la poussée vers le haut.
@@ -982,7 +1175,7 @@ def P2G_solid(grid_m: ti.template(), grid_v: ti.template(),
               x: ti.template(), v: ti.template(), C: ti.template(), F: ti.template(),
               D: ti.template(), broken: ti.template(),
               inv_dx: float, dt: float, dx: float,
-              mu: float, la: float, p_mass: float, p_vol: float):
+              mu: float, la: float, p_mass: float, p_vol: float, k_res: float):
     """Ne remet PAS la grille à zéro : on peut l'appeler après le P2G du fluide (grille partagée)."""
     for p in x:
         base = (x[p] * inv_dx - 0.5).cast(int)
@@ -991,7 +1184,7 @@ def P2G_solid(grid_m: ti.template(), grid_v: ti.template(),
              0.75 - (fx - 1.0)**2,
              0.5 * (fx - 0.5)**2]
 
-        k = 1.0 - D[p]
+        k = ti.max(1.0 - D[p], k_res)      # plancher : jamais totalement sans raideur
         if broken[p] == 1:
             k = 1.0
         tau = kirchhoff_stress(F[p], k * mu, k * la)
@@ -1008,10 +1201,11 @@ def P2G_solid(grid_m: ti.template(), grid_v: ti.template(),
 
 @ti.kernel
 def grid_update(grid_m: ti.template(), grid_v: ti.template(), mask: ti.template(),
-                dt: float, g: float, bound: int, n_grid: int):
+                dt: float, g: float, damp: float, bound: int, n_grid: int):
     for i, j in grid_m:
         if grid_m[i, j] > 0:
             grid_v[i, j] /= grid_m[i, j]
+            grid_v[i, j] *= 1.0 - damp * dt         # amortissement léger
             grid_v[i, j].y -= dt * g
             if i < bound and grid_v[i, j].x < 0:
                 grid_v[i, j].x = 0.0
@@ -1028,9 +1222,8 @@ def grid_update(grid_m: ti.template(), grid_v: ti.template(), mask: ti.template(
 @ti.kernel
 def G2P_solid(grid_v: ti.template(),
               x: ti.template(), v: ti.template(), C: ti.template(), F: ti.template(),
-              D: ti.template(), broken: ti.template(),
-              inv_dx: float, dt: float, dx: float, bound: int,
-              eps0: float, epsf: float, use_damage: int, use_rupture: int):
+              broken: ti.template(),
+              inv_dx: float, dt: float, dx: float, bound: int):
     I = ti.Matrix.identity(ti.f32, 2)
     for p in x:
         base = (x[p] * inv_dx - 0.5).cast(int)
@@ -1059,18 +1252,63 @@ def G2P_solid(grid_v: ti.template(),
                 sig[d, d] = ti.math.clamp(sig[d, d], 0.1, 1.0)
             F_new = U @ sig @ V.transpose()
 
-        elif use_damage == 1:
-            U, sig, V = ti.svd(F_new)
-            eps = ti.max(sig[0, 0], sig[1, 1]) - 1.0
-            D_new = ti.math.clamp((eps - eps0) / (epsf - eps0), 0.0, 1.0)
-            D[p] = ti.max(D[p], D_new)
-            if use_rupture == 1 and D[p] >= 1.0:
-                broken[p] = 1
-                F_new = I
-
         F[p] = F_new
         x[p] += dt * v[p]
         x[p] = ti.math.clamp(x[p], bound * dx, 1.0 - bound * dx)
+
+
+@ti.kernel
+def clear_eps(grid_e: ti.template(), grid_w: ti.template()):
+    for i, j in grid_e:
+        grid_e[i, j] = 0.0
+        grid_w[i, j] = 0.0
+
+
+@ti.kernel
+def scatter_eps(grid_e: ti.template(), grid_w: ti.template(),
+                x: ti.template(), F: ti.template(), broken: ti.template(), inv_dx: float):
+    """Étale l'allongement principal des particules saines sur la grille (somme pondérée)."""
+    for p in x:
+        if broken[p] == 0:
+            base = (x[p] * inv_dx - 0.5).cast(int)
+            fx = x[p] * inv_dx - base
+            w = [0.5 * (1.5 - fx)**2,
+                 0.75 - (fx - 1.0)**2,
+                 0.5 * (fx - 0.5)**2]
+            U, sig, V = ti.svd(F[p])
+            eps = ti.max(sig[0, 0], sig[1, 1]) - 1.0
+            for i, j in ti.static(ti.ndrange(3, 3)):
+                weight = w[i].x * w[j].y
+                grid_e[base + ti.Vector([i, j])] += weight * eps
+                grid_w[base + ti.Vector([i, j])] += weight
+
+
+@ti.kernel
+def update_damage(grid_e: ti.template(), grid_w: ti.template(),
+                  x: ti.template(), F: ti.template(), D: ti.template(), broken: ti.template(),
+                  inv_dx: float, dt: float,
+                  eps0: float, epsf: float, tau_D: float, use_rupture: int):
+    """Endommagement non local (allongement lissé) et à vitesse limitée (dD <= dt / tau_D)."""
+    for p in x:
+        if broken[p] == 0:
+            base = (x[p] * inv_dx - 0.5).cast(int)
+            fx = x[p] * inv_dx - base
+            w = [0.5 * (1.5 - fx)**2,
+                 0.75 - (fx - 1.0)**2,
+                 0.5 * (fx - 0.5)**2]
+            eps = 0.0
+            for i, j in ti.static(ti.ndrange(3, 3)):
+                node = base + ti.Vector([i, j])
+                if grid_w[node] > 0:
+                    eps += w[i].x * w[j].y * grid_e[node] / grid_w[node]
+            D_new = ti.math.clamp((eps - eps0) / (epsf - eps0), 0.0, 1.0)
+            D[p] = ti.max(D[p], ti.min(D_new, D[p] + dt / tau_D))
+            if use_rupture == 1 and D[p] >= 1.0:
+                broken[p] = 1
+                U, sig, V = ti.svd(F[p])           # on retire la traction tout de suite
+                for d in ti.static(range(2)):
+                    sig[d, d] = ti.math.clamp(sig[d, d], 0.1, 1.0)
+                F[p] = U @ sig @ V.transpose()
 
 
 @ti.kernel
@@ -1147,6 +1385,10 @@ g = 9.81
 
 eps0 = 0.05                          # début de l'endommagement (allongement principal)
 epsf = 0.20                          # rupture complète (petit = fragile, grand = ductile)
+tau_D = 2e-3                         # D croît au plus de dt/tau_D par pas
+k_res = 1e-3                         # raideur résiduelle (1-D >= k_res)
+damp = 20.0                          # amortissement de la vitesse de grille (1/s)
+ramp_rate = 50.0                     # montée de la charge (x g par seconde simulée)
 
 c_p = ((la_s + 2 * mu_s) / rho_s) ** 0.5
 dt = 0.4 * dx / c_p
@@ -1173,6 +1415,8 @@ col_s = ti.Vector.field(3, ti.f32, n_solid)
 
 grid_v = ti.Vector.field(2, ti.f32, (n_grid, n_grid))
 grid_m = ti.field(ti.f32, (n_grid, n_grid))
+grid_e = ti.field(ti.f32, (n_grid, n_grid))
+grid_w = ti.field(ti.f32, (n_grid, n_grid))
 mask = ti.field(ti.i32, (n_grid, n_grid))
 img = ti.Vector.field(3, ti.f32, (n_grid, n_grid))
 
@@ -1207,10 +1451,15 @@ def init_scene():
 def substep(load, use_damage, use_rupture):
     clear_grid()
     P2G_solid(grid_m, grid_v, x_s, v_s, C_s, F_s, D_s, broken_s,
-              inv_dx, dt, dx, mu_s, la_s, p_mass, p_vol)
-    grid_update(grid_m, grid_v, mask, dt, load * g, bound, n_grid)
-    G2P_solid(grid_v, x_s, v_s, C_s, F_s, D_s, broken_s,
-              inv_dx, dt, dx, bound, eps0, epsf, use_damage, use_rupture)
+              inv_dx, dt, dx, mu_s, la_s, p_mass, p_vol, k_res)
+    grid_update(grid_m, grid_v, mask, dt, load * g, damp, bound, n_grid)
+    G2P_solid(grid_v, x_s, v_s, C_s, F_s, broken_s,
+              inv_dx, dt, dx, bound)
+    if use_damage == 1:
+        clear_eps(grid_e, grid_w)
+        scatter_eps(grid_e, grid_w, x_s, F_s, broken_s, inv_dx)
+        update_damage(grid_e, grid_w, x_s, F_s, D_s, broken_s, inv_dx, dt,
+                      eps0, epsf, tau_D, use_rupture)
 
 
 def main():
@@ -1219,7 +1468,8 @@ def main():
     gui = window.get_gui()
     model = 3
     color_mode = 0
-    load = 1.0
+    load_target = 1.0
+    load = 0.0
     t_sim = 0.0
     init_scene()
     render_background()
@@ -1234,12 +1484,14 @@ def main():
             elif k == 'r':
                 init_scene()
                 t_sim = 0.0
+                load = 0.0
             elif k in ('1', '2', '3'):
                 model = int(k)
 
         use_damage = 1 if model >= 2 else 0
         use_rupture = 1 if model == 3 else 0
         for _ in range(render_substep):
+            load = min(load + ramp_rate * dt, load_target) if load < load_target else load_target
             substep(load, use_damage, use_rupture)
             t_sim += dt
 
@@ -1249,7 +1501,7 @@ def main():
         canvas.circles(x_s, radius=0.6 * p_spacing, per_vertex_color=col_s)
 
         gui.begin("MPM solide", 0.02, 0.02, 0.46, 0.30)
-        load = gui.slider_float("charge (x g)", load, 0.0, 6.0)
+        load_target = gui.slider_float("charge (x g)", load_target, 0.0, 12.0)
         gui.text(f"modele : {['', 'elastique', 'endommagement', 'endommagement + rupture'][model]}   (touches 1/2/3)")
         gui.text(f"dt = {dt:.2e}   t = {t_sim:.3f} s")
         gui.text(f"D max = {stats[1]:.2f}   rompues = {int(stats[0])}/{n_solid}")
@@ -1273,7 +1525,8 @@ if __name__ == "__main__":
 
 import taichi as ti
 from APIC.APIC import P2G, G2P, grid_step
-from MpM.mpm_solid import (P2G_solid, G2P_solid, init_beam, solid_colors, solid_stats)
+from MpM.mpm_solid import (P2G_solid, G2P_solid, clear_eps, scatter_eps, update_damage,
+                           init_beam, solid_colors, solid_stats)
 
 ti.init(arch=ti.gpu)
 
@@ -1302,6 +1555,7 @@ nu_s = 0.3
 mu_s = E_s / (2 * (1 + nu_s))
 la_s = E_s * nu_s / ((1 + nu_s) * (1 - 2 * nu_s))
 eps0, epsf = 0.05, 0.20
+tau_D, k_res = 2e-3, 1e-3
 use_damage, use_rupture = 1, 1
 
 p_spacing = 0.5 * dx
@@ -1339,6 +1593,8 @@ col_s = ti.Vector.field(3, ti.f32, n_solid)
 # grille commune
 grid_v = ti.Vector.field(2, ti.f32, (n_grid, n_grid))
 grid_m = ti.field(ti.f32, (n_grid, n_grid))
+grid_e = ti.field(ti.f32, (n_grid, n_grid))           # allongement lissé (endommagement non local)
+grid_w = ti.field(ti.f32, (n_grid, n_grid))
 solid = ti.field(ti.f32, (n_grid, n_grid))            # 1 = pilier
 img = ti.Vector.field(3, ti.f32, (n_grid, n_grid))
 
@@ -1383,12 +1639,15 @@ def init_scene():
 def substep():
     P2G(grid_m, grid_v, x_f, v_f, C_f, J_f, inv_dx, dt, dx, E_f, p_mass_f, p_vol_f)      # 1
     P2G_solid(grid_m, grid_v, x_s, v_s, C_s, F_s, D_s, broken_s,
-              inv_dx, dt, dx, mu_s, la_s, p_mass_s, p_vol_s)                              # 2
+              inv_dx, dt, dx, mu_s, la_s, p_mass_s, p_vol_s, k_res)                       # 2
     grid_step(grid_m, grid_v, solid, dt, g, bound, n_grid)                                # 3
     G2P(grid_m, grid_v, x_f, v_f, C_f, J_f, inv_dx, dt, dx, E_f, p_mass_f, p_vol_f)      # 4
-    G2P_solid(grid_v, x_s, v_s, C_s, F_s, D_s, broken_s,
-              inv_dx, dt, dx, bound, eps0, epsf, use_damage, use_rupture)                 # 5
-    advect_fluid()                                                                        # 6
+    G2P_solid(grid_v, x_s, v_s, C_s, F_s, broken_s, inv_dx, dt, dx, bound)                # 5
+    clear_eps(grid_e, grid_w)                                                             # 6
+    scatter_eps(grid_e, grid_w, x_s, F_s, broken_s, inv_dx)
+    update_damage(grid_e, grid_w, x_s, F_s, D_s, broken_s, inv_dx, dt,
+                  eps0, epsf, tau_D, use_rupture)
+    advect_fluid()                                                                        # 7
 
 
 def main():

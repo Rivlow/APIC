@@ -18,11 +18,11 @@ except ImportError:          # lancé directement depuis le dossier MpM/
 ti.init(arch=ti.gpu)
 
 # ---------------------------------------------------------------- paramètres numériques
-n_grid = 128
+n_grid = 256
 dx = 1.0 / n_grid
 inv_dx = float(n_grid)
 bound = 3
-render_substep = 20
+render_substep = 40
 
 # ---------------------------------------------------------------- paramètres physiques
 rho_s = 2.0                          # masse volumique du solide
@@ -33,7 +33,11 @@ la_s = E_s * nu_s / ((1 + nu_s) * (1 - 2 * nu_s))
 g = 9.81
 
 eps0 = 0.05                          # début de l'endommagement (allongement principal)
-epsf = 0.20                          # rupture complète (petit = fragile, grand = ductile)
+epsf = 0.80                          # rupture complète (petit = fragile, grand = ductile)
+tau_D = 1e-3                         # temps d'endommagement : D croît au plus de dt/tau_D par pas
+k_res = 1e-3                         # raideur résiduelle (1-D >= k_res)
+damp = 10.0                          # amortissement de la vitesse de grille (1/s)
+ramp_rate = 50.0                     # montée de la charge (x g par seconde simulée), évite le choc initial
 
 # Pas de temps explicite : dt < dx / c_p avec c_p = sqrt((la + 2 mu) / rho) (ondes de compression)
 c_p = (( la_s + 2 * mu_s) / rho_s) ** 0.5
@@ -63,6 +67,8 @@ col_s = ti.Vector.field(3, ti.f32, n_solid)
 
 grid_v = ti.Vector.field(2, ti.f32, (n_grid, n_grid))
 grid_m = ti.field(ti.f32, (n_grid, n_grid))
+grid_e = ti.field(ti.f32, (n_grid, n_grid))          # allongement lissé (endommagement non local)
+grid_w = ti.field(ti.f32, (n_grid, n_grid))
 mask = ti.field(ti.i32, (n_grid, n_grid))            # 1 = pilier (obstacle rigide)
 img = ti.Vector.field(3, ti.f32, (n_grid, n_grid))
 
@@ -97,10 +103,15 @@ def init_scene():
 def substep(load, use_damage, use_rupture):
     clear_grid()
     P2G_solid(grid_m, grid_v, x_s, v_s, C_s, F_s, D_s, broken_s,
-              inv_dx, dt, dx, mu_s, la_s, p_mass, p_vol)
-    grid_update(grid_m, grid_v, mask, dt, load * g, bound, n_grid)
-    G2P_solid(grid_v, x_s, v_s, C_s, F_s, D_s, broken_s,
-              inv_dx, dt, dx, bound, eps0, epsf, use_damage, use_rupture)
+              inv_dx, dt, dx, mu_s, la_s, p_mass, p_vol, k_res)
+    grid_update(grid_m, grid_v, mask, dt, load * g, damp, bound, n_grid)
+    G2P_solid(grid_v, x_s, v_s, C_s, F_s, broken_s,
+              inv_dx, dt, dx, bound)
+    if use_damage == 1:
+        clear_eps(grid_e, grid_w)
+        scatter_eps(grid_e, grid_w, x_s, F_s, broken_s, inv_dx)
+        update_damage(grid_e, grid_w, x_s, F_s, D_s, broken_s, inv_dx, dt,
+                      eps0, epsf, tau_D, use_rupture)
 
 
 # ---------------------------------------------------------------- boucle principale
@@ -110,7 +121,8 @@ def main():
     gui = window.get_gui()
     model = 3                # 1 élastique, 2 endommagement, 3 endommagement + rupture
     color_mode = 0
-    load = 1.0
+    load_target = 1.0
+    load = 0.0               # charge effective : rejoint load_target en rampe
     t_sim = 0.0
     init_scene()
     render_background()
@@ -125,12 +137,14 @@ def main():
             elif k == 'r':
                 init_scene()
                 t_sim = 0.0
+                load = 0.0
             elif k in ('1', '2', '3'):
                 model = int(k)
 
         use_damage = 1 if model >= 2 else 0
         use_rupture = 1 if model == 3 else 0
         for _ in range(render_substep):
+            load = min(load + ramp_rate * dt, load_target) if load < load_target else load_target
             substep(load, use_damage, use_rupture)
             t_sim += dt
 
@@ -140,7 +154,7 @@ def main():
         canvas.circles(x_s, radius=0.6 * p_spacing, per_vertex_color=col_s)
 
         gui.begin("MPM solide", 0.02, 0.02, 0.46, 0.30)
-        load = gui.slider_float("charge (x g)", load, 0.0, 6.0)
+        load_target = gui.slider_float("charge (x g)", load_target, 0.0, 120.0)
         gui.text(f"modele : {['', 'elastique', 'endommagement', 'endommagement + rupture'][model]}   (touches 1/2/3)")
         gui.text(f"dt = {dt:.2e}   t = {t_sim:.3f} s")
         gui.text(f"D max = {stats[1]:.2f}   rompues = {int(stats[0])}/{n_solid}")

@@ -10,7 +10,9 @@
 # Cycle par pas de temps (identique au fluide) :
 #   1. P2G_solid    : dépôt masse + quantité de mouvement + force interne  -sum_p V_p tau_p grad(w_ip)
 #   2. grid_update  : quantité de mouvement -> vitesse, gravité, parois, obstacles (= grid_step du fluide)
-#   3. G2P_solid    : relecture v, C ; mise à jour de F, de l'endommagement, de la rupture ; advection
+#   3. G2P_solid    : relecture v, C ; mise à jour de F (écrêtage des particules rompues) ; advection
+#   4. scatter_eps + update_damage : endommagement NON LOCAL (allongement lissé par la grille) et à vitesse
+#      limitée (dD <= dt / tau_D) ; c'est ce qui évite que la poutre éclate comme du verre à la rupture.
 
 import taichi as ti
 
@@ -36,7 +38,7 @@ def P2G_solid(grid_m: ti.template(), grid_v: ti.template(),
               x: ti.template(), v: ti.template(), C: ti.template(), F: ti.template(),
               D: ti.template(), broken: ti.template(),
               inv_dx: float, dt: float, dx: float,
-              mu: float, la: float, p_mass: float, p_vol: float):
+              mu: float, la: float, p_mass: float, p_vol: float, k_res: float):
     """Ne remet PAS la grille à zéro : on peut l'appeler après le P2G du fluide (grille partagée)."""
 
     for p in x:
@@ -47,10 +49,11 @@ def P2G_solid(grid_m: ti.template(), grid_v: ti.template(),
              0.75 - (fx - 1.0)**2,
              0.5 * (fx - 0.5)**2]
 
-        # Raideur effective : (1 - D) E pour une particule endommagée.
+        # Raideur effective : (1 - D) E pour une particule endommagée, avec un plancher k_res
+        # (une particule totalement sans raideur se comporterait comme de la poussière).
         # Une particule rompue garde sa raideur (elle résiste encore en compression)
         # mais son F est écrêté dans G2P pour ne jamais porter de traction.
-        k = 1.0 - D[p]
+        k = ti.max(1.0 - D[p], k_res)
         if broken[p] == 1:
             k = 1.0
         tau = kirchhoff_stress(F[p], k * mu, k * la)
@@ -70,12 +73,14 @@ def P2G_solid(grid_m: ti.template(), grid_v: ti.template(),
 # ---------------------------------------------------------------- 2. Mise à jour de la grille
 @ti.kernel
 def grid_update(grid_m: ti.template(), grid_v: ti.template(), mask: ti.template(),
-                dt: float, g: float, bound: int, n_grid: int):
-    """Même rôle que grid_step() du fluide : vitesse, gravité, parois glissantes, obstacles (mask == 1)."""
+                dt: float, g: float, damp: float, bound: int, n_grid: int):
+    """Même rôle que grid_step() du fluide : vitesse, gravité, parois glissantes, obstacles (mask == 1).
+    damp (1/s) : amortissement léger de la vitesse de grille, dissipe l'énergie cinétique."""
 
     for i, j in grid_m:
         if grid_m[i, j] > 0:
             grid_v[i, j] /= grid_m[i, j]
+            grid_v[i, j] *= 1.0 - damp * dt
             grid_v[i, j].y -= dt * g
             if i < bound and grid_v[i, j].x < 0:
                 grid_v[i, j].x = 0.0
@@ -93,10 +98,9 @@ def grid_update(grid_m: ti.template(), grid_v: ti.template(), mask: ti.template(
 @ti.kernel
 def G2P_solid(grid_v: ti.template(),
               x: ti.template(), v: ti.template(), C: ti.template(), F: ti.template(),
-              D: ti.template(), broken: ti.template(),
-              inv_dx: float, dt: float, dx: float, bound: int,
-              eps0: float, epsf: float, use_damage: int, use_rupture: int):
-    """v, C depuis la grille ; F <- (I + dt C) F ; endommagement ; rupture ; advection."""
+              broken: ti.template(),
+              inv_dx: float, dt: float, dx: float, bound: int):
+    """v, C depuis la grille ; F <- (I + dt C) F ; écrêtage des particules rompues ; advection."""
 
     I = ti.Matrix.identity(ti.f32, 2)
 
@@ -133,23 +137,77 @@ def G2P_solid(grid_v: ti.template(),
                 sig[d, d] = ti.math.clamp(sig[d, d], 0.1, 1.0)
             F_new = U @ sig @ V.transpose()
 
-        elif use_damage == 1:
-            # Endommagement : critère sur l'allongement principal maximal eps = s_max - 1
-            #   D = 0 si eps < eps0, D = 1 si eps > epsf, linéaire entre les deux, jamais décroissant.
-            U, sig, V = ti.svd(F_new)
-            eps = ti.max(sig[0, 0], sig[1, 1]) - 1.0
-            D_new = ti.math.clamp((eps - eps0) / (epsf - eps0), 0.0, 1.0)
-            D[p] = ti.max(D[p], D_new)
-
-            if use_rupture == 1 and D[p] >= 1.0:
-                broken[p] = 1
-                F_new = I          # la particule oublie sa déformation : plus de cohésion
-
         F[p] = F_new
 
         # --- advection
         x[p] += dt * v[p]
         x[p] = ti.math.clamp(x[p], bound * dx, 1.0 - bound * dx)
+
+
+# ---------------------------------------------------------------- 4. Endommagement non local
+@ti.kernel
+def clear_eps(grid_e: ti.template(), grid_w: ti.template()):
+    for i, j in grid_e:
+        grid_e[i, j] = 0.0
+        grid_w[i, j] = 0.0
+
+
+@ti.kernel
+def scatter_eps(grid_e: ti.template(), grid_w: ti.template(),
+                x: ti.template(), F: ti.template(), broken: ti.template(), inv_dx: float):
+    """Étale l'allongement principal des particules saines sur la grille (somme pondérée)."""
+
+    for p in x:
+        if broken[p] == 0:
+            base = (x[p] * inv_dx - 0.5).cast(int)
+            fx = x[p] * inv_dx - base
+            w = [0.5 * (1.5 - fx)**2,
+                 0.75 - (fx - 1.0)**2,
+                 0.5 * (fx - 0.5)**2]
+
+            U, sig, V = ti.svd(F[p])
+            eps = ti.max(sig[0, 0], sig[1, 1]) - 1.0
+
+            for i, j in ti.static(ti.ndrange(3, 3)):
+                weight = w[i].x * w[j].y
+                grid_e[base + ti.Vector([i, j])] += weight * eps
+                grid_w[base + ti.Vector([i, j])] += weight
+
+
+@ti.kernel
+def update_damage(grid_e: ti.template(), grid_w: ti.template(),
+                  x: ti.template(), F: ti.template(), D: ti.template(), broken: ti.template(),
+                  inv_dx: float, dt: float,
+                  eps0: float, epsf: float, tau_D: float, use_rupture: int):
+    """Endommagement à partir de l'allongement LISSÉ (non local), à vitesse limitée (dD <= dt / tau_D).
+
+      D_new = clamp((eps_nl - eps0) / (epsf - eps0), 0, 1)     D <- max(D, min(D_new, D + dt / tau_D))
+    """
+
+    for p in x:
+        if broken[p] == 0:
+            base = (x[p] * inv_dx - 0.5).cast(int)
+            fx = x[p] * inv_dx - base
+            w = [0.5 * (1.5 - fx)**2,
+                 0.75 - (fx - 1.0)**2,
+                 0.5 * (fx - 0.5)**2]
+
+            eps = 0.0
+            for i, j in ti.static(ti.ndrange(3, 3)):
+                node = base + ti.Vector([i, j])
+                if grid_w[node] > 0:
+                    eps += w[i].x * w[j].y * grid_e[node] / grid_w[node]
+
+            D_new = ti.math.clamp((eps - eps0) / (epsf - eps0), 0.0, 1.0)
+            D[p] = ti.max(D[p], ti.min(D_new, D[p] + dt / tau_D))
+
+            if use_rupture == 1 and D[p] >= 1.0:
+                broken[p] = 1
+                # on retire la traction tout de suite (au lieu de F = I) : la compression est conservée
+                U, sig, V = ti.svd(F[p])
+                for d in ti.static(range(2)):
+                    sig[d, d] = ti.math.clamp(sig[d, d], 0.1, 1.0)
+                F[p] = U @ sig @ V.transpose()
 
 
 # ---------------------------------------------------------------- utilitaires
