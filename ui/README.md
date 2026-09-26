@@ -1,91 +1,101 @@
-# `ui/` — éditeur de projet APIC / MPM (PySide6 + Taichi GGUI)
+# `ui/` — solveur APIC / MPM 2D en trois classes
 
-Éditeur de type CAE pour les simulations 2D du dépôt : arbre de projet, panneau de propriétés,
-viewport GGUI embarqué, toolbar Play / Step / Reset, sauvegarde JSON. Le dossier est additif :
-aucun script existant n'est modifié, seules les bibliothèques de kernels `APIC/APIC.py` et
-`Code_tuto/mpm_solid.py` sont importées.
+```
+SimulationRunner  (runner.py)  définit la simulation : paramètres plats + matrices n × n ; JSON ; lance
+Solver            (solver.py)  reçoit paramètres + matrices, alloue les champs Taichi, calcule, rend l'image
+UI                (ui.py)      fenêtre Qt : viewport zoomable, sélection de cellules, paramètres, fichiers
+kernels.py                     les kernels Taichi (fluide avec réservoir, grille, émission, rendu)
+```
+
+Les kernels solides (MLS-MPM corotationnel, endommagement, rupture) viennent de `Code_tuto/mpm_solid.py`,
+inchangé. Rien d'autre dans le dépôt n'est touché.
 
 ## Lancer
 
 ```bash
-# depuis la racine du dépôt (ou n'importe où : ui/__main__.py ajoute la racine au sys.path)
-python -m ui                 # scène par défaut = main_fsi.py (eau + pont)
-python -m ui projet.json     # ouvre un projet
-python -m ui.smoke           # test de fumée sans fenêtre (build, 10 images, JSON, rebuild, release)
+python -m ui                     # scène de main_fsi.py (eau + pont)
+python -m ui canal.json          # une simulation enregistrée
+python -m ui.smoke               # test sans fenêtre (Vulkan puis APIC_UI_ARCH=cuda)
+python ui/examples/channel_flow.py [--show] [--save]
 ```
 
 Dépendances : `pip install -r ui/requirements.txt` (PySide6 ≥ 6.8, taichi 1.7.4, numpy).
 
-## Répartition Qt / Taichi
+## Définir une simulation depuis un script
 
-| Qt (PySide6)                                   | Taichi                                              |
-|------------------------------------------------|-----------------------------------------------------|
-| fenêtre, docks, arbre, propriétés, toolbar     | kernels APIC / MPM, particules, grille              |
-| menus, dialogues fichiers, raccourcis          | rendu (fond, particules, contours) dans une texture |
-| sélection dans l'arbre ↔ viewport              | fenêtre GGUI, événements souris / clavier du viewport |
+```python
+import sys; sys.path.insert(0, r"C:\Users\lucas\Dev\Fun\APIC")
+from ui.runner import SimulationRunner
 
-GGUI seule ne peut pas faire l'éditeur (pas d'arbre, de combo, de saisie texte, de docks ni de
-dialogue fichier dans Taichi 1.7), Qt seule ne peut pas afficher sans copier l'image sur le CPU.
+r = SimulationRunner(n=128, gravity=9.81, solid_E=20000.0)
+X, Y = r.centers()                                   # (n, n) : X[i, j] = (i + 0.5) dx
+r.set_fluid(Y < 0.20)                                # masque numpy booléen = cellules pleines d'eau
+r.set_solid(r.rect(0.55, 0.20, 0.58, 0.55))          # rect / circle renvoient un masque
+r.set_obstacle(r.circle(0.35, 0.28, 0.05))
+r.set_inlet((X < 0.06) & (Y > 0.25) & (Y < 0.45), velocity=(3.0, 0.0))
+r.set_outlet(X > 0.95)
+r.set_velocity(r.rect(0.3, 0.1, 0.5, 0.2), (0.0, 2.0))   # vitesse initiale d'une zone
+
+s = r.run(150, callback=lambda s, k: print(k, s.stats()["n_fluid"]))   # sans fenêtre
+x = s.positions()                                    # (N, 2) numpy, copié du GPU à la demande
+r.save("canal.json")                                 # paramètres + matrices dans un seul fichier
+r.show()                                             # interface Qt
+```
+
+Tout est matrices `(n, n)` indexées `[i, j]` = (x, y) comme les champs Taichi (`m[:, 0]` = rangée du bas) :
+
+| Matrice | Type | Rôle |
+|---|---|---|
+| `fluid`, `solid`, `obstacle` | bool | cellules initialement eau / solide / obstacle (exclusifs, le dernier gagne) |
+| `inlet` + `inlet_vx`, `inlet_vy` | bool + float | entrée : vitesse imposée (grille et particules) et émission jusqu'à `ppc²` particules par cellule |
+| `outlet` | bool | sortie : les particules qui y entrent sont détruites |
+| `vx0`, `vy0` | float | vitesse initiale des particules semées dans la cellule |
+
+Paramètres (`SimulationRunner.PARAMS`) : `n, bound, ppc, cfl, gravity, substeps, seed, capacity, res,
+fluid_rho, fluid_E, solid_rho, solid_E, solid_nu, eps0, epsf, tau_D, k_res, use_damage, use_rupture,
+color_mode`. Les clés `n, bound, ppc, capacity, seed, res` sont structurelles (nouveau solveur au Reset) ;
+les autres s'appliquent à chaud (`Solver.set_params`).
+
+**Bande de paroi** : les particules restent dans `[bound·dx, 1 − bound·dx]` (`r.band`). Le semis y est
+borné et les cellules d'entrée / sortie situées dans la bande sont ignorées : mettre l'entrée un peu
+au-delà (`X < r.band + 2 * r.dx`). Sans cela le stencil 3 × 3 de P2G sortirait de la grille (corruption
+silencieuse sur Vulkan, « illegal address » sur CUDA).
+
+## Interface
+
+- **Viewport** : molette = zoom autour du curseur (×1,25, jusqu'à 64×), bouton droit ou milieu = déplacer
+  la vue, `F` = vue entière, bouton gauche = boîte de sélection de cellules, `Échap` = désélection. Le
+  maillage s'affiche dès qu'une cellule fait 6 px ; les cellules initiales sont teintées (eau bleu,
+  solide jaune, obstacle gris, entrée vert, sortie rouge).
+- **Cellules** (dock droit) : sur la sélection, Eau / Solide / Obstacle / Entrée (vx, vy) / Sortie /
+  Vitesse initiale / Effacer. Toute modification allume le bandeau orange : `Reset` (R) reconstruit.
+- **Paramètres** (dock gauche) : formulaire généré depuis `PARAMS` ; les clés marquées `*` demandent un
+  Reset, les autres agissent immédiatement (gravité, matériaux, CFL…).
+- Toolbar : Play/Pause (Espace), Step (S), Reset (R), Vue entière (F), Ouvrir / Enregistrer (JSON).
+- `APIC_UI_AUTOQUIT=<s>` : lance la lecture et ferme après s secondes en imprimant les stats (tests).
 
 ## Trafic GPU ↔ CPU
 
-Constat vérifié dans `taichi/ui/staging_buffer.py` (1.7.4) : `canvas.circles`, `canvas.lines` et
-`canvas.set_image(champ)` passent par des **tampons numpy** (un `np.ndarray` rempli par un kernel
-puis renvoyé au C++). La GGUI « classique » fait donc un aller-retour GPU → CPU → GPU des sommets à
-chaque image (≈ 4 ms pour 88 k particules ici), y compris dans `main_fsi.py`.
+Semis : numpy → GPU une fois au build / reset. Simulation : 7 lancements de kernels par sous-pas, rien ne
+redescend. Affichage : le kernel `render` dessine la vue zoomée dans une image u8 `(res, res)` sur le
+GPU ; une seule copie GPU → CPU par image affichée (≈ 0,6 ms à 700²). Stats : quelques octets toutes les
+6 images. `positions()` / `velocities()` / `damage()` copient à la demande.
 
-La seule voie zéro copie est `canvas.set_image(ti.Texture)` sur l'**arch Vulkan**. C'est le mode par
-défaut de l'éditeur : un kernel (`render_scene`, `ui/sim/kernels.py`) dessine fond, particules et
-contours dans une texture RGBA8 que GGUI présente telle quelle (≈ 0,3 ms). La simulation est aussi
-rapide sur Vulkan que sur CUDA sur cette machine (≈ 12–14 ms pour 20 sous-pas).
+Arch : Vulkan, puis CUDA, puis CPU ; forcer avec `APIC_UI_ARCH=cuda`. Pour déboguer un accès mémoire
+douteux, CUDA lève une erreur là où Vulkan corrompt silencieusement.
 
-Par image, le seul retour vers Python est le `vec2` de `solid_stats` (8 octets, toutes les 6 images).
-Semis des particules : numpy → GPU une seule fois au build / reset. Overlays : petits champs
-téléversés uniquement quand la géométrie ou la sélection change.
+## JSON
 
-Sur CUDA / CPU (`APIC_UI_ARCH=cuda`), repli automatique sur les primitives GGUI (avec staging).
-
-## Règle de réentrance (importante)
-
-`glfwPollEvents`, appelé par GGUI dans `get_events` et `show`, dispatche aussi les messages Windows
-des fenêtres Qt. Un slot Qt (timer, bouton, spinbox) peut donc s'exécuter **au milieu d'un appel
-Taichi**. Règle appliquée dans `MainWindow` : aucun slot ne touche Taichi. Les actions (step, reset,
-build, fermeture, captures) sont mises en file (`_defer`) et exécutées au début du tick ; les
-overlays sont téléversés dans `GguiViewport.frame()`. Ne pas contourner cette règle : c'est la cause
-des access violations rencontrées pendant le développement.
-
-## Structure
-
+```json
+{"version": 2,
+ "params": {"n": 128, "gravity": 9.81, ...},
+ "matrices": {"fluid": {"dtype": "bool", "shape": [128, 128], "data": "<base64 packbits>"},
+              "inlet_vx": {"dtype": "float32", "shape": [128, 128], "data": "<base64>"}}}
 ```
-ui/app.py                  ensure_taichi() -> QApplication -> MainWindow
-ui/mainwindow.py           docks, toolbar, menus, QTimer(16 ms), file d'actions, routage par scope
-ui/model/project.py        dataclasses (Domain, Materials, Rect/Circle, IC, BC, Solver), JSON,
-                           métadonnées `scope` : structural (rebuild) / initial (reset) / runtime (immédiat)
-ui/sim/backend.py          ti.init une seule fois : Vulkan > CUDA > CPU, ou APIC_UI_ARCH
-ui/sim/seeding.py          semis numpy (fluide uniforme, solide en réseau, masque d'obstacles)
-ui/sim/kernels.py          kernels UI sans globales + render_scene (texture)
-ui/sim/session.py          SimSession : FieldsBuilder / destroy, substep (ordre de main_fsi), draw_*
-ui/widgets/ggui_viewport.py fenêtre GGUI embarquée (HWND -> QWindow.fromWinId), overlays, hit-test, drag
-ui/widgets/project_tree.py arbre du projet (menu contextuel : ajouter / supprimer une forme)
-ui/widgets/properties.py   formulaire généré depuis dataclasses.fields() + métadonnées
-```
+Un seul fichier auto-suffisant ; les matrices entièrement nulles sont omises.
 
-## Variables d'environnement
+## Limites
 
-| Variable                | Effet                                                         |
-|-------------------------|---------------------------------------------------------------|
-| `APIC_UI_ARCH`          | `vulkan` / `cuda` / `cpu` (défaut : vulkan, puis cuda, puis cpu) |
-| `APIC_UI_NO_EMBED=1`    | fenêtre GGUI séparée (repli, tous OS)                         |
-| `APIC_UI_NO_TEXTURE=1`  | force les primitives GGUI même sur Vulkan                     |
-| `APIC_UI_AUTOQUIT=<s>`  | lance la lecture et ferme après s secondes (tests)            |
-| `APIC_UI_SCREENSHOT=<p>`| avec AUTOQUIT : `<p>_viewport.png` et `<p>_desktop.png`       |
-| `APIC_UI_TRACE=1`       | trace du tick sur stdout                                      |
-
-## Limites de la v1
-
-- 2D, domaine unitaire `[0,1]²` (imposé par les kernels existants), viewport carré.
-- Un seul matériau fluide et un seul solide *utilisés* à la fois (les kernels prennent un jeu de
-  scalaires par phase) ; plusieurs formes par phase possibles.
-- Embarquement de la fenêtre GGUI : Windows uniquement (HWND) ; ailleurs, deux fenêtres.
-- Une fenêtre GGUI plein écran ou un dialogue modal fige le viewport pendant sa durée (normal).
-- `imgui.ini` continue d'être écrit par GGUI dans le répertoire courant.
+- 2D, domaine unitaire `[0, 1]²`, un fluide et un solide.
+- Entrées / sorties : fluide uniquement.
+- Changer `n` dans l'interface rééchantillonne les matrices au plus proche voisin.

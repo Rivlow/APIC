@@ -1,13 +1,13 @@
-"""Point d'entrée : `python -m ui` depuis n'importe quel cwd."""
+"""Point d'entrée : `python -m ui [simulation.json]`."""
 import os
 import sys
 
-# Les bibliothèques de kernels (APIC/, Code_tuto/) sont des packages « namespace » : il faut la racine
-# du dépôt (parent de ui/) dans sys.path.
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
-    sys.path.insert(0, _ROOT)
+    sys.path.insert(0, _ROOT)                     # Code_tuto/ est un package « namespace »
 
-from ui.app import main  # noqa: E402
+from ui.runner import SimulationRunner  # noqa: E402
 
-raise SystemExit(main())
+path = next((a for a in sys.argv[1:] if a.lower().endswith(".json")), None)
+runner = SimulationRunner.load(path) if path else SimulationRunner.demo()
+raise SystemExit(runner.show(path))
