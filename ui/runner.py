@@ -61,6 +61,12 @@ class SimulationRunner:
     FLOAT = ("vx0", "vy0")
 
     def __init__(self, **params):
+        """Create a simulation with default parameters overridden by `params`, empty matrices and walls.
+
+        **Inputs**
+
+        - **params  parameter overrides (keys of PARAMS; n = square grid nx = ny)
+        """
         if "n" in params:                           # grille carrée (et anciens fichiers) : n = nx = ny
             n = int(params.pop("n"))
             params.setdefault("nx", n)
@@ -76,58 +82,122 @@ class SimulationRunner:
 
     @property
     def walls(self) -> list[dict]:
-        """Segments de paroi (liste de dicts, modifiable en place ; voir Solver/boundary.py)."""
+        """Wall segments.
+
+        **Outputs**
+
+        - list[dict]   editable in place
+        """
         return self._walls.segments
 
     @walls.setter
     def walls(self, segments: list[dict]) -> None:
+        """Replace the wall segments.
+
+        **Inputs**
+
+        - `segments` : list[dict]
+        """
         self._walls.segments = segments
 
     # ------------------------------------------------------------ géométrie
     @property
     def nx(self) -> int:
+        """Number of cells in x (int)."""
         return int(self.p["nx"])
 
     @property
     def ny(self) -> int:
+        """Number of cells in y (int)."""
         return int(self.p["ny"])
 
     @property
     def n(self) -> int:
-        """max(nx, ny) : nombre de cellules par unité domaine (dx = 1 / n)."""
+        """Cells per domain unit.
+
+        **Outputs**
+
+        - `int` : max(nx, ny) (dx = 1 / n)
+        """
         return max(self.nx, self.ny)
 
     @property
     def dx(self) -> float:
+        """Cell size 1 / max(nx, ny) (float)."""
         return 1.0 / self.n
 
     @property
     def Lx(self) -> float:
+        """Domain width nx dx (float)."""
         return self.nx * self.dx
 
     @property
     def Ly(self) -> float:
+        """Domain height ny dx (float)."""
         return self.ny * self.dx
 
     @property
     def band(self) -> float:
-        """Épaisseur de la bande de paroi : les particules restent dans [band, Lx - band] × [band, Ly - band]."""
+        """Wall band thickness.
+
+        **Outputs**
+
+        - `float` : bound dx
+
+        **Note** : particles stay in [band, Lx - band] × [band, Ly - band].
+        """
         return self.p["bound"] * self.dx
 
     def centers(self) -> tuple[np.ndarray, np.ndarray]:
+        """Cell center coordinates.
+
+        **Outputs**
+
+        - `X`, `Y` : np.ndarray f64 (nx, ny)   X[i, j] = (i + 0.5) dx
+        """
         cx = (np.arange(self.nx) + 0.5) * self.dx
         cy = (np.arange(self.ny) + 0.5) * self.dx
         return np.meshgrid(cx, cy, indexing="ij")
 
     def rect(self, x0: float, y0: float, x1: float, y1: float) -> np.ndarray:
+        """Mask of cells whose center lies in a rectangle.
+
+        **Inputs**
+
+        - `x0`, `y0`, `x1`, `y1` : float   corners in domain units (any order)
+
+        **Outputs**
+
+        - np.ndarray bool (nx, ny)
+        """
         X, Y = self.centers()
         return (X >= min(x0, x1)) & (X <= max(x0, x1)) & (Y >= min(y0, y1)) & (Y <= max(y0, y1))
 
     def circle(self, cx: float, cy: float, r: float) -> np.ndarray:
+        """Mask of cells whose center lies in a disc.
+
+        **Inputs**
+
+        - `cx`, `cy`, `r` : float   center and radius in domain units
+
+        **Outputs**
+
+        - np.ndarray bool (nx, ny)
+        """
         X, Y = self.centers()
         return (X - cx) ** 2 + (Y - cy) ** 2 <= r * r
 
     def _mask(self, mask) -> np.ndarray:
+        """Validate a cell mask.
+
+        **Inputs**
+
+        - `mask` : array-like (nx, ny)
+
+        **Outputs**
+
+        - np.ndarray bool (nx, ny)   (ValueError on wrong shape)
+        """
         mask = np.asarray(mask, dtype=bool)
         if mask.shape != (self.nx, self.ny):
             raise ValueError(f"masque {mask.shape} attendu ({self.nx}, {self.ny})")
@@ -135,25 +205,77 @@ class SimulationRunner:
 
     # ------------------------------------------------------------ définition (intérieur)
     def set_fluid(self, mask, velocity=(0.0, 0.0)) -> None:
+        """Mark cells as fluid (clears solid/obstacle there).
+
+        **Inputs**
+
+        - `mask` : np.ndarray bool (nx, ny)
+        - `velocity` : tuple[float, float]   initial velocity
+
+        **Outputs**
+
+        - self.m updated
+        """
         mask = self._mask(mask)
         self.m["fluid"][mask], self.m["solid"][mask], self.m["obstacle"][mask] = True, False, False
         self.m["vx0"][mask], self.m["vy0"][mask] = velocity
 
     def set_solid(self, mask, velocity=(0.0, 0.0)) -> None:
+        """Mark cells as solid (clears fluid/obstacle there).
+
+        **Inputs**
+
+        - `mask` : np.ndarray bool (nx, ny)
+        - `velocity` : tuple[float, float]   initial velocity
+
+        **Outputs**
+
+        - self.m updated
+        """
         mask = self._mask(mask)
         self.m["solid"][mask], self.m["fluid"][mask], self.m["obstacle"][mask] = True, False, False
         self.m["vx0"][mask], self.m["vy0"][mask] = velocity
 
     def set_obstacle(self, mask) -> None:
+        """Mark cells as obstacle (clears fluid/solid there).
+
+        **Inputs**
+
+        - `mask` : np.ndarray bool (nx, ny)
+
+        **Outputs**
+
+        - self.m updated
+        """
         mask = self._mask(mask)
         self.m["obstacle"][mask], self.m["fluid"][mask], self.m["solid"][mask] = True, False, False
 
     def set_velocity(self, mask, velocity) -> None:
-        """Vitesse initiale des particules semées dans ces cellules."""
+        """Set the initial velocity of particles seeded in these cells.
+
+        **Inputs**
+
+        - `mask` : np.ndarray bool (nx, ny)
+        - `velocity` : tuple[float, float]
+
+        **Outputs**
+
+        - self.m["vx0"], self.m["vy0"] updated
+        """
         mask = self._mask(mask)
         self.m["vx0"][mask], self.m["vy0"][mask] = velocity
 
     def clear(self, mask) -> None:
+        """Clear all materials and initial velocity in these cells.
+
+        **Inputs**
+
+        - `mask` : np.ndarray bool (nx, ny)
+
+        **Outputs**
+
+        - self.m updated
+        """
         mask = self._mask(mask)
         for k in self.BOOL:
             self.m[k][mask] = False
@@ -163,27 +285,66 @@ class SimulationRunner:
     # ------------------------------------------------------------ définition (parois)
     def set_wall(self, side: str, kind: str, velocity=(0.0, 0.0), span=(0.0, 1.0), pressure=None,
                  friction=None) -> None:
-        """Condition limite sur un mur : side dans left/right/bottom/top, kind dans wall/inlet/outlet,
-        span = étendue le long du mur en unités domaine (x pour bottom/top, y pour left/right).
-        pressure (sortie seulement) : pression imposée p, uniforme sur le segment (mode incompressible) ;
-        None = 0 (sortie libre). friction (mur seulement) : beta dans [0, 1], 0 = glissant (défaut), 1 = adhérent.
-        Un nouveau segment remplace les anciens là où il les recouvre. L'étendue est bornée à la longueur du mur
-        (Ly à gauche / droite, Lx en bas / haut)."""
+        """Set a wall boundary segment.
+
+        **Inputs**
+
+        - `side` : str                   left / right / bottom / top
+        - `kind` : str                   wall / inlet / outlet
+        - `velocity` : tuple[float, float]   inlet velocity
+        - `span` : tuple[float, float]   extent along the wall, domain units
+        - `pressure` : float | None          outlet pressure (incompressible only; None = 0, free outlet)
+        - `friction` : float | None          wall beta in [0, 1] (0 slip, 1 no-slip)
+
+        **Outputs**
+
+        - self._walls updated (new segment overrides overlapped ones)
+
+        **Note** : span clipped to wall length (Ly for left/right, Lx for bottom/top).
+        """
         ext = self.Ly if side in ("left", "right") else self.Lx
         span = (min(max(float(span[0]), 0.0), ext), min(max(float(span[1]), 0.0), ext))
         self._walls.set(side, kind, velocity, span, pressure, friction)
 
     def clear_wall(self, side: str, span=(0.0, 1.0)) -> None:
+        """Reset part of a wall to the default slip wall.
+
+        **Inputs**
+
+        - `side` : str                   left / right / bottom / top
+        - `span` : tuple[float, float]   extent along the wall, domain units
+
+        **Outputs**
+
+        - self._walls updated
+        """
         self._walls.clear(side, span)
 
     def wall_table(self) -> WallTable:
-        """Rastérisation des segments : type, v, depth, pressure (voir Solver.walls.WallTable) ; un obstacle collé à une
-        entrée / sortie en porte la condition sur sa face qui regarde l'intérieur du domaine."""
+        """Rasterize wall segments.
+
+        **Outputs**
+
+        - `WallTable` : type, v, depth, pressure, friction per wall cell (4, max(nx, ny)[, 2])
+
+        **Note** : an obstacle glued to an inlet/outlet carries it on its inward face.
+        """
         return self._walls.table(self.nx, self.ny, self.p["bound"], self.m["obstacle"])
 
     def resize(self, nx: int, ny: int | None = None) -> None:
-        """Change la grille en rééchantillonnant les matrices (plus proche voisin) ; les parois sont en unités
-        domaine et ne changent pas. resize(n) : grille carrée."""
+        """Change the grid size.
+
+        **Inputs**
+
+        - `nx` : int          new cells in x
+        - `ny` : int | None   new cells in y (None: square nx × nx)
+
+        **Outputs**
+
+        - self.m and self.p["nx"], self.p["ny"] updated
+
+        **Note** : resamples matrices (nearest neighbor), walls unchanged (domain units).
+        """
         ny = nx if ny is None else ny
         ox, oy = self.m["fluid"].shape                 # taille réelle des matrices (p peut déjà avoir changé)
         ix = np.minimum((np.arange(nx) * ox / nx).astype(int), ox - 1)
@@ -193,6 +354,12 @@ class SimulationRunner:
 
     # ------------------------------------------------------------ fichiers
     def to_dict(self) -> dict:
+        """Serialize to a JSON-ready dict.
+
+        **Outputs**
+
+        - `dict` : version, params, matrices (base64, empty ones omitted), walls
+        """
         mats = {}
         for k, a in self.m.items():
             if not a.any():
@@ -205,6 +372,16 @@ class SimulationRunner:
 
     @classmethod
     def from_dict(cls, d: dict) -> "SimulationRunner":
+        """Build a runner from a serialized dict.
+
+        **Inputs**
+
+        - `d` : dict   as produced by to_dict (v2 inlet/outlet matrices migrated to walls)
+
+        **Outputs**
+
+        - SimulationRunner
+        """
         params = {k: v for k, v in d.get("params", {}).items() if k in cls.PARAMS or k == "n"}
         r = cls(**params)
         nx, ny = r.nx, r.ny
@@ -226,7 +403,16 @@ class SimulationRunner:
         return r
 
     def _migrate_legacy(self, legacy: dict) -> None:
-        """Fichiers v2 : les bandes de cellules d'entrée / sortie collées à un mur deviennent des segments."""
+        """Convert v2 inlet/outlet cell bands along the walls into wall segments.
+
+        **Inputs**
+
+        - `legacy` : dict of np.ndarray (nx, ny)   inlet, outlet (bool), inlet_vx, inlet_vy (f32)
+
+        **Outputs**
+
+        - self._walls updated
+        """
         nx, ny, bound = self.nx, self.ny, self.p["bound"]
         n = self.n
         depth = bound + 4
@@ -262,25 +448,68 @@ class SimulationRunner:
                     self.set_wall(side, kind, velocity=vel, span=(k0 / n, k / n))
 
     def save(self, path: str) -> None:
+        """Save params, matrices and walls to a JSON file.
+
+        **Inputs**
+
+        - `path` : str
+        """
         with open(path, "w", encoding="utf-8") as f:
             json.dump(self.to_dict(), f, indent=1)
 
     @classmethod
     def load(cls, path: str) -> "SimulationRunner":
+        """Load a runner from a JSON file.
+
+        **Inputs**
+
+        - `path` : str
+
+        **Outputs**
+
+        - SimulationRunner
+        """
         with open(path, encoding="utf-8") as f:
             return cls.from_dict(json.load(f))
 
     def equals(self, other: "SimulationRunner") -> bool:
+        """Compare params, matrices and walls.
+
+        **Inputs**
+
+        - `other` : SimulationRunner
+
+        **Outputs**
+
+        - bool
+        """
         return (self.p == other.p and all(np.array_equal(self.m[k], other.m[k]) for k in self.m)
                 and self.walls == other.walls)
 
     # ------------------------------------------------------------ exécution
     def solver(self):
+        """Build a Solver for this simulation.
+
+        **Outputs**
+
+        - `Solver` : (allocates Taichi fields)
+        """
         from ui.solver import Solver
         return Solver(self.p, self.m, self.wall_table())
 
     def run(self, frames: int, substeps: int | None = None, callback=None):
-        """Calcule `frames` images sans fenêtre ; callback(solver, k) après chaque image. Renvoie le solveur."""
+        """Run headless for a number of frames.
+
+        **Inputs**
+
+        - `frames` : int
+        - `substeps` : int | None             substeps per frame (None: p["substeps"])
+        - `callback` : callable(Solver, int)  called after each frame
+
+        **Outputs**
+
+        - Solver
+        """
         s = self.solver()
         for k in range(frames):
             s.step(substeps)
@@ -289,7 +518,16 @@ class SimulationRunner:
         return s
 
     def show(self, path: str | None = None) -> int:
-        """Ouvre l'interface Qt sur cette simulation (bloquant)."""
+        """Open the Qt GUI on this simulation (blocking).
+
+        **Inputs**
+
+        - `path` : str | None   file path shown / used for saving
+
+        **Outputs**
+
+        - `int` : Qt exit code
+        """
         import sys
 
         from PySide6.QtWidgets import QApplication
@@ -303,7 +541,12 @@ class SimulationRunner:
     # ------------------------------------------------------------ scène de référence
     @classmethod
     def demo(cls) -> "SimulationRunner":
-        """La scène de main_fsi.py : bassin, bloc d'eau qui tombe sur un tablier tenu par deux piliers."""
+        """Build the reference scene: water block falling on a deck held by two pillars.
+
+        **Outputs**
+
+        - SimulationRunner
+        """
         r = cls(n=250)
         r.set_fluid(r.rect(0.03, 0.03, 0.97, 0.22))
         r.set_fluid(r.rect(0.30, 0.62, 0.70, 0.95))

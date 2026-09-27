@@ -28,7 +28,14 @@ _arch: str | None = None
 
 
 def ensure_taichi() -> str:
-    """ti.init une seule fois : APIC_UI_ARCH (vulkan | cuda | cpu), sinon Vulkan, puis CUDA, puis CPU."""
+    """Initialize Taichi once and return the chosen arch.
+
+    **Outputs**
+
+    - `str` : arch name
+
+    **Note** : APIC_UI_ARCH (vulkan | cuda | cpu) forces the arch; otherwise tries Vulkan, then CUDA, then CPU.
+    """
     global _arch
     if _arch is None:
         forced = os.environ.get("APIC_UI_ARCH")
@@ -43,14 +50,37 @@ def ensure_taichi() -> str:
 
 
 def _fluid_points(cells: np.ndarray, ppc: int, rng: np.random.Generator, dx: float) -> np.ndarray:
-    """ppc² points uniformes par cellule active, en unités domaine."""
+    """Seed ppc² uniform random points per active cell.
+
+    **Inputs**
+
+    - `cells` : np.ndarray bool (nx, ny)   active cells
+    - `ppc` : int                        particles per cell side
+    - `rng` : np.random.Generator
+    - `dx` : float                      cell size
+
+    **Outputs**
+
+    - np.ndarray f64 (N, 2)   positions in domain units
+    """
     idx = np.argwhere(cells)
     base = np.repeat(idx, ppc * ppc, axis=0).astype(np.float64)
     return (base + rng.random(base.shape)) * dx
 
 
 def _solid_points(cells: np.ndarray, ppc: int, dx: float) -> np.ndarray:
-    """Réseau régulier ppc × ppc par cellule active (comme init_beam de Code_tuto/mpm_solid.py)."""
+    """Seed a regular ppc × ppc lattice per active cell.
+
+    **Inputs**
+
+    - `cells` : np.ndarray bool (nx, ny)   active cells
+    - `ppc` : int                        particles per cell side
+    - `dx` : float                      cell size
+
+    **Outputs**
+
+    - np.ndarray f64 (N, 2)   positions in domain units
+    """
     idx = np.argwhere(cells)
     o = (np.arange(ppc) + 0.5) / ppc
     ox, oy = np.meshgrid(o, o, indexing="ij")
@@ -60,6 +90,14 @@ def _solid_points(cells: np.ndarray, ppc: int, dx: float) -> np.ndarray:
 
 class Solver:
     def __init__(self, params: dict, matrices: dict, wall_table):
+        """Seed particles, allocate Taichi fields and set the initial state.
+
+        **Inputs**
+
+        - `params` : dict                              simulation parameters
+        - `matrices` : dict of np.ndarray (nx, ny)       fluid/solid/obstacle masks, vx0/vy0
+        - `wall_table` : WallTable (5 arrays, (4, max(nx, ny)[, 2]))   type, v, depth, pressure, friction
+        """
         self.arch = ensure_taichi()
         self.p = dict(params)
         p = self.p
@@ -177,7 +215,16 @@ class Solver:
 
     # ------------------------------------------------------------ paramètres à chaud
     def set_params(self, params: dict) -> None:
-        """Applique les paramètres non structurels (matériaux, gravité, CFL...) et recalcule dt."""
+        """Apply non-structural parameters and recompute derived constants and dt.
+
+        **Inputs**
+
+        - `params` : dict   parameter overrides (STRUCTURAL keys ignored)
+
+        **Outputs**
+
+        - self.p, dx, masses, Lamé coefficients, dt, dt_solid, tau_D updated
+        """
         for k, v in params.items():
             if k not in STRUCTURAL:
                 self.p[k] = v
@@ -207,7 +254,14 @@ class Solver:
 
     # ------------------------------------------------------------ cycle de vie
     def reset(self) -> None:
-        """État initial : un transfert CPU -> GPU des positions semées, puis kernels d'initialisation."""
+        """Reset to the initial state.
+
+        **Outputs**
+
+        - particle fields re-uploaded and re-initialized, t = 0
+
+        **Note** : one CPU -> GPU transfer of the seeded positions, then init kernels.
+        """
         if self.incompressible:
             self.q.fill(0.0)
             self.fp.fill(0.0)
@@ -221,13 +275,26 @@ class Solver:
         self.t = 0.0
 
     def release(self) -> None:
+        """Free all Taichi fields of this solver.
+
+        **Outputs**
+
+        - field tree destroyed, self._tree = None
+        """
         if self._tree is not None:
             self._tree.destroy()
             self._tree = None
 
     # ------------------------------------------------------------ simulation (incompressible)
     def _adapt_dt(self) -> None:
-        """Pas de temps d'advection : CFL sur la vitesse max (plus de limite acoustique)."""
+        """Set the advection time step from the CFL on max fluid speed (incompressible).
+
+        **Outputs**
+
+        - self.dt updated
+
+        **Note** : reads max speed GPU -> CPU; no acoustic limit.
+        """
         p = self.p
         vmax = max(float(M.max_speed(self.v_f, self.alive)), self._inlet_speed, 0.25)
         dt = p["cfl"] * self.dx / vmax
@@ -236,8 +303,14 @@ class Solver:
         self.dt = dt
 
     def _project(self) -> None:
-        """Projection de pression : `cg_iters` itérations de gradient conjugué, entièrement sur le GPU,
-        sans aucune lecture (le point de départ est la pression du sous-pas précédent)."""
+        """Pressure projection on the MAC grid by conjugate gradient.
+
+        **Outputs**
+
+        - self.q (pressure), self.u, self.v updated
+
+        **Note** : fixed `cg_iters` iterations, fully on GPU with no read-back; warm-started from previous pressure.
+        """
         p = self.p
         M.cg_init(self.q, self.r, self.pd, self.rhs, self.u, self.v, self.ctype, self.cg,
                   self.wall_type, self.wall_d, self.wall_p, self.dx, self.dt, 1.0 / p["fluid_rho"],
@@ -249,9 +322,14 @@ class Solver:
         M.mac_project(self.u, self.v, self.q, self.ctype, self.dx, self.nx, self.ny)
 
     def _density_projection(self) -> None:
-        """Deuxième projection, sur les POSITIONS (voir kernels_inc, 4 bis) : les particules tassées sont
-        redistribuées pour que rho = rho0, sans toucher aux vitesses. `density_iters` itérations de gradient
-        conjugué (tampons r, pd, Ap, rhs, cg partagés avec la pression), sans lecture."""
+        """Density projection: shift fluid particle positions so that rho = rho0.
+
+        **Outputs**
+
+        - self.x_f updated (velocities untouched)
+
+        **Note** : fixed `density_iters` CG iterations, no read-back; shares CG buffers with the pressure solve.
+        """
         p = self.p
         kappa = float(p["volume_correction"])
         if kappa <= 0.0:
@@ -267,7 +345,17 @@ class Solver:
         M.density_shift(self.x_f, self.alive, self.du, self.dv, self.ctype, self.inv_dx, self.dx, p["bound"], nx, ny)
 
     def _solid_substep(self, dt_s: float, with_pressure: bool) -> None:
-        """Un pas MPM du solide seul sur la grille collocalisée (+ accélération de pression du fluide)."""
+        """Advance the solid alone by one MPM step on the collocated grid.
+
+        **Inputs**
+
+        - `dt_s` : float   solid time step
+        - `with_pressure` : bool    add the fluid pressure acceleration self.fp
+
+        **Outputs**
+
+        - solid particle state (x_s, v_s, C_s, F_s, D_s, broken_s) updated
+        """
         p, dx, inv_dx, nx, ny, bound = self.p, self.dx, self.inv_dx, self.nx, self.ny, self.p["bound"]
         self.grid_m.fill(0.0)
         self.grid_v.fill(0.0)
@@ -285,8 +373,14 @@ class Solver:
                           inv_dx, dt_s, p["eps0"], p["epsf"], self.tau_D, int(p["use_rupture"]))
 
     def _substep_incompressible(self) -> None:
-        """Couplage partitionné : le solide (sous-cyclé à dt_solid) impose sa vitesse aux faces des cellules
-        qu'il occupe ; la pression du fluide lui renvoie −∇p sur ses nœuds de bord (Archimède, chargement)."""
+        """Advance one incompressible substep with partitioned fluid-solid coupling.
+
+        **Outputs**
+
+        - fluid and solid state updated
+
+        **Note** : solid sub-cycled at dt_solid imposes its velocity on occupied faces; fluid returns -grad p to it.
+        """
         p, dt, dx, inv_dx, nx, ny, bound = self.p, self.dt, self.dx, self.inv_dx, self.nx, self.ny, self.p["bound"]
         if self.has_solid:
             n_in = max(1, int(np.ceil(dt / self.dt_solid)))
@@ -316,6 +410,16 @@ class Solver:
         self._density_projection()
 
     def _advect_and_emit(self, dt: float) -> None:
+        """Advect fluid particles, then emit at inlets and pressure outlets.
+
+        **Inputs**
+
+        - `dt` : float   time step
+
+        **Outputs**
+
+        - x_f, v_f, alive, free stack updated
+        """
         p, dx, inv_dx, nx, ny, bound = self.p, self.dx, self.inv_dx, self.nx, self.ny, self.p["bound"]
         K.advect_fluid(self.x_f, self.v_f, self.alive, self.wall_type, self.wall_d, inv_dx, dt, bound, dx, nx, ny,
                        self.free_stack, self.free_top)
@@ -330,6 +434,12 @@ class Solver:
 
     # ------------------------------------------------------------ simulation (faiblement compressible)
     def _substep(self) -> None:
+        """Advance one weakly compressible MPM substep (fluid + solid on the collocated grid).
+
+        **Outputs**
+
+        - fluid and solid state updated
+        """
         p, dt, dx, inv_dx, nx, ny, bound = self.p, self.dt, self.dx, self.inv_dx, self.nx, self.ny, self.p["bound"]
         if self.has_fluid:
             K.P2G_fluid(self.grid_m, self.grid_v, self.x_f, self.v_f, self.C_f, self.J_f, self.alive,
@@ -355,6 +465,16 @@ class Solver:
             self._advect_and_emit(dt)
 
     def step(self, substeps: int | None = None) -> None:
+        """Advance the simulation by several substeps.
+
+        **Inputs**
+
+        - `substeps` : int | None   number of substeps (None: p["substeps"])
+
+        **Outputs**
+
+        - state, self.t and self.last_step_ms updated
+        """
         t0 = time.perf_counter()
         n_sub = substeps or self.p["substeps"]
         if self.incompressible:
@@ -370,6 +490,14 @@ class Solver:
 
     # ------------------------------------------------------------ lectures (GPU -> CPU à la demande)
     def stats(self) -> dict:
+        """Read simulation diagnostics.
+
+        **Outputs**
+
+        - `dict` : t, dt, n_fluid, capacity, n_solid, n_broken, D_max, ms, scalar_max (+ cg_iters, cg_rr, div_max)
+
+        **Note** : GPU -> CPU reads on demand only; also updates the smoothed self.scalar_max.
+        """
         n_broken, d_max = 0, 0.0
         if self.has_solid:
             s = solid_stats(self.D_s, self.broken_s)
@@ -388,21 +516,54 @@ class Solver:
         return st
 
     def positions(self) -> np.ndarray:
-        """(N, 2) positions des particules fluides vivantes."""
+        """Read alive fluid particle positions (GPU -> CPU).
+
+        **Outputs**
+
+        - np.ndarray f32 (N, 2)
+        """
         return self.x_f.to_numpy()[self.alive.to_numpy() == 1] if self.has_fluid else np.zeros((0, 2), np.float32)
 
     def velocities(self) -> np.ndarray:
+        """Read alive fluid particle velocities (GPU -> CPU).
+
+        **Outputs**
+
+        - np.ndarray f32 (N, 2)
+        """
         return self.v_f.to_numpy()[self.alive.to_numpy() == 1] if self.has_fluid else np.zeros((0, 2), np.float32)
 
     def solid_positions(self) -> np.ndarray:
+        """Read solid particle positions (GPU -> CPU).
+
+        **Outputs**
+
+        - np.ndarray f32 (Ns, 2)
+        """
         return self.x_s.to_numpy() if self.has_solid else np.zeros((0, 2), np.float32)
 
     def damage(self) -> np.ndarray:
+        """Read solid particle damage D (GPU -> CPU).
+
+        **Outputs**
+
+        - np.ndarray f32 (Ns,)
+        """
         return self.D_s.to_numpy() if self.has_solid else np.zeros(0, np.float32)
 
     def render(self, x0: float = 0.0, y0: float = 0.0, scale: float = 1.0,
                grid: bool = False, tint: bool = False) -> np.ndarray:
-        """Vue [x0, x0 + 1/scale] × [y0, y0 + 1/scale] rendue sur le GPU, puis copiée : (res, res, 3) u8."""
+        """Render the view to an image on the GPU.
+
+        **Inputs**
+
+        - `x0`, `y0`, `scale` : float   view origin and zoom (view = [x0, x0 + 1/scale]²)
+        - `grid`, `tint` : bool    draw mesh / initial-cell tints
+
+        **Outputs**
+
+        - np.ndarray u8 (res, res, 3)
+        """
         res = self.p["res"]
         if self.has_solid:
             solid_colors(self.F_s, self.D_s, self.broken_s, self.col_s, int(self.p["color_mode"]), self.p["epsf"])

@@ -11,7 +11,17 @@ from Solver.boundary import OBSTACLE, apply_obstacle, apply_walls, is_bc_face
 
 @ti.func
 def apply_external_forces(v: ti.template(), dt: float, g: float, damp: float):
-    """Gravité + amortissement léger de la vitesse (damp en 1/s, 0 = aucun)."""
+    """Apply gravity and linear velocity damping.
+
+    **Inputs**
+
+    - `v` : vec2 f32 grid velocity (lvalue)
+    - `dt`, `g`, `damp` : float (damp in 1/s, 0 = none)
+
+    **Outputs**
+
+    - v modified in place
+    """
     v *= 1.0 - damp * dt
     v.y -= dt * g
 
@@ -20,8 +30,25 @@ def apply_external_forces(v: ti.template(), dt: float, g: float, damp: float):
 def grid_step(grid_m: ti.template(), grid_v: ti.template(), cells: ti.template(),
               wall_type: ti.template(), wall_v: ti.template(), wall_d: ti.template(), wall_f: ti.template(),
               dt: float, g: float, damp: float, obstacle_friction: float, bound: int, nx: int, ny: int):
-    """cells : grille i32 (nx × ny), bit OBSTACLE (frottement obstacle_friction : 1 adhérent, 0 glissant ; sauf
-    sur une face qui porte une entrée / sortie). wall_* : table des parois (4 × max(nx, ny)), Solver/boundary.py."""
+    """Grid update: momentum -> velocity, external forces, obstacle and wall BCs.
+
+    **Inputs**
+
+    - `grid_m` : f32 field (nx, ny)
+    - `grid_v` : vec2 f32 field (nx, ny), momentum on entry
+    - `cells` : i32 field (nx, ny), OBSTACLE bit
+    - `wall_type`, `wall_d` : i32 field (4, nm)
+    - `wall_v` : vec2 f32 field (4, nm)
+    - `wall_f` : f32 field (4, nm)
+    - `dt`, `g`, `damp`, `obstacle_friction` : float (friction: 1 no-slip, 0 slip)
+    - `bound`, `nx`, `ny` : int
+
+    **Outputs**
+
+    - grid_v = velocity in place (nodes with grid_m > 0)
+
+    **Note** : obstacle faces carrying an inlet / outlet get the wall BC, not the obstacle BC.
+    """
 
     for i, j in grid_m:
 
@@ -36,9 +63,20 @@ def grid_step(grid_m: ti.template(), grid_v: ti.template(), cells: ti.template()
 
 @ti.kernel
 def advect(phase: ti.template(), dt: float, bound: int, dx: float, nx: int, ny: int):
-    """x <- x + dt v, écrêté à la bande de paroi : une particule à moins de 0.5 dx du bord
-    ferait écrire le stencil P2G hors de la grille (domaine [0, nx dx] × [0, ny dx]).
-    Une sortie (OUTLET) ne détruit pas les particules ici : il faut une phase à réservoir (voir ui/kernels.py)."""
+    """Advect particles (x <- x + dt v), clamped to [bound dx, (n - bound) dx].
+
+    **Inputs**
+
+    - `phase` : data_oriented phase: x, v (N,) vec2 f32
+    - `dt`, `dx` : float
+    - `bound`, `nx`, `ny` : int
+
+    **Outputs**
+
+    - phase.x updated in place
+
+    **Note** : clamp required (within 0.5 dx of the edge P2G writes out of the grid); outlets do not remove particles.
+    """
     lo = ti.Vector([bound * dx, bound * dx])
     hi = ti.Vector([(nx - bound) * dx, (ny - bound) * dx])
     for p in phase.x:

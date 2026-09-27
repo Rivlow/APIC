@@ -21,6 +21,18 @@ class ReinforcedConcrete:
 
     def __init__(self, n, p_mass, p_vol,
                  E_c, nu_c, eps_cu, r_min, r_crush, E_s, fy):
+        """Allocate particle fields and material constants.
+
+        **Inputs**
+
+        - `n` : int particle count
+        - `p_mass`, `p_vol` : float
+        - `E_c`, `nu_c` : float concrete Young modulus, Poisson ratio
+        - `eps_cu`, `r_min`, `r_crush` : float crushing strain, residual tension / compression stiffness
+        - `E_s`, `fy` : float steel modulus, yield stress
+
+        **Note** : scalars are Python attributes baked at compile time; only `nonlinear` (0-D i32) is tunable.
+        """
 
         self.x = ti.Vector.field(2, ti.f32, n)          # cache X0 + Up (transferts APIC)
         self.X0 = ti.Vector.field(2, ti.f32, n)         # position initiale
@@ -54,7 +66,17 @@ class ReinforcedConcrete:
     # ------------------------------------------------------------ lois de comportement
     @ti.func
     def r_tension(self, kap, fcr_i):
-        """Raideur sécante en traction : 1 avant fissuration, puis fcr/(1+sqrt(500 eps)) / (E eps)."""
+        """Secant tension stiffness ratio: 1 before cracking, then fcr / (1 + sqrt(500 kap)) / (E_c kap).
+
+        **Inputs**
+
+        - `kap` : float max equivalent tension strain
+        - `fcr_i` : float tensile strength
+
+        **Outputs**
+
+        - float in [r_min, 1]
+        """
         r = 1.0
         if kap > fcr_i / self.E_c:
             r = ti.min(1.0, fcr_i / (1.0 + ti.sqrt(500.0 * kap)) / (self.E_c * kap))
@@ -62,7 +84,17 @@ class ReinforcedConcrete:
 
     @ti.func
     def r_compression(self, kap, fc_i):
-        """Raideur sécante en compression : loi de Desayi, puis écrasement progressif après eps_cu."""
+        """Secant compression stiffness ratio: Desayi law, then progressive crushing past eps_cu.
+
+        **Inputs**
+
+        - `kap` : float max equivalent compression strain
+        - `fc_i` : float compressive strength
+
+        **Outputs**
+
+        - float >= r_min
+        """
         x = kap / (1.8 * fc_i / self.E_c)
         r = ti.min(1.0, (2.0 / 1.8) / (1.0 + x * x))
         if kap > self.eps_cu:
@@ -72,7 +104,17 @@ class ReinforcedConcrete:
 
     @ti.func
     def principal_stresses(self, p):
-        """Contraintes principales élastiques (Hencky) du béton et repère U de la SVD."""
+        """Elastic (Hencky) principal stresses of the concrete.
+
+        **Inputs**
+
+        - `p` : int particle index
+
+        **Outputs**
+
+        - `s1`, `s2` : float
+        - `U` : mat2 f32 principal frame (SVD)
+        """
         U, sg, V = ti.svd(ti.Matrix.identity(ti.f32, 2) + self.Fm[p])
         e1 = ti.log(ti.max(sg[0, 0], 0.05))
         e2 = ti.log(ti.max(sg[1, 1], 0.05))
@@ -82,8 +124,17 @@ class ReinforcedConcrete:
 
     @ti.func
     def stress(self, p):
-        """Contrainte de Kirchhoff : béton (Hencky, raideurs sécantes par direction principale)
-        + acier (barre uniaxiale suivant la direction x du matériau, élastique parfaitement plastique)."""
+        """Kirchhoff stress: concrete (Hencky, secant stiffness per principal direction) mixed with a steel bar
+        along material x (elastic-perfectly plastic, volume fraction phi).
+
+        **Inputs**
+
+        - `p` : int particle index
+
+        **Outputs**
+
+        - mat2 f32
+        """
         s1, s2, U = self.principal_stresses(p)
         if self.nonlinear[None] == 1:
             rt = self.r_tension(self.kap_t[p], self.fcr_p[p])
@@ -112,18 +163,48 @@ class ReinforcedConcrete:
 
     @ti.func
     def update_deformation(self, p, C_new, dt):
+        """Update Fm = F - I: Fm <- Fm + dt C (I + Fm).
+
+        **Inputs**
+
+        - `p` : int particle index
+        - `C_new` : mat2 f32 velocity gradient
+        - `dt` : float
+
+        **Outputs**
+
+        - Fm[p] in place
+        """
         # F = I + Fm, dF/dt = (grad v) F   ->   Fm <- Fm + dt C (I + Fm)
         self.Fm[p] += dt * C_new @ (ti.Matrix.identity(ti.f32, 2) + self.Fm[p])
 
     # ------------------------------------------------------------ position
     @ti.kernel
     def refresh_x(self):
+        """Refresh the position cache x = X0 + Up.
+
+        **Outputs**
+
+        - x written in place
+
+        **Note** : must be called after every change of Up.
+        """
         for p in self.x:
             self.x[p] = self.X0[p] + self.Up[p]
 
     # ------------------------------------------------------------ historique (non local)
     def history_step(self, grid_et, grid_ec, grid_w, inv_dx: float):
-        """Historique de déformation irréversible du béton (lissé par la grille) et plasticité de l'acier."""
+        """Update irreversible concrete strain history (grid-smoothed) and steel plasticity.
+
+        **Inputs**
+
+        - `grid_et`, `grid_ec`, `grid_w` : f32 field (nx, ny), scratch
+        - `inv_dx` : float
+
+        **Outputs**
+
+        - kap_t, kap_c, eps_p updated in place ; grids overwritten
+        """
         grid_et.fill(0.0)
         grid_ec.fill(0.0)
         grid_w.fill(0.0)
@@ -132,7 +213,19 @@ class ReinforcedConcrete:
 
     @ti.kernel
     def scatter_eps(self, grid_et: ti.template(), grid_ec: ti.template(), grid_w: ti.template(), inv_dx: float):
-        """Étale sur la grille les déformations équivalentes (contrainte principale élastique / E)."""
+        """Scatter equivalent strains (principal elastic stress / E_c) on the grid.
+
+        **Inputs**
+
+        - `grid_et`, `grid_ec`, `grid_w` : f32 field (nx, ny)
+        - `inv_dx` : float
+
+        **Outputs**
+
+        - grid_et (tension), grid_ec (compression), grid_w (weight sum) accumulated in place
+
+        **Note** : does not clear the grid.
+        """
         for p in self.x:
             base, fx, w = stencil(self.x[p], inv_dx)
             s1, s2, U = self.principal_stresses(p)
@@ -147,6 +240,17 @@ class ReinforcedConcrete:
 
     @ti.kernel
     def update_state(self, grid_et: ti.template(), grid_ec: ti.template(), grid_w: ti.template(), inv_dx: float):
+        """Update strain history from grid-smoothed strains and steel plastic strain (return mapping).
+
+        **Inputs**
+
+        - `grid_et`, `grid_ec`, `grid_w` : f32 field (nx, ny)
+        - `inv_dx` : float
+
+        **Outputs**
+
+        - kap_t, kap_c (running max), eps_p updated in place
+        """
         for p in self.x:
             base, fx, w = stencil(self.x[p], inv_dx)
             et = 0.0
@@ -169,7 +273,12 @@ class ReinforcedConcrete:
     # ------------------------------------------------------------ diagnostics
     @ti.kernel
     def damage_counts(self) -> ti.types.vector(2, ti.f32):
-        """Nombre de particules de béton fissurées (d_t > 0.9) et écrasées (eps_c > eps_cu)."""
+        """Count cracked (d_t > 0.9) and crushed (kap_c > eps_cu) plain-concrete particles.
+
+        **Outputs**
+
+        - vec2 f32 (cracked, crushed)
+        """
         nt = 0.0
         nc = 0.0
         for p in self.x:

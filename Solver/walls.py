@@ -30,7 +30,17 @@ OBSTACLE = 4                                  # bit de `cells` : nœud bloqué
 
 
 def side_length(side: int, nx: int, ny: int) -> int:
-    """Nombre de cellules le long du mur : ny pour gauche / droite, nx pour bas / haut."""
+    """Number of cells along a wall.
+
+    **Inputs**
+
+    - `side` : int in LEFT/RIGHT/BOTTOM/TOP
+    - `nx`, `ny` : int
+
+    **Outputs**
+
+    - int, ny for left / right, nx for bottom / top
+    """
     return ny if side in (LEFT, RIGHT) else nx
 
 
@@ -55,13 +65,31 @@ class Walls:
     """
 
     def __init__(self, segments=None):
+        """Store a copy of the segments.
+
+        **Inputs**
+
+        - `segments` : list of segment dicts (JSON form) or None
+        """
         self.segments: list[dict] = [dict(w) for w in (segments or [])]
 
     def set(self, side: str, kind: str, velocity=(0.0, 0.0), span=(0.0, 1.0), pressure=None,
             friction=None) -> None:
-        """side dans left/right/bottom/top, kind dans wall/inlet/outlet, span en unités domaine le long du mur.
-        pressure (sortie seulement) : pression imposée p, uniforme sur le segment ; None = 0 (sortie libre).
-        friction (mur seulement) : beta dans [0, 1], 0 = glissant (défaut), 1 = adhérent."""
+        """Add a wall segment, overriding what it overlaps.
+
+        **Inputs**
+
+        - `side` : str in left/right/bottom/top
+        - `kind` : str in wall/inlet/outlet
+        - `velocity` : (2,) float, inlet velocity
+        - `span` : (2,) float, extent along the wall in domain units
+        - `pressure` : float or None, outlet only (None = 0, free outlet)
+        - `friction` : float in [0, 1] or None, wall only (0 slip, 1 no-slip)
+
+        **Outputs**
+
+        - self.segments updated ; ValueError on invalid arguments
+        """
         if side not in SIDES:
             raise ValueError(f"côté {side!r} inconnu (attendu : {SIDES})")
         if kind not in WALL_TYPES:
@@ -96,11 +124,33 @@ class Walls:
         self.segments = kept
 
     def clear(self, side: str, span=(0.0, 1.0)) -> None:
+        """Reset a span of a side to the default slip wall.
+
+        **Inputs**
+
+        - `side` : str in left/right/bottom/top
+        - `span` : (2,) float, domain units
+
+        **Outputs**
+
+        - self.segments updated
+        """
         self.set(side, "wall", span=span)
 
     def table(self, nx: int, ny: int, bound: int, obstacle=None) -> WallTable:
-        """Rastérisation (voir WallTable). obstacle : masque (nx, ny) bool ; un obstacle collé à une entrée / sortie
-        en porte la condition (depth). Les coins (dans la bande transversale) sont toujours des murs."""
+        """Rasterize wall segments into per-cell tables.
+
+        **Inputs**
+
+        - `nx`, `ny`, `bound` : int
+        - `obstacle` : np.ndarray bool (nx, ny) or None
+
+        **Outputs**
+
+        - WallTable of np.ndarray (4, nm) (v: (4, nm, 2)), nm = max(nx, ny)
+
+        **Note** : corners (k in the transverse band) are always walls; an obstacle glued to an inlet / outlet carries it.
+        """
         nm = max(nx, ny)                              # dx = 1 / nm : cellule k couvre [k dx, (k + 1) dx]
         wtype = np.zeros((4, nm), np.int32)
         wvel = np.zeros((4, nm, 2), np.float32)
@@ -133,8 +183,20 @@ class Walls:
 
     @staticmethod
     def _depth(o: np.ndarray, wtype: np.ndarray, nx: int, ny: int, bound: int) -> np.ndarray:
-        """Pour chaque cellule d'entrée / sortie le long d'un mur : si un obstacle touche le mur (dans la bande
-        ou la première cellule utilisable), le mur recule jusqu'à la première couche libre après lui."""
+        """Wall depth per inlet / outlet cell, pushed past an obstacle touching the wall.
+
+        **Inputs**
+
+        - `o` : np.ndarray bool (nx, ny) obstacle mask
+        - `wtype` : np.ndarray int32 (4, nm)
+        - `nx`, `ny`, `bound` : int
+
+        **Outputs**
+
+        - np.ndarray int32 (4, nm), depth in cells from the edge (first free layer, >= bound)
+
+        **Note** : touching = within the band or the first usable cell; depth never beyond mid-domain.
+        """
         # couches [côté][couche depuis le bord, cellule le long du mur]
         layers = [o, o[::-1, :], o.T, o.T[::-1, :]]
         wdepth = np.full((4, max(nx, ny)), bound, np.int32)
@@ -154,7 +216,19 @@ class Walls:
         return wdepth
 
     def fields(self, nx: int, ny: int, bound: int, obstacle=None):
-        """Table rastérisée copiée dans cinq champs Taichi (wall_type, wall_v, wall_d, wall_p, wall_f), une fois."""
+        """Rasterize and upload the wall table to Taichi fields (once).
+
+        **Inputs**
+
+        - `nx`, `ny`, `bound` : int
+        - `obstacle` : np.ndarray bool (nx, ny) or None
+
+        **Outputs**
+
+        - `wall_type`, `wall_d` : i32 field (4, nm)
+        - `wall_v` : vec2 f32 field (4, nm)
+        - `wall_p`, `wall_f` : f32 field (4, nm)
+        """
         import taichi as ti                           # import local : ce module reste utilisable sans Taichi
         t = self.table(nx, ny, bound, obstacle)
         nm = max(nx, ny)

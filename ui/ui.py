@@ -38,6 +38,13 @@ class Viewport(QWidget):
     hoverChanged = Signal(str)
 
     def __init__(self, runner: SimulationRunner, parent=None):
+        """Create the viewport on a runner (full view, no selection).
+
+        **Inputs**
+
+        - `runner` : SimulationRunner
+        - `parent` : QWidget | None
+        """
         super().__init__(parent)
         self.runner = runner
         self.x0, self.y0, self.scale = 0.0, 0.0, 1.0     # vue = [x0, x0 + 1/scale] × [y0, y0 + 1/scale]
@@ -58,63 +65,154 @@ class Viewport(QWidget):
 
     @property
     def n(self) -> int:
-        """max(nx, ny) : cellules par unité domaine (dx = 1 / n)."""
+        """Cells per domain unit, max(nx, ny) (int)."""
         return self.runner.n
 
     @property
     def nx(self) -> int:
+        """Number of cells in x (int)."""
         return self.runner.nx
 
     @property
     def ny(self) -> int:
+        """Number of cells in y (int)."""
         return self.runner.ny
 
     def side_len(self, side: str) -> int:
-        """Cellules le long du mur : ny à gauche / droite, nx en bas / haut."""
+        """Number of cells along a wall.
+
+        **Inputs**
+
+        - `side` : str   left / right / bottom / top
+
+        **Outputs**
+
+        - `int` : ny for left/right, nx for bottom/top
+        """
         return self.ny if side in ("left", "right") else self.nx
 
     def side_extent(self, side: str) -> float:
-        """Longueur du mur en unités domaine."""
+        """Wall length in domain units.
+
+        **Inputs**
+
+        - `side` : str   left / right / bottom / top
+
+        **Outputs**
+
+        - float
+        """
         return self.side_len(side) / self.n
 
     @property
     def bound(self) -> int:
+        """Wall band thickness in cells (int)."""
         return self.runner.p["bound"]
 
     # ------------------------------------------------------------ image
     def set_image(self, buf: np.ndarray) -> None:
+        """Display a rendered image.
+
+        **Inputs**
+
+        - `buf` : np.ndarray u8 (res, res, 3)
+
+        **Outputs**
+
+        - self._buf, self._qimg set, repaint scheduled
+
+        **Note** : keeps a reference to the buffer (QImage does not own the memory).
+        """
         self._buf = np.ascontiguousarray(buf)             # QImage ne possède pas la mémoire : garder une référence
         h, w, _ = self._buf.shape
         self._qimg = QImage(self._buf.data, w, h, 3 * w, QImage.Format.Format_RGB888)
         self.update()
 
     def sizeHint(self) -> QSize:
+        """Preferred widget size.
+
+        **Outputs**
+
+        - QSize
+        """
         return QSize(700, 700)
 
     # ------------------------------------------------------------ transformations
     def _square(self):
+        """Centered square drawing area of the widget.
+
+        **Outputs**
+
+        - tuple[int, int, int]   x offset, y offset, side (px)
+        """
         side = min(self.width(), self.height())
         return (self.width() - side) // 2, (self.height() - side) // 2, side
 
     def px_to_dom(self, pos) -> tuple[float, float]:
+        """Convert a widget pixel position to domain coordinates.
+
+        **Inputs**
+
+        - `pos` : QPointF
+
+        **Outputs**
+
+        - tuple[float, float]   (x, y)
+        """
         ox, oy, side = self._square()
         sx, sy = (pos.x() - ox) / side, (pos.y() - oy) / side
         return self.x0 + sx / self.scale, self.y0 + (1.0 - sy) / self.scale
 
     def dom_to_px(self, x: float, y: float) -> tuple[float, float]:
+        """Convert domain coordinates to widget pixels.
+
+        **Inputs**
+
+        - `x`, `y` : float
+
+        **Outputs**
+
+        - tuple[float, float]   (px, py)
+        """
         ox, oy, side = self._square()
         return ox + (x - self.x0) * self.scale * side, oy + (1.0 - (y - self.y0) * self.scale) * side
 
     def px_per_unit(self) -> float:
+        """Screen pixels per domain unit at the current zoom.
+
+        **Outputs**
+
+        - float
+        """
         return self._square()[2] * self.scale
 
     def cell_at(self, pos) -> tuple[int, int]:
+        """Cell under a pixel position (clamped to the grid).
+
+        **Inputs**
+
+        - `pos` : QPointF
+
+        **Outputs**
+
+        - tuple[int, int]   (i, j)
+        """
         x, y = self.px_to_dom(pos)
         return int(np.clip(int(x * self.n), 0, self.nx - 1)), int(np.clip(int(y * self.n), 0, self.ny - 1))
 
     def wall_at(self, pos):
-        """(side, k) si le curseur est à moins de SNAP_PX d'un bord du domaine ou dans la bande de paroi
-        (hors coins), sinon None. k = cellule le long du mur, bornée à la zone utilisable."""
+        """Wall under the cursor, if within SNAP_PX of a domain edge or in the wall band.
+
+        **Inputs**
+
+        - `pos` : QPointF
+
+        **Outputs**
+
+        - tuple[str, int] | None   (side, k), k = cell along the wall
+
+        **Note** : k clamped to the usable zone [bound, len - bound - 1].
+        """
         x, y = self.px_to_dom(pos)
         ppu = self.px_per_unit()
         n, b = self.n, self.bound
@@ -133,17 +231,40 @@ class Viewport(QWidget):
         return side, k
 
     def _clamp_view(self) -> None:
+        """Keep the view inside the unit square.
+
+        **Outputs**
+
+        - self.x0, self.y0 clamped
+        """
         span = 1.0 / self.scale
         self.x0 = float(np.clip(self.x0, 0.0, 1.0 - span))
         self.y0 = float(np.clip(self.y0, 0.0, 1.0 - span))
 
     def reset_view(self) -> None:
+        """Show the whole domain (no zoom).
+
+        **Outputs**
+
+        - self.x0, self.y0, self.scale reset, repaint scheduled
+        """
         self.x0, self.y0, self.scale = 0.0, 0.0, 1.0
         self.update()
 
     # ------------------------------------------------------------ segments de paroi (géométrie écran)
     def _edge_point(self, side: str, along: float, depth_px: float = 0.0) -> QPointF:
-        """Point du bord `side` à la coordonnée `along` (unités domaine), décalé de depth_px vers l'intérieur."""
+        """Screen point on a wall edge.
+
+        **Inputs**
+
+        - `side` : str     left / right / bottom / top
+        - `along` : float   coordinate along the wall, domain units
+        - `depth_px` : float   inward offset (px)
+
+        **Outputs**
+
+        - QPointF
+        """
         if side == "left":
             px, py = self.dom_to_px(0.0, along)
             return QPointF(px + depth_px, py)
@@ -157,11 +278,33 @@ class Viewport(QWidget):
         return QPointF(px, py + depth_px)
 
     def _segment_rect(self, side: str, a: float, b: float, thick: float, inset: float = 0.0) -> QRectF:
+        """Screen rectangle of a wall segment.
+
+        **Inputs**
+
+        - `side` : str     left / right / bottom / top
+        - `a`, `b` : float   span along the wall, domain units
+        - `thick` : float   thickness (px)
+        - `inset` : float   inward offset (px)
+
+        **Outputs**
+
+        - QRectF
+        """
         p0, p1 = self._edge_point(side, a, inset), self._edge_point(side, b, inset + thick)
         return QRectF(p0, p1).normalized()
 
     def _handle_at(self, pos):
-        """(indice du segment, extrémité) si le curseur est sur une poignée d'un segment existant."""
+        """Segment handle under the cursor.
+
+        **Inputs**
+
+        - `pos` : QPointF
+
+        **Outputs**
+
+        - tuple[int, int] | None   (segment index, end 0/1)
+        """
         for idx, w in enumerate(self.runner.walls):
             for end in (0, 1):
                 c = self._edge_point(w["side"], w["span"][end], 5.0)
@@ -170,6 +313,17 @@ class Viewport(QWidget):
         return None
 
     def _snap_along(self, side: str, pos) -> float:
+        """Cursor coordinate along a wall, snapped to cell boundaries.
+
+        **Inputs**
+
+        - `side` : str       left / right / bottom / top
+        - `pos` : QPointF
+
+        **Outputs**
+
+        - `float` : domain units, clamped to [bound, len - bound] cells
+        """
         x, y = self.px_to_dom(pos)
         along = y if side in ("left", "right") else x
         n, b = self.n, self.bound
@@ -178,6 +332,16 @@ class Viewport(QWidget):
 
     # ------------------------------------------------------------ souris / clavier
     def wheelEvent(self, event) -> None:
+        """Zoom around the cursor.
+
+        **Inputs**
+
+        - `event` : QWheelEvent
+
+        **Outputs**
+
+        - self.x0, self.y0, self.scale updated
+        """
         xc, yc = self.px_to_dom(event.position())
         new_scale = float(np.clip(self.scale * 1.25 ** (event.angleDelta().y() / 120.0), 1.0, 64.0))
         self.x0 = xc - (xc - self.x0) * self.scale / new_scale       # le point sous le curseur reste fixe
@@ -187,6 +351,16 @@ class Viewport(QWidget):
         self.update()
 
     def mousePressEvent(self, event) -> None:
+        """Start a handle drag, wall selection, cell box selection (left) or pan (right / middle).
+
+        **Inputs**
+
+        - `event` : QMouseEvent
+
+        **Outputs**
+
+        - drag state and selections updated, selection signals emitted
+        """
         self.setFocus()
         if event.button() == Qt.MouseButton.LeftButton:
             self._moved = False
@@ -215,6 +389,16 @@ class Viewport(QWidget):
             self._pan = event.position()
 
     def mouseMoveEvent(self, event) -> None:
+        """Update the active drag / pan and the hover state.
+
+        **Inputs**
+
+        - `event` : QMouseEvent
+
+        **Outputs**
+
+        - selections, wall spans or view updated; hoverChanged emitted
+        """
         pos = event.position()
         if self._drag is not None:
             i, j = self.cell_at(pos)
@@ -263,6 +447,16 @@ class Viewport(QWidget):
             self.hoverChanged.emit(f"cellule ({int(x * self.n)}, {int(y * self.n)})  x={x:.3f} y={y:.3f}")
 
     def mouseReleaseEvent(self, event) -> None:
+        """End drags; a click without motion on a wall selects the whole wall.
+
+        **Inputs**
+
+        - `event` : QMouseEvent
+
+        **Outputs**
+
+        - drag state cleared; wallSelectionChanged / wallEdited emitted
+        """
         if self._wdrag is not None and not self._moved:          # clic simple : tout le mur
             side, _ = self._wdrag
             self.wsel = (side, self.bound, self.side_len(side) - self.bound - 1)
@@ -273,12 +467,24 @@ class Viewport(QWidget):
         self._drag = self._wdrag = self._hdrag = self._pan = None
 
     def leaveEvent(self, event) -> None:
+        """Clear wall hover highlight when the cursor leaves.
+
+        **Inputs**
+
+        - `event` : QEvent
+        """
         if self.hover_wall is not None:
             self.hover_wall = None
             self.update()
         super().leaveEvent(event)
 
     def keyPressEvent(self, event) -> None:
+        """F: whole view; Escape: clear selections.
+
+        **Inputs**
+
+        - `event` : QKeyEvent
+        """
         if event.key() == Qt.Key.Key_F:
             self.reset_view()
         elif event.key() == Qt.Key.Key_Escape:
@@ -292,6 +498,12 @@ class Viewport(QWidget):
 
     # ------------------------------------------------------------ dessin
     def paintEvent(self, event) -> None:
+        """Draw the rendered image, wall segments and handles, hover and selections.
+
+        **Inputs**
+
+        - `event` : QPaintEvent
+        """
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.fillRect(self.rect(), QColor(16, 16, 24))
@@ -361,6 +573,15 @@ class Viewport(QWidget):
 
 class UI(QMainWindow):
     def __init__(self, runner: SimulationRunner, path: str | None = None):
+        """Build the main window (viewport, docks, toolbar, status bar) and start the frame timer.
+
+        **Inputs**
+
+        - `runner` : SimulationRunner
+        - `path` : str | None         file path for save
+
+        **Note** : the solver is built after the window is shown; APIC_UI_AUTOQUIT=<s> autoplays then quits.
+        """
         super().__init__()
         self.runner = runner
         self.path = path
@@ -409,6 +630,16 @@ class UI(QMainWindow):
 
     # ------------------------------------------------------------ construction
     def _make_editor(self, key: str):
+        """Create the editor widget of a parameter (check box, int or float spin box).
+
+        **Inputs**
+
+        - `key` : str   parameter name
+
+        **Outputs**
+
+        - `QWidget` : (also stored in self._editors)
+        """
         default, value = SimulationRunner.PARAMS[key], self.runner.p[key]
         if isinstance(default, bool):
             w = QCheckBox()
@@ -432,8 +663,12 @@ class UI(QMainWindow):
         return w
 
     def _build_params_dock(self) -> None:
-        """Arbre de paramètres rangé par dossiers ; les dossiers « État initial » et « Conditions aux
-        limites » résument la scène courante (mis à jour à chaque modification)."""
+        """Build the parameter tree dock (folders + initial-state and boundary-condition summaries).
+
+        **Outputs**
+
+        - self.tree, self.item_ic, self.item_bc created
+        """
         self.tree = QTreeWidget()
         self.tree.setColumnCount(2)
         self.tree.setHeaderLabels(["Paramètre", "Valeur"])
@@ -471,7 +706,12 @@ class UI(QMainWindow):
         self.resizeDocks([dock], [360], Qt.Orientation.Horizontal)
 
     def _refresh_summaries(self) -> None:
-        """Dossiers « État initial » et « Conditions aux limites » d'après le runner."""
+        """Refill the initial-state and boundary-condition folders from the runner.
+
+        **Outputs**
+
+        - self.item_ic, self.item_bc children replaced
+        """
         m, p, r = self.runner.m, self.runner.p, self.runner
         for item in (self.item_ic, self.item_bc):
             item.takeChildren()
@@ -480,7 +720,17 @@ class UI(QMainWindow):
             QTreeWidgetItem(parent, [name, text])
 
         def vel_groups(mask, vx, vy):
-            """Regroupe les cellules d'un masque par vitesse (vx, vy) identique."""
+            """Group mask cells by identical velocity.
+
+            **Inputs**
+
+            - `mask` : np.ndarray bool (nx, ny)
+            - `vx`, `vy` : np.ndarray f32 (nx, ny)
+
+            **Outputs**
+
+            - list[tuple[tuple[float, float], int]]   ((vx, vy), cell count)
+            """
             if not mask.any():
                 return []
             pairs = np.stack([vx[mask], vy[mask]], axis=1)
@@ -523,6 +773,7 @@ class UI(QMainWindow):
                 f"{kind},{vel} {axis} ∈ [{w['span'][0]:.3f}, {w['span'][1]:.3f}]{note}")
 
     def _build_scene_dock(self) -> None:
+        """Build the scene dock: cell actions, wall actions, display options."""
         w = QWidget()
         grid = QGridLayout(w)
         # ---- cellules (intérieur)
@@ -611,6 +862,7 @@ class UI(QMainWindow):
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
 
     def _build_toolbar(self) -> None:
+        """Build the toolbar actions (play, step, reset, view, open, save) with shortcuts."""
         tb = QToolBar("Simulation")
         tb.setMovable(False)
         self.addToolBar(tb)
@@ -635,6 +887,7 @@ class UI(QMainWindow):
         act("Enregistrer sous…", self._save_as, "Ctrl+Shift+S")
 
     def _build_statusbar(self) -> None:
+        """Build the status bar labels (hover, time, particles, perf)."""
         self.lbl_hover = QLabel()
         self.lbl_time = QLabel()
         self.lbl_particles = QLabel()
@@ -645,6 +898,12 @@ class UI(QMainWindow):
 
     # ------------------------------------------------------------ boucle
     def _tick(self) -> None:
+        """Timer slot: step if playing, render the view, refresh stats every 6 frames.
+
+        **Outputs**
+
+        - viewport image and status labels updated
+        """
         if self.solver is None:
             return
         if self.playing:
@@ -669,6 +928,12 @@ class UI(QMainWindow):
             self.lbl_perf.setText(f"{self.solver.arch} · {st['ms']:.1f} ms/image" if self.playing else f"{self.solver.arch} · pause")
 
     def _rebuild(self) -> None:
+        """Rebuild the solver from the runner (seed, compile kernels, reset).
+
+        **Outputs**
+
+        - self.solver replaced, dirty flag cleared
+        """
         self.statusBar().showMessage("Semis et compilation des kernels…")
         self.statusBar().repaint()
         QApplication.processEvents()                      # laisse la fenêtre se peindre avant le calcul bloquant
@@ -684,6 +949,12 @@ class UI(QMainWindow):
         self.statusBar().clearMessage()
 
     def _mark_dirty(self) -> None:
+        """Flag the scene as modified (Reset required).
+
+        **Outputs**
+
+        - self.dirty = True, banner shown, summaries and title refreshed
+        """
         self.dirty = True
         self.banner.show()
         self._refresh_summaries()
@@ -692,6 +963,16 @@ class UI(QMainWindow):
 
     # ------------------------------------------------------------ actions
     def _set_playing(self, on: bool) -> None:
+        """Play / pause the simulation (rebuilds first if dirty).
+
+        **Inputs**
+
+        - `on` : bool
+
+        **Outputs**
+
+        - self.playing and play action updated
+        """
         self.playing = bool(on) and self.solver is not None
         if self.act_play.isChecked() != self.playing:
             self.act_play.blockSignals(True)
@@ -702,6 +983,7 @@ class UI(QMainWindow):
             self._rebuild()
 
     def _step(self) -> None:
+        """Pause and advance one frame (rebuilds first if dirty)."""
         self._set_playing(False)
         if self.dirty:
             self._rebuild()
@@ -709,12 +991,24 @@ class UI(QMainWindow):
             self.solver.step()
 
     def _reset(self) -> None:
+        """Reset the solver, rebuilding it if the scene is dirty."""
         if self.dirty or self.solver is None:
             self._rebuild()
         else:
             self.solver.reset()
 
     def _on_param(self, key: str, value) -> None:
+        """Apply a parameter edit.
+
+        **Inputs**
+
+        - `key` : str
+        - `value` : bool | int | float
+
+        **Outputs**
+
+        - runner.p updated; structural keys mark dirty, others are applied to the solver live
+        """
         if key in SimulationRunner.STRUCTURAL:
             if key in ("nx", "ny"):
                 nx, ny = (int(value), self.runner.ny) if key == "nx" else (self.runner.nx, int(value))
@@ -729,13 +1023,31 @@ class UI(QMainWindow):
             self._update_title(modified=True)
 
     def _on_color_mode(self, _index: int) -> None:
+        """Fluid color mode changed: reset the color scale.
+
+        **Inputs**
+
+        - `_index` : int   combo box index (unused)
+        """
         if self.solver is not None:
             self.solver.scalar_max = 0.0             # l'échelle se recalcule sur la nouvelle quantité
 
     def _vel(self) -> tuple[float, float]:
+        """Initial velocity from the cell spin boxes.
+
+        **Outputs**
+
+        - tuple[float, float]   (vx, vy)
+        """
         return self.spin_vx.value(), self.spin_vy.value()
 
     def _on_selection(self, sel) -> None:
+        """Update cell buttons and label for a new cell selection.
+
+        **Inputs**
+
+        - `sel` : tuple[int, int, int, int] | None   (i0, j0, i1, j1) inclusive
+        """
         for b in self._cell_buttons:
             b.setEnabled(sel is not None)
         if sel is None:
@@ -745,6 +1057,12 @@ class UI(QMainWindow):
             self.lbl_sel.setText(f"Sélection : i {i0}..{i1}, j {j0}..{j1}\n{(i1 - i0 + 1) * (j1 - j0 + 1)} cellules")
 
     def _on_wall_selection(self, sel) -> None:
+        """Update wall buttons and label for a new wall selection.
+
+        **Inputs**
+
+        - `sel` : tuple[str, int, int] | None   (side, k0, k1) inclusive
+        """
         for b in self._wall_buttons:
             b.setEnabled(sel is not None)
         if sel is None:
@@ -759,6 +1077,16 @@ class UI(QMainWindow):
                                   f"cellules {k0}..{k1}")
 
     def _apply_cells(self, fn) -> None:
+        """Apply a runner action to the selected cell box.
+
+        **Inputs**
+
+        - `fn` : callable(np.ndarray bool (nx, ny))
+
+        **Outputs**
+
+        - runner.m updated, marks scene dirty
+        """
         if self.viewport.sel is None:
             return
         i0, j0, i1, j1 = self.viewport.sel
@@ -768,6 +1096,16 @@ class UI(QMainWindow):
         self._mark_dirty()
 
     def _apply_wall(self, kind: str) -> None:
+        """Set a wall segment of the given kind on the selected wall span.
+
+        **Inputs**
+
+        - `kind` : str   inlet / outlet / wall
+
+        **Outputs**
+
+        - runner walls updated, marks scene dirty
+        """
         if self.viewport.wsel is None:
             return
         side, k0, k1 = self.viewport.wsel
@@ -780,6 +1118,13 @@ class UI(QMainWindow):
 
     # ------------------------------------------------------------ fichiers
     def _load(self, runner: SimulationRunner, path: str | None) -> None:
+        """Switch to another runner and rebuild everything.
+
+        **Inputs**
+
+        - `runner` : SimulationRunner
+        - `path` : str | None
+        """
         self._set_playing(False)
         self.runner = runner
         self.viewport.runner = runner
@@ -799,6 +1144,7 @@ class UI(QMainWindow):
         self._update_title()
 
     def _open(self) -> None:
+        """Ask for a JSON file and load it."""
         path, _ = QFileDialog.getOpenFileName(self, "Ouvrir une simulation", "", "Simulation (*.json)")
         if not path:
             return
@@ -808,6 +1154,7 @@ class UI(QMainWindow):
             QMessageBox.critical(self, "Ouverture impossible", str(exc))
 
     def _save(self) -> None:
+        """Save to self.path (asks for a path if none)."""
         if self.path is None:
             self._save_as()
             return
@@ -816,6 +1163,12 @@ class UI(QMainWindow):
         self.statusBar().showMessage(f"Enregistré : {self.path}", 3000)
 
     def _save_as(self) -> None:
+        """Ask for a path, then save.
+
+        **Outputs**
+
+        - self.path updated
+        """
         path, _ = QFileDialog.getSaveFileName(self, "Enregistrer la simulation", self.path or "simulation.json",
                                               "Simulation (*.json)")
         if path:
@@ -823,22 +1176,36 @@ class UI(QMainWindow):
             self._save()
 
     def _update_title(self, modified: bool = False) -> None:
+        """Set the window title from the file name.
+
+        **Inputs**
+
+        - `modified` : bool   append '*'
+        """
         name = os.path.basename(self.path) if self.path else "simulation"
         self.setWindowTitle(f"{name}{'*' if modified else ''} — APIC / MPM")
 
     # ------------------------------------------------------------ fin
     def _autoplay(self) -> None:
+        """Start playing once the solver exists (diagnostic mode)."""
         if self.solver is None:
             QTimer.singleShot(200, self._autoplay)
         else:
             self._set_playing(True)
 
     def _autoquit(self) -> None:
+        """Print diagnostics and close the window (diagnostic mode)."""
         st = self.solver.stats() if self.solver is not None else {}
         print(f"[diag] frames={self._frames} stats={st} view={self.viewport.scale}", flush=True)
         self.close()
 
     def closeEvent(self, event) -> None:
+        """Stop the timer and release the solver on close.
+
+        **Inputs**
+
+        - `event` : QCloseEvent
+        """
         self.timer.stop()
         if self.solver is not None:
             self.solver.release()

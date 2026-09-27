@@ -10,10 +10,16 @@ from Solver.APIC import stencil
 
 @ti.func
 def kirchhoff_stress(F, mu: float, la: float):
-    """Contrainte de Kirchhoff tau = P F^T du modèle corotationnel (Stomakhin et al. 2012).
+    """Corotated Kirchhoff stress tau = 2 mu (F - R) F^T + la J (J - 1) I (Stomakhin et al. 2012).
 
-    P = 2 mu (F - R) + la J (J - 1) F^{-T}   ->   tau = 2 mu (F - R) F^T + la J (J - 1) I
-    R est la rotation de la décomposition polaire F = R S, obtenue via la SVD F = U S V^T : R = U V^T.
+    **Inputs**
+
+    - `F` : mat2 f32 deformation gradient
+    - `mu`, `la` : float Lamé parameters
+
+    **Outputs**
+
+    - mat2 f32
     """
     U, sig, V = ti.svd(F)
     R = U @ V.transpose()
@@ -26,6 +32,16 @@ def kirchhoff_stress(F, mu: float, la: float):
 class Solid:
 
     def __init__(self, n, mu, la, k_res, p_mass, p_vol):
+        """Allocate particle fields (x, v, C, F, D, broken) and parameters.
+
+        **Inputs**
+
+        - `n` : int particle count
+        - `mu`, `la`, `k_res` : float Lamé parameters, residual stiffness (tunable 0-D fields)
+        - `p_mass`, `p_vol` : float
+
+        **Note** : p_mass, p_vol are Python attributes baked at compile time.
+        """
 
         self.x = ti.Vector.field(2, ti.f32, n)
         self.v = ti.Vector.field(2, ti.f32, n)
@@ -49,6 +65,16 @@ class Solid:
 
     @ti.func
     def stress(self, p):
+        """Damaged corotated stress, stiffness factor max(1 - D, k_res) (1 if broken).
+
+        **Inputs**
+
+        - `p` : int particle index
+
+        **Outputs**
+
+        - mat2 f32
+        """
         # Raideur effective (1 - D), avec un plancher k_res. Une particule rompue garde sa raideur
         # (elle résiste en compression) mais son F est écrêté dans update_deformation (pas de traction).
         k = ti.max(1.0 - self.D[p], self.k_res[None])
@@ -58,6 +84,18 @@ class Solid:
 
     @ti.func
     def update_deformation(self, p, C_new, dt):
+        """Update F <- (I + dt C) F ; broken particles: principal stretches clamped to [0.1, 1].
+
+        **Inputs**
+
+        - `p` : int particle index
+        - `C_new` : mat2 f32 velocity gradient
+        - `dt` : float
+
+        **Outputs**
+
+        - F[p] in place
+        """
         F_new = (ti.Matrix.identity(ti.f32, 2) + dt * C_new) @ self.F[p]
 
         if self.broken[p] == 1:
@@ -73,7 +111,14 @@ class Solid:
     # ------------------------------------------------------------ état
     @ti.kernel
     def reset_state(self):
-        """Au repos et intact (les positions x sont posées par le cas de calcul)."""
+        """Reset particles to rest and undamaged.
+
+        **Outputs**
+
+        - v, C, F, D, broken reset in place
+
+        **Note** : positions x are set by the case, not here.
+        """
         for p in self.x:
             self.v[p] = [0.0, 0.0]
             self.C[p] = ti.Matrix.zero(ti.f32, 2, 2)
@@ -84,7 +129,18 @@ class Solid:
     # ------------------------------------------------------------ endommagement non local
     def damage_step(self, grid_e, grid_w, inv_dx: float, dt: float,
                     eps0: float, epsf: float, tau_D: float, use_rupture: int):
-        """grid_e, grid_w : champs scalaires de la taille de la grille (allongement pondéré, somme des poids)."""
+        """Non-local damage update: clear scratch grids, scatter strain, update D.
+
+        **Inputs**
+
+        - `grid_e`, `grid_w` : f32 field (nx, ny), scratch (weighted stretch, weight sum)
+        - `inv_dx`, `dt`, `eps0`, `epsf`, `tau_D` : float
+        - `use_rupture` : int (1 = allow rupture)
+
+        **Outputs**
+
+        - D, broken, F updated in place ; grid_e, grid_w overwritten
+        """
         grid_e.fill(0.0)
         grid_w.fill(0.0)
         self.scatter_eps(grid_e, grid_w, inv_dx)
@@ -92,7 +148,19 @@ class Solid:
 
     @ti.kernel
     def scatter_eps(self, grid_e: ti.template(), grid_w: ti.template(), inv_dx: float):
-        """Étale l'allongement principal des particules saines sur la grille (somme pondérée)."""
+        """Scatter max principal stretch of intact particles on the grid.
+
+        **Inputs**
+
+        - `grid_e`, `grid_w` : f32 field (nx, ny)
+        - `inv_dx` : float
+
+        **Outputs**
+
+        - grid_e (weighted stretch), grid_w (weight sum) accumulated in place
+
+        **Note** : does not clear the grid.
+        """
         for p in self.x:
             if self.broken[p] == 0:
                 base, fx, w = stencil(self.x[p], inv_dx)
@@ -106,7 +174,18 @@ class Solid:
     @ti.kernel
     def update_damage(self, grid_e: ti.template(), grid_w: ti.template(), inv_dx: float, dt: float,
                       eps0: float, epsf: float, tau_D: float, use_rupture: int):
-        """D_new = clamp((eps_nl - eps0) / (epsf - eps0), 0, 1)     D <- max(D, min(D_new, D + dt / tau_D))"""
+        """Update damage from grid-smoothed stretch: D <- max(D, min(D_new, D + dt / tau_D)).
+
+        **Inputs**
+
+        - `grid_e`, `grid_w` : f32 field (nx, ny)
+        - `inv_dx`, `dt`, `eps0`, `epsf`, `tau_D` : float (D_new = clamp((eps - eps0) / (epsf - eps0), 0, 1))
+        - `use_rupture` : int (1: D >= 1 breaks the particle)
+
+        **Outputs**
+
+        - D, broken, F in place (newly broken: tension removed from F)
+        """
         for p in self.x:
             if self.broken[p] == 0:
                 base, fx, w = stencil(self.x[p], inv_dx)
@@ -130,8 +209,18 @@ class Solid:
     # ------------------------------------------------------------ affichage, diagnostics
     @ti.kernel
     def colors(self, col: ti.template(), mode: int, eps_scale: float):
-        """mode 0 = endommagement (gris -> jaune, rouge si rompu),
-        mode 1 = allongement principal max (bleu = compression, rouge = traction)."""
+        """Particle display colors.
+
+        **Inputs**
+
+        - `col` : vec3 f32 field (N,)
+        - `mode` : int: 0 damage (grey -> yellow, red if broken), 1 max principal stretch (blue -> red)
+        - `eps_scale` : float, stretch mapped to full color
+
+        **Outputs**
+
+        - col written in place
+        """
         for p in self.D:
             if mode == 0:
                 if self.broken[p] == 1:
@@ -146,7 +235,12 @@ class Solid:
 
     @ti.kernel
     def stats(self) -> ti.types.vector(2, ti.f32):
-        """(nombre de particules rompues, D max)."""
+        """Damage diagnostics.
+
+        **Outputs**
+
+        - vec2 f32 (broken particle count, max D)
+        """
         n_broken = 0
         D_max = 0.0
         for p in self.D:

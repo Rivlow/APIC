@@ -15,7 +15,19 @@ import taichi as ti
 
 @ti.func
 def stencil(xp, inv_dx):
-    """Node [0,0] from the 3x3 stencil using B-spline interpoltion"""
+    """Quadratic B-spline weights of the 3x3 stencil.
+
+    **Inputs**
+
+    - `xp` : vec2 f32 particle position
+    - `inv_dx` : float
+
+    **Outputs**
+
+    - `base` : vec2 i32 node [0, 0] of the stencil
+    - `fx` : vec2 f32 xp inv_dx - base ;
+    - `w` : 3x2 f32 weights (row = offset 0..2, column = axis)
+    """
     base = (xp * inv_dx - 0.5).cast(int)
     fx = xp * inv_dx - base
     w0 = 0.5 * (1.5 - fx)**2
@@ -27,7 +39,17 @@ def stencil(xp, inv_dx):
 
 @ti.kernel
 def clear_grid(grid_m: ti.template(), grid_v: ti.template()):
-    """Reset grid once per step"""
+    """Reset grid mass and momentum (once per step).
+
+    **Inputs**
+
+    - `grid_m` : f32 field (nx, ny)
+    - `grid_v` : vec2 f32 field (nx, ny)
+
+    **Outputs**
+
+    - grid_m, grid_v zeroed in place
+    """
     for i, j in grid_m:
         grid_v[i, j] = [0.0, 0.0]
         grid_m[i, j] = 0.0
@@ -36,7 +58,22 @@ def clear_grid(grid_m: ti.template(), grid_v: ti.template()):
 @ti.kernel
 def P2G(phase: ti.template(), grid_m: ti.template(), grid_v: ti.template(),
         inv_dx: float, dx: float, dt: float):
- 
+    """Project particles on grid (mass, momentum, MLS stress).
+
+    **Inputs**
+
+    - `phase` : data_oriented phase: x, v (N,) vec2 f32 ; C (N,) mat2 f32 ; p_mass, p_vol float ; stress(p)
+    - `grid_m` : f32 field (nx, ny)
+    - `grid_v` : vec2 f32 field (nx, ny)
+    - `inv_dx`, `dx`, `dt` : float
+
+    **Outputs**
+
+    - grid_m, grid_v accumulated in place
+
+    **Note** : does not clear the grid (call clear_grid first).
+    """
+
     for p in phase.x:
 
         base, fx, w = stencil(phase.x[p], inv_dx)
@@ -53,7 +90,19 @@ def P2G(phase: ti.template(), grid_m: ti.template(), grid_v: ti.template(),
 @ti.kernel
 def G2P(phase: ti.template(), grid_v: ti.template(),
         inv_dx: float, dx: float, dt: float):
-  
+    """Gather grid velocity to particles (APIC) and update their deformation.
+
+    **Inputs**
+
+    - `phase` : data_oriented phase: x, v (N,) vec2 f32 ; C (N,) mat2 f32 ; update_deformation(p, C, dt)
+    - `grid_v` : vec2 f32 field (nx, ny), velocity (after grid_step)
+    - `inv_dx`, `dx`, `dt` : float
+
+    **Outputs**
+
+    - phase.v, phase.C and deformation state (J or F) written in place
+    """
+
     for p in phase.x:
 
         base, fx, w = stencil(phase.x[p], inv_dx)

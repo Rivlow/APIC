@@ -56,6 +56,12 @@ Image = ti.Vector.field(3, ti.f32, (nx_grid, nx_grid))
 
 @ti.kernel
 def apply_IC():
+    """Seed particles uniformly in the water block, at rest (C = 0, J = 1).
+
+    **Outputs**
+
+    - fluid.x, fluid.v (n_particles,) vec2, fluid.C (n_particles,) mat2x2, fluid.J (n_particles,) updated in place
+    """
 
     for p in fluid.x:
 
@@ -69,6 +75,16 @@ def apply_IC():
 
 @ti.kernel
 def render(mode: ti.i32):
+    """Fill the image from the grid (density or speed), obstacles in grey.
+
+    **Inputs**
+
+    - `mode` : int    0 = relative density, 1 = speed
+
+    **Outputs**
+
+    - Image (nx_grid, nx_grid) vec3 f32 updated in place
+    """
     for i, j in Image:
         if cells[i, j] & OBSTACLE:
             Image[i, j] = [0.35, 0.35, 0.35]
@@ -87,6 +103,7 @@ def render(mode: ti.i32):
 
 # ---------------------------------------------------------------- Boucle principale
 def main():
+    """Interactive loop: APIC substeps, render, GUI (SPACE toggle view, R reset, ESC quit)."""
     window = ti.ui.Window("APIC 2D - eau quasi-incompressible", res=(512, 512))
     canvas = window.get_canvas()
     gui = window.get_gui()

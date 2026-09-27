@@ -22,12 +22,32 @@ AIR, FLUID, SOLID, MOVING = 0, 1, 2, 3       # MOVING : cellule occupée par le 
 
 @ti.func
 def weights(fx):
+    """Quadratic B-spline weights.
+
+    **Inputs**
+
+    - `fx` : vec2 f32 offset from the base node (in cells)
+
+    **Outputs**
+
+    - list of 3 vec2 weights
+    """
     return [0.5 * (1.5 - fx) ** 2, 0.75 - (fx - 1.0) ** 2, 0.5 * (fx - 0.5) ** 2]
 
 
 @ti.func
 def stencil(xp, inv_dx: float, ox: float, oy: float):
-    """Nœud de base et fraction pour une grille décalée de (ox, oy) demi-cellules."""
+    """Base node and fraction on a grid staggered by (ox, oy) half cells.
+
+    **Inputs**
+
+    - `xp` : vec2 f32 position
+    - `inv_dx`, `ox`, `oy` : float
+
+    **Outputs**
+
+    - (ivec2 base, vec2 fx)
+    """
     off = ti.Vector([ox, oy])
     base = (xp * inv_dx - off - 0.5).cast(int)
     fx = xp * inv_dx - off - base
@@ -38,6 +58,21 @@ def stencil(xp, inv_dx: float, ox: float, oy: float):
 @ti.kernel
 def mac_p2g(x: ti.template(), vel: ti.template(), C: ti.template(), alive: ti.template(),
             u: ti.template(), v: ti.template(), mu: ti.template(), mv: ti.template(), inv_dx: float, dx: float):
+    """Transfer particles to MAC faces (APIC).
+
+    **Inputs**
+
+    - `x`, `vel` : vec2 f32 field (cap,) positions / velocities
+    - `C` : mat2 f32 field (cap,) affine matrices
+    - `alive` : i32 field (cap,) 1 = live particle
+    - `u`, `v` : f32 fields (nx+1, ny), (nx, ny+1) MAC face velocities
+    - `mu`, `mv` : f32 fields, same shapes, transfer weights
+    - `inv_dx`, `dx` : float
+
+    **Outputs**
+
+    - u, v, mu, mv written in place
+    """
     for I in ti.grouped(u):
         u[I] = 0.0
         mu[I] = 0.0
@@ -76,12 +111,28 @@ def mac_classify(ctype: ti.template(), cells: ti.template(), wall_type: ti.templ
                  wall_d: ti.template(), x: ti.template(), alive: ti.template(),
                  x_s: ti.template(), has_solid: int, inv_dx: float, nx: int, ny: int, bound: int,
                  free_surface: int):
-    """free_surface = 1 : une cellule sans particule est de l'air (p = 0).
-    free_surface = 0 : domaine plein, toute cellule non solide est fluide (la pression y est resolue,
-    y compris negative).
-    Bande de paroi et face d'obstacle qui porte une entrée / sortie : SOLID (paroi glissante ou entrée :
-    vitesse imposée sur les faces), AIR pour une sortie (p = 0 exactement sur le mur). Les cellules contenant
-    une particule du solide MPM sont MOVING."""
+    """Classify cells (air/fluid/solid/moving).
+
+    **Inputs**
+
+    - `ctype` : i32 field (nx, ny)
+    - `cells` : i32 field (nx, ny) bit flags
+    - `wall_type` : i32 field (4, nm) wall BC type
+    - `wall_v` : vec2 f32 field (4, nm) inlet velocity
+    - `wall_d` : i32 field (4, nm) wall offset from the edge (cells)
+    - `x` : vec2 f32 field (cap,) fluid positions
+    - `alive` : i32 field (cap,) 1 = live particle
+    - `x_s` : vec2 f32 field (Ns,) solid positions
+    - `has_solid` : int
+    - `inv_dx` : float
+    - `nx`, `ny`, `bound`, `free_surface` : int
+
+    **Outputs**
+
+    - ctype written in place
+
+    **Note** : outlet wall cells are AIR; free_surface = 0 makes every non-solid cell FLUID.
+    """
     for i, j in ctype:
         f = cells[i, j]
         side, _k = band_cell(i, j, nx, ny, bound, wall_d)
@@ -116,9 +167,19 @@ def mac_classify(ctype: ti.template(), cells: ti.template(), wall_type: ti.templ
 @ti.func
 def solid_beta(wall_f: ti.template(), i: int, j: int, nx: int, ny: int, bound: int, beta_o: float,
                horizontal: int) -> float:
-    """Frottement de la cellule solide (i, j) : celui du mur si elle est dans la bande de paroi (horizontal = 1 :
-    face u, tangentielle aux murs du bas / haut, qui ont la priorité dans un coin ; 0 : face v, murs gauche /
-    droite prioritaires), sinon celui des obstacles beta_o."""
+    """Friction of solid cell (i, j): wall friction in the band, else beta_o.
+
+    **Inputs**
+
+    - `wall_f` : f32 field (4, nm) wall friction
+    - `i`, `j`, `nx`, `ny`, `bound` : int
+    - `beta_o` : float obstacle friction
+    - `horizontal` : int 1 = u face (bottom/top walls win in corners)
+
+    **Outputs**
+
+    - float beta
+    """
     beta = beta_o
     on_bt = j < bound or j >= ny - bound
     on_lr = i < bound or i >= nx - bound
@@ -140,12 +201,25 @@ def mac_bc(u: ti.template(), v: ti.template(), ctype: ti.template(), wall_type: 
            wall_d: ti.template(), wall_f: ti.template(),
            grid_v: ti.template(), grid_m: ti.template(), dt: float, g: float, beta_o: float,
            nx: int, ny: int, bound: int, with_gravity: int):
-    """Gravité, puis vitesses sur les faces touchant une cellule solide :
-      - face normale (entre une cellule solide et une non solide) : 0 (imperméable), (vx, vy) d'une entrée, ou la
-        vitesse du solide MPM (moyenne des deux nœuds de la grille collocalisée qui encadrent la face) ;
-      - face tangentielle (entre deux cellules solides fixes, à côté d'une rangée fluide) : valeur fantôme
-        (1 - 2 beta) u_fluide, u_fluide = face voisine côté fluide. beta = 0 : glissant (gradient nul),
-        beta = 1 : adhérent (moyenne nulle sur la paroi). beta : frottement du mur (wall_f) ou des obstacles."""
+    """Apply gravity and face BCs (walls, inlets, moving solid, friction ghosts).
+
+    **Inputs**
+
+    - `u`, `v` : f32 fields (nx+1, ny), (nx, ny+1) MAC face velocities
+    - `ctype` : i32 field (nx, ny)
+    - `wall_type` : i32 field (4, nm) wall BC type
+    - `wall_v` : vec2 f32 field (4, nm) inlet velocity
+    - `wall_d` : i32 field (4, nm) wall offset from the edge (cells)
+    - `wall_f` : f32 field (4, nm) wall friction
+    - `grid_v` : vec2 f32 field (nx, ny) solid node velocities
+    - `grid_m` : f32 field (nx, ny) solid node masses
+    - `dt`, `g`, `beta_o` : float
+    - `nx`, `ny`, `bound`, `with_gravity` : int
+
+    **Outputs**
+
+    - u, v written in place
+    """
     for I in ti.grouped(v):
         if with_gravity == 1:
             v[I] -= dt * g
@@ -207,8 +281,21 @@ def mac_bc(u: ti.template(), v: ti.template(), ctype: ti.template(), wall_type: 
 @ti.kernel
 def pressure_force(fp: ti.template(), grid_m: ti.template(), q: ti.template(), ctype: ti.template(),
                    inv_dx: float, coef: float, nx: int, ny: int):
-    """Accélération −∇p / ρ_s sur les nœuds massiques du solide, à partir de q (cellules fluides seulement,
-    0 ailleurs) ; coef = −(ρ_f / ρ_s) / dt_fluide car p = q ρ_f / dt."""
+    """Pressure acceleration -grad p / rho_s on solid grid nodes.
+
+    **Inputs**
+
+    - `fp` : vec2 f32 field (nx, ny)
+    - `grid_m` : f32 field (nx, ny) solid node masses
+    - `q` : f32 field (nx, ny) pressure dt / rho
+    - `ctype` : i32 field (nx, ny)
+    - `inv_dx`, `coef` : float
+    - `nx`, `ny` : int
+
+    **Outputs**
+
+    - fp written in place
+    """
     for i, j in fp:
         a = ti.Vector([0.0, 0.0])
         if grid_m[i, j] > 0:
@@ -224,6 +311,19 @@ def pressure_force(fp: ti.template(), grid_m: ti.template(), q: ti.template(), c
 
 @ti.kernel
 def add_accel(grid_v: ti.template(), grid_m: ti.template(), fp: ti.template(), dt: float):
+    """Add fp dt to grid velocities of massive nodes.
+
+    **Inputs**
+
+    - `grid_v` : vec2 f32 field (nx, ny)
+    - `grid_m` : f32 field (nx, ny)
+    - `fp` : vec2 f32 field (nx, ny) acceleration
+    - `dt` : float
+
+    **Outputs**
+
+    - grid_v written in place
+    """
     for i, j in grid_v:
         if grid_m[i, j] > 0:
             grid_v[i, j] += dt * fp[i, j]
@@ -232,8 +332,20 @@ def add_accel(grid_v: ti.template(), grid_m: ti.template(), fp: ti.template(), d
 # ---------------------------------------------------------------- 4. densité des particules + gradient conjugué
 @ti.kernel
 def particle_density(x: ti.template(), alive: ti.template(), dens: ti.template(), inv_dx: float, ppc: int):
-    """rho / rho0 aux centres des cellules : somme des poids B-spline quadratiques des particules, divisée par
-    ppc² (densité nominale = 1)."""
+    """Particle density rho / rho0 at cell centers.
+
+    **Inputs**
+
+    - `x` : vec2 f32 field (cap,) positions
+    - `alive` : i32 field (cap,) 1 = live particle
+    - `dens` : f32 field (nx, ny)
+    - `inv_dx` : float
+    - `ppc` : int
+
+    **Outputs**
+
+    - dens written in place (1 = nominal)
+    """
     for i, j in dens:
         dens[i, j] = 0.0
     inv = 1.0 / (ppc * ppc)
@@ -247,7 +359,18 @@ def particle_density(x: ti.template(), alive: ti.template(), dens: ti.template()
 
 @ti.func
 def apply_A(q, ctype, i, j, nx, ny):
-    """(A q)_ij = deg q_ij - somme des q des voisins fluides (air : q = 0 ; solide : exclu)."""
+    """Apply the 5-point Laplacian (air: 0, solid: excluded) at cell (i, j).
+
+    **Inputs**
+
+    - `q` : f32 field (nx, ny)
+    - `ctype` : i32 field (nx, ny)
+    - `i`, `j`, `nx`, `ny` : int
+
+    **Outputs**
+
+    - float (A q)_ij
+    """
     deg = 0
     s = 0.0
     for di, dj in ti.static(((1, 0), (-1, 0), (0, 1), (0, -1))):
@@ -266,10 +389,26 @@ def cg_init(q: ti.template(), r: ti.template(), pd: ti.template(), rhs: ti.templ
             u: ti.template(), v: ti.template(), ctype: ti.template(), cg: ti.template(),
             wall_type: ti.template(), wall_d: ti.template(), wall_p: ti.template(),
             dx: float, dt: float, inv_rho: float, nx: int, ny: int, bound: int):
-    """Second membre, résidu initial r = b - A q (q = pression précédente comme point de départ).
-    Cellules d'air : pression de Dirichlet connue, 0 (surface libre) ou pression imposée d'une sortie
-    (outlet_q) ; reportée dans le second membre des cellules fluides voisines
-    (deg q_i - somme q_j fluides = b + somme q_air), et lue telle quelle par mac_project."""
+    """Solve pressure: CG init (rhs, Dirichlet air cells, r, p, rr).
+
+    **Inputs**
+
+    - `q`, `r`, `pd`, `rhs` : f32 fields (nx, ny)
+    - `u`, `v` : f32 fields (nx+1, ny), (nx, ny+1) MAC face velocities
+    - `ctype` : i32 field (nx, ny)
+    - `cg` : f32 field (3,) [rr, pAp, rr_new]
+    - `wall_type` : i32 field (4, nm) wall BC type
+    - `wall_d` : i32 field (4, nm) wall offset from the edge (cells)
+    - `wall_p` : f32 field (4, nm) outlet pressure
+    - `dx`, `dt`, `inv_rho` : float
+    - `nx`, `ny`, `bound` : int
+
+    **Outputs**
+
+    - q, r, pd, rhs, cg[0] written in place
+
+    **Note** : warm start from previous q.
+    """
     for i, j in ctype:
         if ctype[i, j] != FLUID:
             q[i, j] = 0.0
@@ -300,6 +439,19 @@ def cg_init(q: ti.template(), r: ti.template(), pd: ti.template(), rhs: ti.templ
 
 @ti.kernel
 def cg_apply(pd: ti.template(), Ap: ti.template(), ctype: ti.template(), cg: ti.template(), nx: int, ny: int):
+    """Solve pressure: CG step A p and pAp.
+
+    **Inputs**
+
+    - `pd`, `Ap` : f32 fields (nx, ny)
+    - `ctype` : i32 field (nx, ny)
+    - `cg` : f32 field (3,) [rr, pAp, rr_new]
+    - `nx`, `ny` : int
+
+    **Outputs**
+
+    - Ap, cg[1] written in place
+    """
     pAp = 0.0
     for i, j in ctype:
         if ctype[i, j] == FLUID:
@@ -311,7 +463,20 @@ def cg_apply(pd: ti.template(), Ap: ti.template(), ctype: ti.template(), cg: ti.
 @ti.kernel
 def cg_update(q: ti.template(), r: ti.template(), pd: ti.template(), Ap: ti.template(), ctype: ti.template(),
               cg: ti.template()):
-    """q += α p, r -= α A p, puis p = r + β p, avec α = rr / pAp et β = rr_new / rr."""
+    """Solve pressure: CG update of q, r, p.
+
+    **Inputs**
+
+    - `q`, `r`, `pd`, `Ap` : f32 fields (nx, ny)
+    - `ctype` : i32 field (nx, ny)
+    - `cg` : f32 field (3,) [rr, pAp, rr_new]
+
+    **Outputs**
+
+    - q, r, pd, cg written in place
+
+    **Note** : alpha, beta computed on GPU (no read-back).
+    """
     alpha = cg[0] / ti.max(cg[1], 1e-30)
     rr_new = 0.0
     for i, j in ctype:
@@ -338,9 +503,23 @@ def cg_update(q: ti.template(), r: ti.template(), pd: ti.template(), Ap: ti.temp
 def density_cg_init(phi: ti.template(), r: ti.template(), pd: ti.template(), rhs: ti.template(),
                     dens: ti.template(), ctype: ti.template(), cg: ti.template(), kappa: float, dx: float,
                     nx: int, ny: int):
-    """Second membre kappa dx² e : e = rho/rho0 - 1 dans les deux sens à l'intérieur (corriger seulement les
-    excès, avec le bruit du semis, gonfle le fluide) ; surdensité seulement dans une cellule de surface (voisine
-    de l'air), naturellement sous-dense car partiellement remplie. Point de départ : phi = 0."""
+    """Density projection: CG init with rhs kappa dx^2 (rho/rho0 - 1), phi = 0.
+
+    **Inputs**
+
+    - `phi`, `r`, `pd`, `rhs` : f32 fields (nx, ny)
+    - `dens` : f32 field (nx, ny) rho / rho0
+    - `ctype` : i32 field (nx, ny)
+    - `cg` : f32 field (3,) [rr, pAp, rr_new]
+    - `kappa`, `dx` : float
+    - `nx`, `ny` : int
+
+    **Outputs**
+
+    - phi, r, pd, rhs, cg[0] written in place
+
+    **Note** : surface cells correct overdensity only.
+    """
     for i, j in ctype:
         phi[i, j] = 0.0
         rhs[i, j] = 0.0
@@ -368,8 +547,20 @@ def density_cg_init(phi: ti.template(), r: ti.template(), pd: ti.template(), rhs
 @ti.kernel
 def density_gradient(phi: ti.template(), du: ti.template(), dv: ti.template(), ctype: ti.template(),
                      dx: float, nx: int, ny: int):
-    """Déplacement sur les faces : -(phi_j - phi_i) / dx entre deux cellules non solides dont l'une est fluide
-    (air : phi = 0) ; 0 ailleurs (aucune poussée vers un mur, un obstacle ou le solide MPM)."""
+    """Face displacements -grad phi (0 next to solids).
+
+    **Inputs**
+
+    - `phi` : f32 field (nx, ny)
+    - `du`, `dv` : f32 fields (nx+1, ny), (nx, ny+1)
+    - `ctype` : i32 field (nx, ny)
+    - `dx` : float
+    - `nx`, `ny` : int
+
+    **Outputs**
+
+    - du, dv written in place
+    """
     for i, j in du:
         val = 0.0
         if 0 < i < nx:
@@ -389,10 +580,23 @@ def density_gradient(phi: ti.template(), du: ti.template(), dv: ti.template(), c
 @ti.kernel
 def density_shift(x: ti.template(), alive: ti.template(), du: ti.template(), dv: ti.template(),
                   ctype: ti.template(), inv_dx: float, dx: float, bound: int, nx: int, ny: int):
-    """x_p += déplacement interpolé depuis les faces (mêmes poids que mac_g2p), borné à 0,5 dx par composante,
-    puis écrêté à la bande de paroi. Les vitesses ne changent pas. Un déplacement qui ferait entrer la particule
-    dans une cellule solide (obstacle, paroi, solide MPM) est refusé : la correction de densité ne doit jamais
-    pousser du fluide dans une structure (le couplage fluide-structure s'emballe)."""
+    """Shift particle positions by the interpolated face displacement.
+
+    **Inputs**
+
+    - `x` : vec2 f32 field (cap,) positions
+    - `alive` : i32 field (cap,) 1 = live particle
+    - `du`, `dv` : f32 fields (nx+1, ny), (nx, ny+1)
+    - `ctype` : i32 field (nx, ny)
+    - `inv_dx`, `dx` : float
+    - `bound`, `nx`, `ny` : int
+
+    **Outputs**
+
+    - x written in place
+
+    **Note** : shift clamped to 0.5 dx; moves into solid cells rejected; velocities untouched.
+    """
     lo = ti.Vector([bound * dx, bound * dx])
     hi = ti.Vector([(nx - bound) * dx, (ny - bound) * dx])
     for p in x:
@@ -418,7 +622,20 @@ def density_shift(x: ti.template(), alive: ti.template(), du: ti.template(), dv:
 @ti.kernel
 def mac_project(u: ti.template(), v: ti.template(), q: ti.template(), ctype: ti.template(), dx: float,
                 nx: int, ny: int):
-    """u -= grad q sur les faces entre deux cellules non solides dont l'une est fluide (air : q = 0)."""
+    """Subtract grad q on faces between non-solid cells (one fluid).
+
+    **Inputs**
+
+    - `u`, `v` : f32 fields (nx+1, ny), (nx, ny+1) MAC face velocities
+    - `q` : f32 field (nx, ny) pressure dt / rho
+    - `ctype` : i32 field (nx, ny)
+    - `dx` : float
+    - `nx`, `ny` : int
+
+    **Outputs**
+
+    - u, v written in place
+    """
     for i, j in u:
         if 0 < i < nx:
             tl, tr = ctype[i - 1, j], ctype[i, j]
@@ -435,7 +652,23 @@ def mac_project(u: ti.template(), v: ti.template(), q: ti.template(), ctype: ti.
 @ti.kernel
 def mac_g2p(x: ti.template(), vel: ti.template(), C: ti.template(), alive: ti.template(),
             u: ti.template(), v: ti.template(), mu: ti.template(), mv: ti.template(), inv_dx: float, dx: float):
-    """Vitesse et matrice affine depuis les faces valides (poids > 0) ; sans face valide, on garde la vitesse."""
+    """Transfer face velocities to particles (APIC).
+
+    **Inputs**
+
+    - `x`, `vel` : vec2 f32 field (cap,) positions / velocities
+    - `C` : mat2 f32 field (cap,) affine matrices
+    - `alive` : i32 field (cap,) 1 = live particle
+    - `u`, `v` : f32 fields (nx+1, ny), (nx, ny+1) MAC face velocities
+    - `mu`, `mv` : f32 fields, same shapes, transfer weights
+    - `inv_dx`, `dx` : float
+
+    **Outputs**
+
+    - vel, C written in place
+
+    **Note** : component kept unchanged when no face has weight > 0.
+    """
     k = 4.0 * inv_dx * inv_dx
     for p in x:
         if alive[p] == 1:
@@ -473,6 +706,24 @@ def mac_g2p(x: ti.template(), vel: ti.template(), C: ti.template(), alive: ti.te
 @ti.func
 def _spawn(x: ti.template(), vel: ti.template(), C: ti.template(), J: ti.template(), alive: ti.template(),
            free_stack: ti.template(), free_top: ti.template(), xp, vp):
+    """Pop a free slot and spawn one particle.
+
+    **Inputs**
+
+    - `x`, `vel` : vec2 f32 field (cap,) positions / velocities
+    - `C` : mat2 f32 field (cap,) affine matrices
+    - `J` : f32 field (cap,) volume ratios
+    - `alive` : i32 field (cap,) 1 = live particle
+    - `free_stack` : i32 field (cap,) free slot stack
+    - `free_top` : i32 field (1,) stack size
+    - `xp`, `vp` : vec2 f32 position / velocity
+
+    **Outputs**
+
+    - pool fields written in place
+
+    **Note** : no-op when the pool is full.
+    """
     idx = ti.atomic_sub(free_top[0], 1) - 1
     if idx >= 0:
         p = free_stack[idx]
@@ -491,11 +742,30 @@ def emit_pressure_outlet(x: ti.template(), vel: ti.template(), C: ti.template(),
                          acc: ti.template(), ctype: ti.template(), u: ti.template(), v: ti.template(), ppc: int,
                          free_stack: ti.template(), free_top: ti.template(), dt: float, dx: float, bound: int,
                          nx: int, ny: int):
-    """Sortie à pression imposée p > 0 (il y a de l'eau dehors) : si le gradient de pression fait RENTRER
-    l'écoulement (vitesse de face projetée v_n > 0, cellule devant le mur fluide), l'eau qui entre est émise au
-    flux, comme par une entrée : ppc² v_n dt / dx particules par pas (fraction reportée dans acc), dans la lame
-    [mur, mur + v_n dt], à la vitesse normale v_n. Sinon l'eau aspirée laisserait un vide. La sortie de l'eau
-    ne demande rien : les particules qui franchissent le mur sont détruites (advect_fluid)."""
+    """Emit particles by flux at pressure outlets (p > 0) with inflow.
+
+    **Inputs**
+
+    - `x`, `vel` : vec2 f32 field (cap,) positions / velocities
+    - `C` : mat2 f32 field (cap,) affine matrices
+    - `J` : f32 field (cap,) volume ratios
+    - `alive` : i32 field (cap,) 1 = live particle
+    - `wall_type` : i32 field (4, nm) wall BC type
+    - `wall_d` : i32 field (4, nm) wall offset from the edge (cells)
+    - `wall_p` : f32 field (4, nm) outlet pressure
+    - `acc` : f32 field (4, nm) fractional particle carry
+    - `ctype` : i32 field (nx, ny)
+    - `u`, `v` : f32 fields (nx+1, ny), (nx, ny+1) MAC face velocities
+    - `ppc` : int
+    - free_stack i32 field (cap,) free slot stack
+    - `free_top` : i32 field (1,) stack size
+    - `dt`, `dx` : float
+    - `bound`, `nx`, `ny` : int
+
+    **Outputs**
+
+    - pool fields, acc written in place
+    """
     ppc2 = float(ppc * ppc)
     for side, k in wall_type:
         ln = ny if side <= RIGHT else nx
@@ -524,11 +794,32 @@ def emit_pressure_outlet(x: ti.template(), vel: ti.template(), C: ti.template(),
 
 @ti.kernel
 def cg_residual(cg: ti.template()) -> ti.f32:
+    """Current CG residual rr.
+
+    **Inputs**
+
+    - `cg` : f32 field (3,) [rr, pAp, rr_new]
+
+    **Outputs**
+
+    - f32 cg[0]
+    """
     return cg[0]
 
 
 @ti.kernel
 def max_speed(vel: ti.template(), alive: ti.template()) -> ti.f32:
+    """Max particle speed.
+
+    **Inputs**
+
+    - `vel` : vec2 f32 field (cap,) velocities
+    - `alive` : i32 field (cap,) 1 = live particle
+
+    **Outputs**
+
+    - f32 max |vel|
+    """
     m = 0.0
     for p in vel:
         if alive[p] == 1:
@@ -538,7 +829,18 @@ def max_speed(vel: ti.template(), alive: ti.template()) -> ti.f32:
 
 @ti.kernel
 def divergence_max(u: ti.template(), v: ti.template(), ctype: ti.template(), dx: float) -> ti.f32:
-    """Diagnostic : max |div u| sur les cellules fluides (doit tendre vers 0 après projection)."""
+    """Max |div u| over fluid cells (diagnostic).
+
+    **Inputs**
+
+    - `u`, `v` : f32 fields (nx+1, ny), (nx, ny+1) MAC face velocities
+    - `ctype` : i32 field (nx, ny)
+    - `dx` : float
+
+    **Outputs**
+
+    - f32 max
+    """
     m = 0.0
     for i, j in ctype:
         if ctype[i, j] == FLUID:

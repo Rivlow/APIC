@@ -4,6 +4,17 @@ CFL = 0.5
 
 @ti.func
 def compute_dt(v:ti.template(), dx:float, E:float, rho:float) -> float:
+    """CFL time step with sound speed c_s = sqrt(E / rho).
+
+    **Inputs**
+
+    - `v` : vec2 f32 field (N,)
+    - `dx`, `E`, `rho` : float
+
+    **Outputs**
+
+    - dt float
+    """
 
     # dt = CFL / max_p[(|u|+c_s)/dx + (|v|+c_s)/dy]
     c_s = ti.sqrt(E/rho)
@@ -17,6 +28,20 @@ def compute_dt(v:ti.template(), dx:float, E:float, rho:float) -> float:
 def time_integration(x:ti.template(), v:ti.template(),
                      bound:int, dx:float,
                      E:float, rho:float) -> float:
+    """Advect particles with the CFL time step, clamped to [bound dx, 1 - bound dx].
+
+    **Inputs**
+
+    - `x`, `v` : vec2 f32 field (N,)
+    - `bound` : int
+    - `dx`, `E`, `rho` : float
+
+    **Outputs**
+
+    - dt float ; x updated in place
+
+    **Note** : assumes the unit square domain.
+    """
 
     dt = compute_dt(v, dx, E, rho)
     for p in x:

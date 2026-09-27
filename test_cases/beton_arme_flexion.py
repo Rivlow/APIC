@@ -108,6 +108,19 @@ Image = ti.Vector.field(3, ti.f32, (W, H))
 # ---------------------------------------------------------------- grille : appuis, vérins
 @ti.kernel
 def grid_update(dt: float, g_eff: float, v_load: float, u_load: float):
+    """Grid update: momentum -> velocity, damping, gravity, walls, supports, jacks (accumulates reaction).
+
+    **Inputs**
+
+    - `dt` : float  time step (s)
+    - `g_eff` : float  effective gravity (m/s2)
+    - `v_load` : float  jack velocity (m/s)
+    - `u_load` : float  jack stroke (m)
+
+    **Outputs**
+
+    - grid_v (nx, ny) vec2 f32, react () f32 (N/m) updated in place
+    """
     for i, j in grid_m:
         if grid_m[i, j] > 0:
             grid_v[i, j] /= grid_m[i, j]
@@ -138,6 +151,12 @@ def grid_update(dt: float, g_eff: float, v_load: float, u_load: float):
 
 @ti.kernel
 def init_mask():
+    """Mark support nodes (under the beam, around xs1 and xs2).
+
+    **Outputs**
+
+    - mask (nx, ny) i32 updated in place (1 = support)
+    """
     for i, j in mask:
         pos = ti.Vector([i, j]) * dx
         support = (ti.abs(pos.x - xs1) <= hw or ti.abs(pos.x - xs2) <= hw) and pos.y <= beam_y0
@@ -147,6 +166,18 @@ def init_mask():
 # ---------------------------------------------------------------- advection (domaine rectangulaire, X0 + Up)
 @ti.kernel
 def advect(dt: float):
+    """Advance displacements Up, clamp to the domain, update x = X0 + Up.
+
+    **Inputs**
+
+    - `dt` : float  time step (s)
+
+    **Outputs**
+
+    - beam.Up, beam.x (n_solid,) vec2 f32 updated in place
+
+    **Note** : component-wise clamp only when outside; the compact form gets reassociated and rounds Up to ulp(X0).
+    """
     lo = ti.Vector([bound * dx, bound * dx])
     hi = ti.Vector([Lx - bound * dx, Ly - bound * dx])
     for p in beam.x:
@@ -166,6 +197,12 @@ def advect(dt: float):
 # ---------------------------------------------------------------- initialisation, mesures
 @ti.kernel
 def init_beam():
+    """Initialise particles on a 2 x 2 per cell lattice with rebar fraction and lognormal strengths.
+
+    **Outputs**
+
+    - beam particle fields (n_solid,) updated in place
+    """
     for p in beam.x:
         i = p % n_px
         j = p // n_px
@@ -185,7 +222,12 @@ def init_beam():
 
 @ti.kernel
 def bottom_mid_uy() -> ti.types.vector(2, ti.f32):
-    """Somme et nombre des déplacements verticaux de la fibre inférieure à mi-portée."""
+    """Sum and count of vertical displacements of the bottom fibre near mid-span.
+
+    **Outputs**
+
+    - ti.Vector(2) f32 (sum Up.y in m, count)
+    """
     s = 0.0
     n = 0.0
     for p in beam.x:
@@ -198,6 +240,17 @@ def bottom_mid_uy() -> ti.types.vector(2, ti.f32):
 # ---------------------------------------------------------------- affichage
 @ti.func
 def particle_color(p: int, mode: int):
+    """Particle colour: damage/steel state or principal stress.
+
+    **Inputs**
+
+    - `p` : int  particle index
+    - `mode` : int  0 = damage and steel, 1 = principal stress
+
+    **Outputs**
+
+    - ti.Vector(3) f32 RGB
+    """
     col = ti.Vector([0.75, 0.75, 0.75])
     if mode == 0:
         if beam.phi[p] > 0.0:
@@ -224,6 +277,17 @@ def particle_color(p: int, mode: int):
 
 @ti.kernel
 def render(mode: int, u_load: float):
+    """Draw supports, jacks and particles (4 x 4 pixel squares) into the image.
+
+    **Inputs**
+
+    - `mode` : int    colour mode (see particle_color)
+    - `u_load` : float  jack stroke (m)
+
+    **Outputs**
+
+    - Image (W, H) vec3 f32 updated in place
+    """
     for i, j in Image:
         pos = ti.Vector([(i + 0.5) * Lx / W, (j + 0.5) * Ly / H])
         col = ti.Vector([0.02, 0.02, 0.08])
@@ -251,6 +315,12 @@ class State:
 
 
 def reset():
+    """Reset particles, support mask and State (t, u).
+
+    **Outputs**
+
+    - beam, mask, State updated in place
+    """
     init_beam()
     beam.refresh_x()
     init_mask()
@@ -259,12 +329,32 @@ def reset():
 
 
 def smoothstep(t):
+    """Smooth 0 -> 1 load ramp over t_ramp.
+
+    **Inputs**
+
+    - `t` : float  time (s)
+
+    **Outputs**
+
+    - float in [0, 1]
+    """
     s = min(t / t_ramp, 1.0)
     return s * s * (3.0 - 2.0 * s)
 
 
 def substep(v_load, model):
-    """Un pas de temps. model : 1 élastique linéaire, 2 béton armé non linéaire."""
+    """Advance one time step (P2G, grid update, G2P, advection, history).
+
+    **Inputs**
+
+    - `v_load` : float  target jack velocity (m/s)
+    - `model` : int    1 linear elastic, 2 nonlinear reinforced concrete
+
+    **Outputs**
+
+    - beam, grid fields, react, State updated in place
+    """
     s = smoothstep(State.t)
     v_eff = v_load * s
     nl = 1 if model >= 2 else 0
@@ -281,7 +371,18 @@ def substep(v_load, model):
 
 
 def advance(n, v_load, model):
-    """n pas de temps ; retourne (P en kN moyenné sur la série, flèche à mi-portée en mm)."""
+    """Run n time steps and measure load and deflection.
+
+    **Inputs**
+
+    - `n` : int    number of steps
+    - `v_load` : float  jack velocity (m/s)
+    - `model` : int    1 linear elastic, 2 nonlinear
+
+    **Outputs**
+
+    - tuple[float, float] (P kN averaged over the n steps, mid-span deflection mm)
+    """
     react[None] = 0.0
     for _ in range(n):
         substep(v_load, model)
@@ -295,6 +396,19 @@ HEADER = "t_s,course_verin_mm,fleche_mm,P_kN,n_fissurees,n_ecrasees"
 
 
 def run_headless(u_max_mm, v_load=0.2, model=2, csv="beton_courbe.csv"):
+    """Run without a window up to a jack stroke and write the load-deflection curve to csv.
+
+    **Inputs**
+
+    - `u_max_mm` : float  max jack stroke (mm)
+    - `v_load` : float  jack velocity (m/s)
+    - `model` : int    1 linear elastic, 2 nonlinear
+    - `csv` : str    output path
+
+    **Outputs**
+
+    - np.ndarray (n_rows, 6) (t s, stroke mm, deflection mm, P kN, n cracked, n crushed)
+    """
     reset()
     rows = []
     while State.u * 1000.0 < u_max_mm:
@@ -306,6 +420,7 @@ def run_headless(u_max_mm, v_load=0.2, model=2, csv="beton_courbe.csv"):
 
 
 def main():
+    """Interactive loop: jack speed slider, keys 1/2 model, SPACE colour, R reset, S save curve, ESC quit."""
     window = ti.ui.Window("MPM 2D - poutre en béton armé, flexion 4 points", res=(W, H))
     canvas = window.get_canvas()
     gui = window.get_gui()

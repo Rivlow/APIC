@@ -85,7 +85,12 @@ Image = ti.Vector.field(3, ti.f32, (n_grid, n_grid))
 # ---------------------------------------------------------------- état initial
 @ti.kernel
 def init_beam():
-    """Réseau régulier 2 x 2 par cellule dans le rectangle de la poutre."""
+    """Place particles on a regular 2 x 2 per cell lattice in the beam rectangle.
+
+    **Outputs**
+
+    - solid.x (n_solid,) vec2 f32 updated in place
+    """
     for p in solid.x:
         i = p % n_px
         j = p // n_px
@@ -93,12 +98,30 @@ def init_beam():
 
 
 def reset():
+    """Reset beam positions and the solid particle state.
+
+    **Outputs**
+
+    - solid fields updated in place
+    """
     init_beam()
     solid.reset_state()
 
 
 # ---------------------------------------------------------------- pas de temps
 def substep(load, use_damage, use_rupture):
+    """Advance one time step (P2G, grid update, G2P, advection, damage).
+
+    **Inputs**
+
+    - `load` : float  gravity multiplier (x g)
+    - `use_damage` : int    1 = non-local damage on
+    - `use_rupture` : int    1 = rupture on
+
+    **Outputs**
+
+    - module-level fields updated in place
+    """
     clear_grid(grid_m, grid_v)
     P2G(solid, grid_m, grid_v, inv_dx, dx, dt)
     grid_step(grid_m, grid_v, cells, wall_type, wall_v, wall_d, wall_f, dt, load * g, damp,
@@ -110,17 +133,35 @@ def substep(load, use_damage, use_rupture):
 
 
 def ramp(load, load_target):
+    """Move the load toward the target at ramp_rate (upward only; drops instantly).
+
+    **Inputs**
+
+    - `load` : float  current load (x g)
+    - `load_target` : float  target load (x g)
+
+    **Outputs**
+
+    - float new load (x g)
+    """
     return min(load + ramp_rate * dt, load_target) if load < load_target else load_target
 
 
 # ---------------------------------------------------------------- affichage
 @ti.kernel
 def render_background():
+    """Paint the background: pillars grey, rest dark blue.
+
+    **Outputs**
+
+    - Image (n_grid, n_grid) vec3 f32 updated in place
+    """
     for i, j in Image:
         Image[i, j] = ti.Vector([0.35, 0.35, 0.35]) if cells[i, j] & OBSTACLE else ti.Vector([0.02, 0.02, 0.08])
 
 
 def main():
+    """Interactive loop: load slider, model keys 1/2/3, SPACE colour mode, R reset, ESC quit."""
     window = ti.ui.Window("MPM 2D - poutre : élasticité, endommagement, rupture", res=(700, 700))
     canvas = window.get_canvas()
     gui = window.get_gui()
@@ -169,7 +210,18 @@ def main():
 
 
 def run_headless(n_steps, load_target=150.0, model=3):
-    """n_steps pas sans fenêtre ; retourne (positions, D) finales."""
+    """Run n_steps without a window and return the final state.
+
+    **Inputs**
+
+    - `n_steps` : int    number of time steps
+    - `load_target` : float  target load (x g)
+    - `model` : int    1 elastic, 2 damage, 3 damage + rupture
+
+    **Outputs**
+
+    - tuple[np.ndarray f32 (n_solid, 2), np.ndarray f32 (n_solid,)] (positions, damage D)
+    """
     reset()
     load = 0.0
     for _ in range(n_steps):

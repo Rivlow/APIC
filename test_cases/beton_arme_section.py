@@ -24,7 +24,16 @@ yc = h / 2
 
 
 def sigma_concrete(eps):
-    """Loi du béton de l'article : Desayi en compression (nul après eps_cu), raidissement en traction."""
+    """Concrete stress law: Desayi in compression (zero beyond eps_cu), tension stiffening.
+
+    **Inputs**
+
+    - `eps` : np.ndarray float (n,)  strain (> 0 tension)
+
+    **Outputs**
+
+    - np.ndarray float (n,) stress (Pa)
+    """
     eps = np.asarray(eps, dtype=float)
     s = np.zeros_like(eps)
     ecr = fcr / E_c
@@ -41,11 +50,31 @@ def sigma_concrete(eps):
 
 
 def sigma_steel(eps):
+    """Elastic-perfectly plastic steel stress.
+
+    **Inputs**
+
+    - `eps` : float or np.ndarray float  strain
+
+    **Outputs**
+
+    - same type/shape, stress (Pa) clipped to [-fy, fy]
+    """
     return np.clip(E_s * eps, -fy, fy)
 
 
 def forces(eps0, phi):
-    """Effort normal N et moment M (autour du centre de gravité) pour la déformation eps0 et la courbure phi."""
+    """Section axial force and moment (about the centroid) for a given strain and curvature.
+
+    **Inputs**
+
+    - `eps0` : float  strain at the centroid
+    - `phi` : float  curvature (1/m, > 0 = bottom fibre in tension)
+
+    **Outputs**
+
+    - tuple[float, float] (N in N, M in N.m)
+    """
     e = eps0 + phi * (y - yc)                       # phi > 0 : fibre inférieure tendue
     sc = sigma_concrete(e)
     N = np.sum(sc) * b * dy
@@ -60,6 +89,16 @@ def forces(eps0, phi):
 
 
 def moment_curvature(phis):
+    """Moment-curvature curve: bisection on eps0 so that N = 0, then M.
+
+    **Inputs**
+
+    - `phis` : np.ndarray float (n,)  curvatures (1/m)
+
+    **Outputs**
+
+    - np.ndarray float (n,) moments (N.m)
+    """
     Ms = []
     e0 = 0.0
     for phi in phis:
@@ -76,6 +115,12 @@ def moment_curvature(phis):
 
 
 def load_deflection():
+    """4-point bending load-deflection curve by integrating curvatures (unit-load theorem).
+
+    **Outputs**
+
+    - tuple (deflection mm (300,), P kN (300,), phis (k,), Ms N.m (k,)) up to the moment peak
+    """
     phis = np.linspace(1e-6, 0.06, 600)
     Ms = moment_curvature(phis)
     imax = int(np.argmax(Ms))                        # on reste avant le pic du moment

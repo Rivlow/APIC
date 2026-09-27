@@ -10,6 +10,12 @@ if _ROOT not in sys.path:
 
 
 def main() -> int:
+    """Run headless smoke tests (demo scene, JSON round trip, walls, v2 migration, incompressible, FSI).
+
+    **Outputs**
+
+    - `int` : 0 on success (AssertionError otherwise)
+    """
     import numpy as np
 
     from ui.runner import SimulationRunner

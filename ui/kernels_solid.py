@@ -23,10 +23,16 @@ import taichi as ti
 # ---------------------------------------------------------------- loi de comportement
 @ti.func
 def kirchhoff_stress(F, mu: float, la: float):
-    """Contrainte de Kirchhoff tau = P F^T du modèle corotationnel (Stomakhin et al. 2012).
+    """Corotated Kirchhoff stress tau = P F^T.
 
-    P = 2 mu (F - R) + la J (J - 1) F^{-T}   ->   tau = 2 mu (F - R) F^T + la J (J - 1) I
-    R est la rotation de la décomposition polaire F = R S, obtenue via la SVD F = U S V^T : R = U V^T.
+    **Inputs**
+
+    - `F` : mat2 f32 deformation gradient
+    - `mu`, `la` : float Lame parameters
+
+    **Outputs**
+
+    - mat2 tau
     """
     U, sig, V = ti.svd(F)
     R = U @ V.transpose()
@@ -42,7 +48,24 @@ def P2G_solid(grid_m: ti.template(), grid_v: ti.template(),
               D: ti.template(), broken: ti.template(),
               inv_dx: float, dt: float, dx: float,
               mu: float, la: float, p_mass: float, p_vol: float, k_res: float):
-    """Ne remet PAS la grille à zéro : on peut l'appeler après le P2G du fluide (grille partagée)."""
+    """Solid particles to grid (MLS-MPM): mass, momentum, internal force.
+
+    **Inputs**
+
+    - `grid_m` : f32 field (nx, ny) node masses
+    - `grid_v` : vec2 f32 field (nx, ny) node momenta
+    - `x`, `v` : vec2 f32 fields (Ns,) positions / velocities
+    - `C`, `F` : mat2 f32 fields (Ns,) affine matrices / deformation gradients
+    - `D` : f32 field (Ns,) damage
+    - `broken` : i32 field (Ns,)
+    - `inv_dx`, `dt`, `dx`, `mu`, `la`, `p_mass`, `p_vol`, `k_res` : float
+
+    **Outputs**
+
+    - grid_m, grid_v accumulated in place
+
+    **Note** : does not clear the grid (shared with the fluid).
+    """
 
     for p in x:
 
@@ -77,8 +100,20 @@ def P2G_solid(grid_m: ti.template(), grid_v: ti.template(),
 @ti.kernel
 def grid_update(grid_m: ti.template(), grid_v: ti.template(), mask: ti.template(),
                 dt: float, g: float, damp: float, bound: int, n_grid: int):
-    """Même rôle que grid_step() du fluide : vitesse, gravité, parois glissantes, obstacles (mask == 1).
-    damp (1/s) : amortissement léger de la vitesse de grille, dissipe l'énergie cinétique."""
+    """Grid update: momentum to velocity, damping, gravity, walls, obstacles.
+
+    **Inputs**
+
+    - `grid_m` : f32 field (n_grid, n_grid)
+    - `grid_v` : vec2 f32 field (n_grid, n_grid)
+    - `mask` : field (n_grid, n_grid) 1 = obstacle
+    - `dt`, `g`, `damp` : float
+    - `bound`, `n_grid` : int
+
+    **Outputs**
+
+    - grid_v written in place
+    """
 
     for i, j in grid_m:
         if grid_m[i, j] > 0:
@@ -103,8 +138,21 @@ def G2P_solid(grid_v: ti.template(),
               x: ti.template(), v: ti.template(), C: ti.template(), F: ti.template(),
               broken: ti.template(),
               inv_dx: float, dt: float, dx: float, bound: int, nx: int, ny: int):
-    """v, C depuis la grille ; F <- (I + dt C) F ; écrêtage des particules rompues ; advection
-    (écrêtée à la zone utilisable [bound dx, (nx - bound) dx] × [bound dx, (ny - bound) dx])."""
+    """Grid to solid particles: v, C, F update, rupture clamp, advection.
+
+    **Inputs**
+
+    - `grid_v` : vec2 f32 field (nx, ny) node velocities
+    - `x`, `v` : vec2 f32 fields (Ns,) positions / velocities
+    - `C`, `F` : mat2 f32 fields (Ns,) affine matrices / deformation gradients
+    - `broken` : i32 field (Ns,)
+    - `inv_dx`, `dt`, `dx` : float
+    - `bound`, `nx`, `ny` : int
+
+    **Outputs**
+
+    - x, v, C, F written in place
+    """
 
     I = ti.Matrix.identity(ti.f32, 2)
     lo = ti.Vector([bound * dx, bound * dx])
@@ -153,6 +201,16 @@ def G2P_solid(grid_v: ti.template(),
 # ---------------------------------------------------------------- 4. Endommagement non local
 @ti.kernel
 def clear_eps(grid_e: ti.template(), grid_w: ti.template()):
+    """Zero the nonlocal strain grids.
+
+    **Inputs**
+
+    - `grid_e`, `grid_w` : f32 fields (nx, ny)
+
+    **Outputs**
+
+    - grid_e, grid_w written in place
+    """
     for i, j in grid_e:
         grid_e[i, j] = 0.0
         grid_w[i, j] = 0.0
@@ -161,7 +219,22 @@ def clear_eps(grid_e: ti.template(), grid_w: ti.template()):
 @ti.kernel
 def scatter_eps(grid_e: ti.template(), grid_w: ti.template(),
                 x: ti.template(), F: ti.template(), broken: ti.template(), inv_dx: float):
-    """Étale l'allongement principal des particules saines sur la grille (somme pondérée)."""
+    """Scatter principal stretch of intact particles to the grid.
+
+    **Inputs**
+
+    - `grid_e`, `grid_w` : f32 fields (nx, ny) weighted strain / weights
+    - `x` : vec2 f32 field (Ns,) positions
+    - `F` : mat2 f32 field (Ns,) deformation gradients
+    - `broken` : i32 field (Ns,)
+    - `inv_dx` : float
+
+    **Outputs**
+
+    - grid_e, grid_w accumulated in place
+
+    **Note** : does not clear the grid (see clear_eps).
+    """
 
     for p in x:
         if broken[p] == 0:
@@ -185,9 +258,23 @@ def update_damage(grid_e: ti.template(), grid_w: ti.template(),
                   x: ti.template(), F: ti.template(), D: ti.template(), broken: ti.template(),
                   inv_dx: float, dt: float,
                   eps0: float, epsf: float, tau_D: float, use_rupture: int):
-    """Endommagement à partir de l'allongement LISSÉ (non local), à vitesse limitée (dD <= dt / tau_D).
+    """Update damage from the smoothed (nonlocal) strain; flag rupture.
 
-      D_new = clamp((eps_nl - eps0) / (epsf - eps0), 0, 1)     D <- max(D, min(D_new, D + dt / tau_D))
+    **Inputs**
+
+    - `grid_e`, `grid_w` : f32 fields (nx, ny)
+    - `x` : vec2 f32 field (Ns,) positions
+    - `F` : mat2 f32 field (Ns,) deformation gradients
+    - `D` : f32 field (Ns,) damage
+    - `broken` : i32 field (Ns,)
+    - `inv_dx`, `dt`, `eps0`, `epsf`, `tau_D` : float
+    - `use_rupture` : int
+
+    **Outputs**
+
+    - D, broken, F written in place
+
+    **Note** : rate-limited, dD <= dt / tau_D; D never decreases.
     """
 
     for p in x:
@@ -221,8 +308,22 @@ def update_damage(grid_e: ti.template(), grid_w: ti.template(),
 def init_beam(x: ti.template(), v: ti.template(), C: ti.template(), F: ti.template(),
               D: ti.template(), broken: ti.template(),
               x0: float, y0: float, n_px: int, spacing: float):
-    """Place les particules sur un réseau régulier (2 x 2 par cellule) dans le rectangle
-    [x0, x0 + n_px*spacing] x [y0, ...], au repos, intactes."""
+    """Place solid particles on a regular lattice, at rest and intact.
+
+    **Inputs**
+
+    - `x`, `v` : vec2 f32 fields (Ns,)
+    - `C`, `F` : mat2 f32 fields (Ns,)
+    - `D` : f32 field (Ns,)
+    - `broken` : i32 field (Ns,)
+    - `x0`, `y0` : float
+    - `n_px` : int particles per row
+    - `spacing` : float
+
+    **Outputs**
+
+    - all fields written in place
+    """
 
     for p in x:
         i = p % n_px
@@ -238,8 +339,21 @@ def init_beam(x: ti.template(), v: ti.template(), C: ti.template(), F: ti.templa
 @ti.kernel
 def solid_colors(F: ti.template(), D: ti.template(), broken: ti.template(),
                  col: ti.template(), mode: int, eps_scale: float):
-    """Couleur d'affichage : mode 0 = endommagement (gris -> jaune, rouge si rompu),
-    mode 1 = allongement principal max (bleu = compression, rouge = traction)."""
+    """Solid display colors (0: damage, 1: max principal stretch).
+
+    **Inputs**
+
+    - `F` : mat2 f32 field (Ns,)
+    - `D` : f32 field (Ns,)
+    - `broken` : i32 field (Ns,)
+    - `col` : vec3 f32 field (Ns,)
+    - `mode` : int
+    - `eps_scale` : float
+
+    **Outputs**
+
+    - col written in place
+    """
 
     for p in D:
         if mode == 0:
@@ -256,7 +370,17 @@ def solid_colors(F: ti.template(), D: ti.template(), broken: ti.template(),
 
 @ti.kernel
 def solid_stats(D: ti.template(), broken: ti.template()) -> ti.types.vector(2, ti.f32):
-    """Retourne (nombre de particules rompues, D max)."""
+    """Solid statistics.
+
+    **Inputs**
+
+    - `D` : f32 field (Ns,)
+    - `broken` : i32 field (Ns,)
+
+    **Outputs**
+
+    - vec2 f32 (n_broken, D_max)
+    """
     n_broken = 0
     D_max = 0.0
     for p in D:

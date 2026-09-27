@@ -22,12 +22,34 @@ FLUID0, SOLID0 = 1, 2
 
 @ti.func
 def cell_of(xp, inv_dx: float, nx: int, ny: int):
+    """Cell containing a position, clamped to the grid.
+
+    **Inputs**
+
+    - `xp` : vec2 f32 position
+    - `inv_dx` : float
+    - `nx`, `ny` : int
+
+    **Outputs**
+
+    - ivec2 cell index (i, j)
+    """
     c = (xp * inv_dx).cast(int)
     return ti.Vector([ti.math.clamp(c.x, 0, nx - 1), ti.math.clamp(c.y, 0, ny - 1)])
 
 
 @ti.func
 def weights(fx):
+    """Quadratic B-spline weights.
+
+    **Inputs**
+
+    - `fx` : vec2 f32 offset from the base node (in cells)
+
+    **Outputs**
+
+    - list of 3 vec2 weights
+    """
     return [0.5 * (1.5 - fx) ** 2, 0.75 - (fx - 1.0) ** 2, 0.5 * (fx - 0.5) ** 2]
 
 
@@ -35,7 +57,24 @@ def weights(fx):
 @ti.kernel
 def init_pool(alive: ti.template(), x: ti.template(), C: ti.template(), J: ti.template(), n_init: int,
               free_stack: ti.template(), free_top: ti.template()):
-    """Les n_init premières particules sont vivantes ; les autres sont garées et empilées comme libres."""
+    """Init the fluid particle pool: first n_init alive, others free.
+
+    **Inputs**
+
+    - `alive` : i32 field (cap,) 1 = live particle
+    - `x` : vec2 f32 field (cap,) positions
+    - `C` : mat2 f32 field (cap,) affine matrices
+    - `J` : f32 field (cap,) volume ratios
+    - `n_init` : int
+    - `free_stack` : i32 field (cap,) free slot stack
+    - `free_top` : i32 field (1,) stack size
+
+    **Outputs**
+
+    - all fields written in place
+
+    **Note** : dead particles parked at (-1, -1).
+    """
     for p in alive:
         C[p] = ti.Matrix.zero(ti.f32, 2, 2)
         J[p] = 1.0
@@ -50,6 +89,18 @@ def init_pool(alive: ti.template(), x: ti.template(), C: ti.template(), J: ti.te
 
 @ti.kernel
 def init_solid_state(C: ti.template(), F: ti.template(), D: ti.template(), broken: ti.template()):
+    """Reset solid particles (C = 0, F = I, D = 0, intact).
+
+    **Inputs**
+
+    - `C`, `F` : mat2 f32 fields (Ns,)
+    - `D` : f32 field (Ns,) damage
+    - `broken` : i32 field (Ns,)
+
+    **Outputs**
+
+    - all fields written in place
+    """
     for p in D:
         C[p] = ti.Matrix.zero(ti.f32, 2, 2)
         F[p] = ti.Matrix.identity(ti.f32, 2)
@@ -59,6 +110,16 @@ def init_solid_state(C: ti.template(), F: ti.template(), D: ti.template(), broke
 
 @ti.kernel
 def count_alive(alive: ti.template()) -> ti.i32:
+    """Count live fluid particles.
+
+    **Inputs**
+
+    - `alive` : i32 field (cap,) 1 = live particle
+
+    **Outputs**
+
+    - i32 count
+    """
     n = 0
     for p in alive:
         n += alive[p]
@@ -70,7 +131,24 @@ def count_alive(alive: ti.template()) -> ti.i32:
 def P2G_fluid(grid_m: ti.template(), grid_v: ti.template(),
               x: ti.template(), v: ti.template(), C: ti.template(), J: ti.template(), alive: ti.template(),
               inv_dx: float, dt: float, dx: float, E: float, p_mass: float, p_vol: float):
-    """Remet la grille à zéro puis dépose masse, quantité de mouvement et pression (APIC/APIC.py + alive)."""
+    """Particles to grid (weakly compressible APIC): mass, momentum, pressure.
+
+    **Inputs**
+
+    - `grid_m` : f32 field (nx, ny) node masses
+    - `grid_v` : vec2 f32 field (nx, ny) node momenta
+    - `x`, `v` : vec2 f32 field (cap,) positions / velocities
+    - `C` : mat2 f32 field (cap,) affine matrices
+    - `J` : f32 field (cap,) volume ratios
+    - `alive` : i32 field (cap,) 1 = live particle
+    - `inv_dx`, `dt`, `dx`, `E`, `p_mass`, `p_vol` : float
+
+    **Outputs**
+
+    - grid_m, grid_v written in place
+
+    **Note** : clears the grid first.
+    """
     for i, j in grid_m:
         grid_v[i, j] = [0.0, 0.0]
         grid_m[i, j] = 0.0
@@ -96,7 +174,21 @@ def P2G_fluid(grid_m: ti.template(), grid_v: ti.template(),
 def G2P_fluid(grid_v: ti.template(),
               x: ti.template(), v: ti.template(), C: ti.template(), J: ti.template(), alive: ti.template(),
               inv_dx: float, dt: float, dx: float):
-    """v, C, J depuis la grille."""
+    """Grid to particles (weakly compressible APIC).
+
+    **Inputs**
+
+    - `grid_v` : vec2 f32 field (nx, ny) node velocities
+    - `x`, `v` : vec2 f32 field (cap,) positions / velocities
+    - `C` : mat2 f32 field (cap,) affine matrices
+    - `J` : f32 field (cap,) volume ratios
+    - `alive` : i32 field (cap,) 1 = live particle
+    - `inv_dx`, `dt`, `dx` : float
+
+    **Outputs**
+
+    - v, C, J written in place
+    """
     for p in x:
         if alive[p] == 1:
             base = (x[p] * inv_dx - 0.5).cast(int)
@@ -120,9 +212,27 @@ def G2P_fluid(grid_v: ti.template(),
 def advect_fluid(x: ti.template(), v: ti.template(), alive: ti.template(), wall_type: ti.template(),
                  wall_d: ti.template(), inv_dx: float, dt: float, bound: int, dx: float, nx: int, ny: int,
                  free_stack: ti.template(), free_top: ti.template()):
-    """Advection ; une particule qui franchit un mur de sortie (ou la face d'obstacle qui le prolonge,
-    à wall_d cellules du bord) est détruite (slot rendu à la pile), sinon elle reste dans la zone utilisable
-    [bound dx, (nx - bound) dx] × [bound dx, (ny - bound) dx]."""
+    """Advect fluid particles; kill those crossing an outlet.
+
+    **Inputs**
+
+    - `x`, `v` : vec2 f32 field (cap,) positions / velocities
+    - `alive` : i32 field (cap,) 1 = live particle
+    - `wall_type` : i32 field (4, nm) wall BC type
+    - `wall_d` : i32 field (4, nm) wall offset from the edge (cells)
+    - `inv_dx`, `dt` : float
+    - `bound` : int
+    - `dx` : float
+    - `nx`, `ny` : int
+    - `free_stack` : i32 field (cap,) free slot stack
+    - `free_top` : i32 field (1,) stack size
+
+    **Outputs**
+
+    - x, alive, free_stack, free_top written in place
+
+    **Note** : killed slots pushed to the stack; survivors clamped to [bound dx, (n - bound) dx].
+    """
     lo = ti.Vector([bound * dx, bound * dx])
     hi = ti.Vector([(nx - bound) * dx, (ny - bound) * dx])
     Lx, Ly = nx * dx, ny * dx
@@ -150,9 +260,30 @@ def emit_wall(x: ti.template(), v: ti.template(), C: ti.template(), J: ti.templa
               wall_type: ti.template(), wall_v: ti.template(), wall_d: ti.template(), emit_acc: ti.template(),
               ppc2: float, free_stack: ti.template(), free_top: ti.template(), dt: float, dx: float, bound: int,
               nx: int, ny: int):
-    """Chaque cellule de mur en entrée injecte ppc² · v_n dt / dx particules par pas (fraction reportée dans
-    emit_acc) : les particules naissent dans la lame [mur, mur + v_n dt] avec la vitesse imposée. Le mur est
-    à wall_d cellules du bord : la bande, ou la face d'un obstacle collé à l'entrée."""
+    """Emit particles from inlet walls by flux (ppc^2 v_n dt / dx per wall cell).
+
+    **Inputs**
+
+    - `x`, `v` : vec2 f32 field (cap,) positions / velocities
+    - `C` : mat2 f32 field (cap,) affine matrices
+    - `J` : f32 field (cap,) volume ratios
+    - `alive` : i32 field (cap,) 1 = live particle
+    - `wall_type` : i32 field (4, nm) wall BC type
+    - `wall_v` : vec2 f32 field (4, nm) inlet velocity
+    - `wall_d` : i32 field (4, nm) wall offset from the edge (cells)
+    - `emit_acc` : f32 field (4, nm) fractional particle carry
+    - `ppc2` : float
+    - `free_stack` : i32 field (cap,) free slot stack
+    - `free_top` : i32 field (1,) stack size
+    - `dt`, `dx` : float
+    - `bound`, `nx`, `ny` : int
+
+    **Outputs**
+
+    - x, v, C, J, alive, emit_acc, free_stack, free_top written in place
+
+    **Note** : stops silently when the pool is full.
+    """
     lo_d = ti.Vector([bound * dx, bound * dx])
     hi_d = ti.Vector([(nx - bound) * dx, (ny - bound) * dx])
     for side, k in wall_type:
@@ -205,7 +336,16 @@ FLUID_MODES = ["uniforme", "vitesse |v|", "vx", "vy", "pression", "vorticité"]
 
 @ti.func
 def cmap_jet(t):
-    """0..1 -> bleu, cyan, jaune, rouge."""
+    """Jet colormap (blue, cyan, yellow, red).
+
+    **Inputs**
+
+    - `t` : float in [0, 1]
+
+    **Outputs**
+
+    - vec3 RGB
+    """
     r = ti.math.clamp(1.5 - ti.abs(4.0 * t - 3.0), 0.0, 1.0)
     g = ti.math.clamp(1.5 - ti.abs(4.0 * t - 2.0), 0.0, 1.0)
     b = ti.math.clamp(1.5 - ti.abs(4.0 * t - 1.0), 0.0, 1.0)
@@ -214,7 +354,16 @@ def cmap_jet(t):
 
 @ti.func
 def cmap_signed(t):
-    """0..1 (0.5 = zéro) -> bleu, blanc, rouge."""
+    """Diverging colormap (blue, white, red), 0.5 = zero.
+
+    **Inputs**
+
+    - `t` : float in [0, 1]
+
+    **Outputs**
+
+    - vec3 RGB
+    """
     blue = ti.Vector([0.15, 0.35, 1.0])
     white = ti.Vector([0.95, 0.95, 0.95])
     red = ti.Vector([1.0, 0.2, 0.1])
@@ -227,7 +376,23 @@ def cmap_signed(t):
 @ti.kernel
 def fluid_scalar_wc(mode: int, x: ti.template(), v: ti.template(), J: ti.template(), alive: ti.template(),
                     grid_v: ti.template(), sc: ti.template(), E: float, inv_dx: float, nx: int, ny: int):
-    """Quantité par particule, mode faiblement compressible (pression = E (1 - J), vorticité sur la grille)."""
+    """Per-particle display scalar, weakly compressible mode.
+
+    **Inputs**
+
+    - `mode` : int (index in FLUID_MODES)
+    - `x`, `v` : vec2 f32 field (cap,) positions / velocities
+    - `J` : f32 field (cap,) volume ratios
+    - `alive` : i32 field (cap,) 1 = live particle
+    - `grid_v` : vec2 f32 field (nx, ny) node velocities
+    - `sc` : f32 field (cap,)
+    - `E`, `inv_dx` : float
+    - `nx`, `ny` : int
+
+    **Outputs**
+
+    - sc written in place
+    """
     for p in x:
         if alive[p] == 1:
             s = 0.0
@@ -250,7 +415,23 @@ def fluid_scalar_wc(mode: int, x: ti.template(), v: ti.template(), J: ti.templat
 def fluid_scalar_inc(mode: int, x: ti.template(), v: ti.template(), alive: ti.template(),
                      u: ti.template(), vv: ti.template(), q: ti.template(), sc: ti.template(),
                      rho_over_dt: float, inv_dx: float, nx: int, ny: int):
-    """Quantité par particule, mode incompressible (pression = q rho / dt, vorticité depuis les faces)."""
+    """Per-particle display scalar, incompressible mode.
+
+    **Inputs**
+
+    - `mode` : int (index in FLUID_MODES)
+    - `x`, `v` : vec2 f32 field (cap,) positions / velocities
+    - `alive` : i32 field (cap,) 1 = live particle
+    - `u`, `vv` : f32 fields (nx+1, ny), (nx, ny+1) MAC face velocities
+    - `q` : f32 field (nx, ny) pressure dt / rho
+    - `sc` : f32 field (cap,)
+    - `rho_over_dt`, `inv_dx` : float
+    - `nx`, `ny` : int
+
+    **Outputs**
+
+    - sc written in place
+    """
     for p in x:
         if alive[p] == 1:
             s = 0.0
@@ -274,6 +455,17 @@ def fluid_scalar_inc(mode: int, x: ti.template(), v: ti.template(), alive: ti.te
 
 @ti.kernel
 def scalar_absmax(sc: ti.template(), alive: ti.template()) -> ti.f32:
+    """Max |sc| over live particles.
+
+    **Inputs**
+
+    - `sc` : f32 field (cap,)
+    - `alive` : i32 field (cap,) 1 = live particle
+
+    **Outputs**
+
+    - f32 max
+    """
     m = 0.0
     for p in sc:
         if alive[p] == 1:
@@ -289,12 +481,34 @@ def render(img: ti.template(), res: int, x0: float, y0: float, scale: float,
            x_f: ti.template(), alive: ti.template(), has_fluid: int, fr: float, fg: float, fb: float, r_f: int,
            sc: ti.template(), fluid_mode: int, inv_smax: float,
            x_s: ti.template(), col_s: ti.template(), has_solid: int, r_s: int):
-    """Image (res, res) u8 indexée [ligne, colonne], ligne 0 en haut (format QImage RGB888).
+    """Render domain, walls, obstacles, grid and particles to an image.
 
-    Vue : x = x0 + (col + 0.5) / (res scale), y = y0 + (res - ligne - 0.5) / (res scale) ; le domaine
-    [0, nx dx] × [0, ny dx] (dx = 1 / max(nx, ny)) est inclus dans le carré unité, le reste est hors domaine.
-    Fond, bande de paroi (grise, verte pour une entrée, rouge pour une sortie), obstacles (la face qui porte
-    une entrée / sortie prend sa couleur), teintes des cellules initiales, maillage, puis particules.
+    **Inputs**
+
+    - `img` : u8 vec3 field (res, res)
+    - `res` : int
+    - `x0`, `y0`, `scale` : float view origin / zoom
+    - `cells` : i32 field (nx, ny) bit flags (FLUID0, SOLID0, OBSTACLE)
+    - `wall_type` : i32 field (4, nm) wall BC type
+    - `wall_d` : i32 field (4, nm) wall offset from the edge (cells)
+    - `nx`, `ny`, `bound`, `grid_on`, `tint_on` : int
+    - `x_f` : vec2 f32 field (cap,) fluid positions
+    - `alive` : i32 field (cap,) 1 = live particle
+    - `has_fluid` : int
+    - fr, fg, fb float fluid color
+    - `r_f` : int fluid dot radius (px)
+    - `sc` : f32 field (cap,) display scalar
+    - fluid_mode int
+    - `inv_smax` : float
+    - `x_s` : vec2 f32 field (Ns,) solid positions
+    - `col_s` : vec3 f32 field (Ns,) solid colors
+    - `has_solid`, `r_s` : int
+
+    **Outputs**
+
+    - img written in place
+
+    **Note** : indexed [row, col], row 0 at the top (QImage RGB888).
     """
     k = 1.0 / (res * scale)
     nm = ti.max(nx, ny)
