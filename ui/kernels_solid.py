@@ -1,6 +1,9 @@
-# MpM/mpm_solid.py -- Solide MLS-MPM 2D : élasticité corotationnelle + endommagement + rupture
+# ui/kernels_solid.py -- Solide MLS-MPM 2D : élasticité corotationnelle + endommagement + rupture
 #
-# Même grille et mêmes poids B-spline quadratiques que le fluide APIC (APIC/APIC.py).
+# Ancien Solver/MpM/mpm_solid.py, gardé ici tel quel tant que ui/solver.py n'est pas migré vers
+# Solver/APIC.py + Solver/Solid/solid.py (qui en reprennent le contenu).
+#
+# Même grille et mêmes poids B-spline quadratiques que le fluide APIC.
 # Chaque particule solide porte :
 #   x, v, C   : position, vitesse, matrice affine APIC (comme le fluide)
 #   F         : gradient de déformation (2x2), F = I au repos

@@ -284,8 +284,8 @@ class Viewport(QWidget):
         n, b = self.n, self.bound
         thick = max(4.0, min(10.0, b / n * self.px_per_unit()))
 
-        # segments de paroi de la scène (état courant du runner, même avant Reset), rognés par les obstacles
-        wtype, _ = self.runner.wall_table()
+        # segments de paroi de la scène (état courant du runner, même avant Reset)
+        wtype = self.runner.wall_table()[0]
         for s, sname in enumerate(SIDES):
             k = b
             while k < n - b:
@@ -478,7 +478,7 @@ class UI(QMainWindow):
         row(self.item_ic, "Obstacles", f"{n_o} cellules" if n_o else "aucun")
 
         row(self.item_bc, "Par défaut", f"mur glissant, bande de {p['bound']} cellules")
-        wtype, _ = r.wall_table()
+        wtype, _, wdepth = r.wall_table()
         if not r.walls:
             row(self.item_bc, "Segments", "aucun (clic sur un bord du domaine)")
         for k, w in enumerate(r.walls, start=1):
@@ -486,11 +486,10 @@ class UI(QMainWindow):
             axis = "y" if w["side"] in ("left", "right") else "x"
             k0, k1 = int(np.floor(w["span"][0] * r.n + 1e-9)), int(np.ceil(w["span"][1] * r.n - 1e-9))
             k0, k1 = max(k0, p["bound"]), min(k1, r.n - p["bound"])
-            want = 1 if w["type"] == "inlet" else 2
-            clipped = int((wtype[s, k0:k1] != want).sum()) if k1 > k0 else 0
+            moved = int((wdepth[s, k0:k1] > p["bound"]).sum()) if k1 > k0 else 0
             kind = "entrée" if w["type"] == "inlet" else "sortie"
             vel = f" v = ({w['velocity'][0]:g}, {w['velocity'][1]:g})," if w["type"] == "inlet" else ""
-            note = f", rognée par un obstacle sur {clipped} cellules" if clipped else ""
+            note = f", portée par la face d'un obstacle sur {moved} cellules" if moved else ""
             row(self.item_bc, f"{k}. paroi {SIDE_LABELS[w['side']]}",
                 f"{kind},{vel} {axis} ∈ [{w['span'][0]:.3f}, {w['span'][1]:.3f}]{note}")
 

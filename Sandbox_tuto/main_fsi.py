@@ -16,7 +16,7 @@
 # Touches : ESPACE couleur du solide (endommagement / déformation), R reset, ESC quitter.
 
 import taichi as ti
-from APIC.APIC import P2G, G2P, grid_step
+from Solver.APIC.APIC import P2G, G2P, grid_step
 from Code_tuto.mpm_solid import (P2G_solid, G2P_solid, clear_eps, scatter_eps, update_damage,
                                  init_beam, solid_colors, solid_stats)
 

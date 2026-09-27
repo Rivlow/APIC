@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell($s = \"$env:LOCALAPPDATA\\\\Temp\\\\claude\\\\c--Users-lucas-Dev-Fun-APIC\\\\4594f13a-c779-42d4-8db7-96fd7976fac6\\\\scratchpad\"; $py = \"C:\\\\Users\\\\lucas\\\\miniconda3\\\\python.exe\"; & $py \"$s\\\\probe_beton.py\" old \"$s\\\\p_old.npz\" 2>&1 | Select-String -NotMatch Taichi; & $py \"$s\\\\probe_beton.py\" new \"$s\\\\p_new.npz\" 2>&1 | Select-String -NotMatch Taichi; & $py -c \"import numpy as np; a=np.load\\(r'$s\\\\p_old.npz'\\); b=np.load\\(r'$s\\\\p_new.npz'\\); [print\\(k, np.abs\\(a[k]-b[k]\\).max\\(\\)\\) for k in a.files]\")",
+      "PowerShell(Remove-Item -Recurse -Force Solver\\\\MpM -Confirm:$false; Get-ChildItem Solver, test_cases -Recurse -Name | Where-Object { $_ -notmatch '__pycache__' })",
+      "PowerShell(& C:\\\\Users\\\\lucas\\\\miniconda3\\\\python.exe \"$env:LOCALAPPDATA\\\\Temp\\\\claude\\\\c--Users-lucas-Dev-Fun-APIC\\\\4594f13a-c779-42d4-8db7-96fd7976fac6\\\\scratchpad\\\\split_boundary.py\")",
+      "PowerShell(& C:\\\\Users\\\\lucas\\\\miniconda3\\\\python.exe \"$env:LOCALAPPDATA\\\\Temp\\\\claude\\\\c--Users-lucas-Dev-Fun-APIC\\\\4594f13a-c779-42d4-8db7-96fd7976fac6\\\\scratchpad\\\\check_ui_faces.py\" 2>&1 | Select-String -NotMatch \"Taichi\\\\]\")"
+    ]
+  }
+}

@@ -17,8 +17,8 @@ Conventions : domaine [0, 1]², matrices indexées [i, j] = (x, y) comme les cha
 
 Les conditions aux limites n'existent que sur les quatre parois du domaine : un segment de mur
 (côté, étendue le long du mur en unités domaine, type entrée ou sortie, vitesse) ; la paroi par
-défaut est un mur glissant. Un obstacle qui touche un mur a priorité : le segment est rogné là où
-l'obstacle est collé au bord (voir `wall_table`).
+défaut est un mur glissant. Un obstacle collé à une entrée / sortie en devient la surface : sa face de
+même normale que le mur porte la condition (voir Solver/walls.py).
 """
 from __future__ import annotations
 
@@ -27,9 +27,7 @@ import json
 
 import numpy as np
 
-SIDES = ("left", "right", "bottom", "top")
-WALL, INLET, OUTLET = 0, 1, 2
-WALL_TYPES = {"wall": WALL, "inlet": INLET, "outlet": OUTLET}
+from Solver.walls import SIDES, Walls  # noqa: F401  (SIDES réexporté pour ui.ui ; numpy seul, sans Taichi)
 
 
 class SimulationRunner:
@@ -65,7 +63,16 @@ class SimulationRunner:
         n = self.p["n"]
         self.m = {k: np.zeros((n, n), bool) for k in self.BOOL}
         self.m.update({k: np.zeros((n, n), np.float32) for k in self.FLOAT})
-        self.walls: list[dict] = []                 # segments de paroi, le dernier l'emporte
+        self._walls = Walls()                       # segments de paroi, le dernier l'emporte
+
+    @property
+    def walls(self) -> list[dict]:
+        """Segments de paroi (liste de dicts, modifiable en place ; voir Solver/boundary.py)."""
+        return self._walls.segments
+
+    @walls.setter
+    def walls(self, segments: list[dict]) -> None:
+        self._walls.segments = segments
 
     # ------------------------------------------------------------ géométrie
     @property
@@ -131,57 +138,15 @@ class SimulationRunner:
         """Condition limite sur un mur : side dans left/right/bottom/top, kind dans wall/inlet/outlet,
         span = étendue le long du mur en unités domaine (x pour bottom/top, y pour left/right).
         Un nouveau segment remplace les anciens là où il les recouvre."""
-        if side not in SIDES:
-            raise ValueError(f"côté {side!r} inconnu (attendu : {SIDES})")
-        if kind not in WALL_TYPES:
-            raise ValueError(f"type {kind!r} inconnu (attendu : {tuple(WALL_TYPES)})")
-        a, b = sorted((float(span[0]), float(span[1])))
-        a, b = max(a, 0.0), min(b, 1.0)
-        if b <= a:
-            return
-        kept = []
-        for w in self.walls:
-            if w["side"] != side or w["span"][1] <= a or w["span"][0] >= b:
-                kept.append(w)
-                continue
-            if w["span"][0] < a:                      # morceau restant avant
-                kept.append({**w, "span": [w["span"][0], a]})
-            if w["span"][1] > b:                      # morceau restant après
-                kept.append({**w, "span": [b, w["span"][1]]})
-        if kind != "wall":
-            kept.append({"side": side, "span": [a, b], "type": kind,
-                         "velocity": [float(velocity[0]), float(velocity[1])]})
-        self.walls = kept
+        self._walls.set(side, kind, velocity, span)
 
     def clear_wall(self, side: str, span=(0.0, 1.0)) -> None:
-        self.set_wall(side, "wall", span=span)
+        self._walls.clear(side, span)
 
-    def wall_table(self) -> tuple[np.ndarray, np.ndarray]:
-        """Rastérisation des segments : wtype (4, n) int32 et wvel (4, n, 2) float32, indexés
-        [côté, cellule le long du mur]. Un obstacle collé au bord (dans la bande ou la première cellule
-        utilisable) rogne le segment : la paroi y redevient un mur."""
-        n, bound = self.n, self.p["bound"]
-        wtype = np.zeros((4, n), np.int32)
-        wvel = np.zeros((4, n, 2), np.float32)
-        for w in self.walls:
-            s = SIDES.index(w["side"])
-            k0 = int(np.floor(w["span"][0] * n + 1e-9))
-            k1 = int(np.ceil(w["span"][1] * n - 1e-9))
-            k0, k1 = max(k0, bound), min(k1, n - bound)
-            if k1 <= k0:
-                continue
-            wtype[s, k0:k1] = WALL_TYPES[w["type"]]
-            wvel[s, k0:k1] = w.get("velocity", [0.0, 0.0])
-        o = self.m["obstacle"]
-        edge = bound + 1                              # bande + première cellule utilisable
-        blocked = [o[:edge, :].any(axis=0), o[n - edge:, :].any(axis=0),
-                   o[:, :edge].any(axis=1), o[:, n - edge:].any(axis=1)]
-        for s in range(4):
-            wtype[s, blocked[s]] = WALL
-            wvel[s, blocked[s]] = 0.0
-        wtype[:, :bound] = WALL
-        wtype[:, n - bound:] = WALL
-        return wtype, wvel
+    def wall_table(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Rastérisation des segments : wtype, wvel, wdepth (voir Walls.table) ; un obstacle collé à une
+        entrée / sortie en porte la condition sur sa face qui regarde l'intérieur du domaine."""
+        return self._walls.table(self.n, self.p["bound"], self.m["obstacle"])
 
     def resize(self, n: int) -> None:
         """Change la grille en rééchantillonnant les matrices (plus proche voisin) ; les parois sont en

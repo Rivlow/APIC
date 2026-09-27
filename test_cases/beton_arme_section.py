@@ -1,15 +1,16 @@
-# MpM/beton_section.py -- Référence "résistance des matériaux" à comparer au calcul MPM
+# test_cases/beton_arme_section.py -- Référence "résistance des matériaux" à comparer au calcul MPM
+# (ancien Solver/MpM/beton_section.py ; numpy seul, sans Taichi)
 #
 # Analyse de section à la manière de l'article (2.1) : pour une courbure phi donnée, on cherche la
 # déformation au centre de gravité qui annule l'effort normal N, puis on calcule le moment M(phi).
 # On intègre ensuite les courbures le long de la poutre (flexion 4 points) pour obtenir la flèche.
 #
-# Lancer :  python MpM/beton_section.py [beton_courbe.csv]   (trace la comparaison si le csv existe)
+# Lancer :  python test_cases/beton_arme_section.py [beton_courbe.csv]   (trace la comparaison si le csv existe)
 
 import sys
 import numpy as np
 
-# mêmes données que MpM/beton.py
+# mêmes données que test_cases/beton_arme_flexion.py
 b, h = 0.2, 0.2
 E_c, fc, fcr, eps_cu = 30.4e9, 47.1e6, 3.5e6, 0.004
 E_s, fy = 230e9, 309e6

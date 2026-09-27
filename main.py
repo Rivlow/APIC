@@ -1,7 +1,11 @@
 
-from APIC.APIC import *
-from Time_integration.time_integration import *
+from Solver.APIC import clear_grid, P2G, G2P
+from Solver.physics import grid_step
+from Solver.walls import Walls, OBSTACLE
+from Solver.Fluid.fluid import Fluid
+from Solver.Time_integration.time_integration import time_integration
 
+import numpy as np
 import taichi as ti
 ti.init(arch=ti.gpu)  
 
@@ -29,49 +33,44 @@ y0, y1 = 0.3, 0.9
 
 n_particles = int(4*(x1 - x0)*(y1 - y0)*nx_grid*nx_grid)
 
-# Obstacle 
-Ox = ti.Vector([0.55, 0.30])
-R = 0.1
+# Obstacle (cellules bloquées, masque numpy (n, n) indexé [i, j] = (x, y))
+Ox, R = (0.55, 0.30), 0.1
+Xc, Yc = np.meshgrid((np.arange(nx_grid) + 0.5) * dx, (np.arange(nx_grid) + 0.5) * dx, indexing="ij")
+obstacle = (Xc - Ox[0])**2 + (Yc - Ox[1])**2 < R**2
+
+# Conditions aux limites : segments sur les quatre murs (mur glissant partout par défaut)
+walls = Walls()
+# walls.set("left", "inlet", velocity=(1.0, 0.0), span=(0.3, 0.6))   # exemple : entrée sur le mur gauche
 
 #-------------- Fields -----------------#
-x = ti.Vector.field(2, ti.f32, n_particles)
-v = ti.Vector.field(2, ti.f32, n_particles)
-
-C = ti.Matrix.field(2, 2, ti.f32, n_particles)                # affine matrix APIC
-J = ti.field(ti.f32, n_particles)                             # dilatation rate
+fluid = Fluid(n_particles, E, p_mass, p_vol)                   # x, v, C (APIC), J (dilatation rate)
 
 grid_v = ti.Vector.field(2, ti.f32, (nx_grid, nx_grid))       # Momentum 
 grid_m = ti.field(ti.f32, (nx_grid, nx_grid))                 # Mass 
 
-solid = ti.field(ti.f32, (nx_grid, nx_grid))                  # 1 if node in obstacle
+cells = ti.field(ti.i32, (nx_grid, nx_grid))                  # bit OBSTACLE : noeud bloqué
+cells.from_numpy(np.where(obstacle, OBSTACLE, 0).astype(np.int32))
+wall_type, wall_v, wall_d = walls.fields(nx_grid, bound, obstacle)   # table des parois (4, n)
 Image = ti.Vector.field(3, ti.f32, (nx_grid, nx_grid))
 
 
 @ti.kernel
 def apply_IC():
 
-    for p in x:
+    for p in fluid.x:
 
-        x[p] = [x0 + ti.random()*(x1 - x0), y0 + ti.random()*(y1 - y0)]
-        v[p] = [0.0, 0.0]
+        fluid.x[p] = [x0 + ti.random()*(x1 - x0), y0 + ti.random()*(y1 - y0)]
+        fluid.v[p] = [0.0, 0.0]
 
-        C[p] = ti.Matrix.zero(ti.f32, 2, 2)
-        J[p] = 1.0
-
-    for i, j in solid:
-
-        pos = ti.Vector([i, j])*dx
-
-        in_circle = (pos - Ox).norm() < R
-
-        solid[i,j] = 1 if in_circle else 0
+        fluid.C[p] = ti.Matrix.zero(ti.f32, 2, 2)
+        fluid.J[p] = 1.0
 
 
 
 @ti.kernel
 def render(mode: ti.i32):
     for i, j in Image:
-        if solid[i, j] == 1:
+        if cells[i, j] & OBSTACLE:
             Image[i, j] = [0.35, 0.35, 0.35]
         else:
             val = 0.0
@@ -106,20 +105,15 @@ def main():
                 t_sim = 0.0
         for _ in range(render_substep):
 
-            P2G(grid_m, grid_v,
-                x, v, C, J, 
-                inv_dx, dt, dx,
-                E, p_mass, p_vol)
-            
-            grid_step(grid_m, grid_v, solid,
-                      dt, g, bound, nx_grid)
+            clear_grid(grid_m, grid_v)
+            P2G(fluid, grid_m, grid_v, inv_dx, dx, dt)
 
-            G2P(grid_m, grid_v,
-                x, v, C, J,
-                inv_dx, dt, dx,
-                E, p_mass, p_vol)
+            grid_step(grid_m, grid_v, cells, wall_type, wall_v, wall_d,
+                      dt, g, 0.0, bound, nx_grid)
 
-            dt_cfl = time_integration(x, v, bound, dx, E, rho)
+            G2P(fluid, grid_v, inv_dx, dx, dt)
+
+            dt_cfl = time_integration(fluid.x, fluid.v, bound, dx, E, rho)
             t_sim += dt_cfl
 
         render(mode)

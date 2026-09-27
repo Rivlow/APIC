@@ -44,7 +44,7 @@ def main() -> int:
     assert s.stats()["t"] > 0
     s.release()
 
-    # ---- entrée / sortie sur les parois ; un obstacle collé au mur droit rogne la sortie
+    # ---- entrée / sortie sur les parois ; un obstacle collé au mur droit porte la sortie sur sa face gauche
     r = SimulationRunner(n=96, substeps=10, capacity=60000)
     X, Y = r.centers()
     r.set_fluid(Y < 0.15)
@@ -53,10 +53,12 @@ def main() -> int:
     r.set_obstacle(r.rect(0.90, 0.5, 1.0, 0.6))                 # bloc collé au mur droit
     r.set_wall("left", "inlet", velocity=(3.0, 0.0), span=(0.3, 0.4))
     r.set_wall("right", "outlet")
-    wt, wv = r.wall_table()
+    wt, wv, wd = r.wall_table()
     n, b = r.n, r.p["bound"]
     assert (wt[0, int(0.3 * n):int(0.4 * n)] == 1).all() and (wv[0, int(0.35 * n)] == [3.0, 0.0]).all(), "entrée"
-    assert (wt[1, b:int(0.5 * n)] == 2).all() and (wt[1, int(0.5 * n) + 1:int(0.6 * n) - 1] == 0).all(), "sortie rognée"
+    assert (wt[1, b:n - b] == 2).all(), "sortie"
+    assert (wd[1, int(0.5 * n) + 1:int(0.6 * n) - 1] == 10).all() and (wd[1, b:int(0.5 * n) - 1] == b).all(), \
+        "sortie portée par la face de l'obstacle (10 cellules depuis le bord)"
     assert (wt[:, :b] == 0).all() and (wt[:, n - b:] == 0).all(), "coins"
     s = r.solver()
     s.step()

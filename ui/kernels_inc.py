@@ -11,7 +11,7 @@ Le gradient conjugué vit sur le GPU : `cg` = [rr, pAp, rr_new] ; α et β sont 
 """
 import taichi as ti
 
-from ui.kernels import INLET, OBSTACLE, OUTLET, band_bc
+from Solver.boundary import INLET, OBSTACLE, OUTLET, band_bc, band_cell
 
 AIR, FLUID, SOLID, MOVING = 0, 1, 2, 3       # MOVING : cellule occupée par le solide MPM (vitesse = celle du solide)
 
@@ -69,18 +69,20 @@ def mac_p2g(x: ti.template(), vel: ti.template(), C: ti.template(), alive: ti.te
 # ---------------------------------------------------------------- 2. type des cellules
 @ti.kernel
 def mac_classify(ctype: ti.template(), cells: ti.template(), wall_type: ti.template(), wall_v: ti.template(),
-                 x: ti.template(), alive: ti.template(),
+                 wall_d: ti.template(), x: ti.template(), alive: ti.template(),
                  x_s: ti.template(), has_solid: int, inv_dx: float, n: int, bound: int, free_surface: int):
     """free_surface = 1 : une cellule sans particule est de l'air (p = 0).
     free_surface = 0 : domaine plein, toute cellule non solide est fluide (la pression y est resolue,
     y compris negative).
-    Bande de paroi : SOLID (paroi glissante ou entrée : vitesse imposée sur les faces), AIR pour une
-    sortie (p = 0 exactement sur le mur). Les cellules contenant une particule du solide MPM sont MOVING."""
+    Bande de paroi et face d'obstacle qui porte une entrée / sortie : SOLID (paroi glissante ou entrée :
+    vitesse imposée sur les faces), AIR pour une sortie (p = 0 exactement sur le mur). Les cellules contenant
+    une particule du solide MPM sont MOVING."""
     for i, j in ctype:
         f = cells[i, j]
-        wall = i < bound or j < bound or i >= n - bound or j >= n - bound
+        side, _k = band_cell(i, j, n, bound, wall_d)
+        wall = i < bound or j < bound or i >= n - bound or j >= n - bound or side >= 0
         if wall:
-            t, _ = band_bc(wall_type, wall_v, i, j, n, bound)
+            t, _ = band_bc(wall_type, wall_v, wall_d, i, j, n, bound)
             ctype[i, j] = AIR if t == OUTLET else SOLID
         elif f & OBSTACLE:
             ctype[i, j] = SOLID
@@ -100,7 +102,8 @@ def mac_classify(ctype: ti.template(), cells: ti.template(), wall_type: ti.templ
             c = (x[p] * inv_dx).cast(int)
             ci = ti.math.clamp(c.x, 0, n - 1)
             cj = ti.math.clamp(c.y, 0, n - 1)
-            wall = ci < bound or cj < bound or ci >= n - bound or cj >= n - bound
+            side, _k = band_cell(ci, cj, n, bound, wall_d)
+            wall = ci < bound or cj < bound or ci >= n - bound or cj >= n - bound or side >= 0
             if ctype[ci, cj] == AIR and not wall:
                 ctype[ci, cj] = FLUID
 
@@ -108,6 +111,7 @@ def mac_classify(ctype: ti.template(), cells: ti.template(), wall_type: ti.templ
 # ---------------------------------------------------------------- 3. gravité + vitesses imposées
 @ti.kernel
 def mac_bc(u: ti.template(), v: ti.template(), ctype: ti.template(), wall_type: ti.template(), wall_v: ti.template(),
+           wall_d: ti.template(),
            grid_v: ti.template(), grid_m: ti.template(), dt: float, g: float, n: int, bound: int, with_gravity: int):
     """Gravité, puis vitesse imposée sur les faces touchant une cellule solide : 0 (paroi, obstacle),
     (vx, vy) d'une entrée (cellule de bande), ou la vitesse du solide MPM (moyenne des deux nœuds de la
@@ -120,8 +124,8 @@ def mac_bc(u: ti.template(), v: ti.template(), ctype: ti.template(), wall_type: 
         tl, tr = ctype[il, j], ctype[ir, j]
         if tl >= SOLID or tr >= SOLID:
             val = 0.0
-            bl, vl = band_bc(wall_type, wall_v, il, j, n, bound)
-            br, vr = band_bc(wall_type, wall_v, ir, j, n, bound)
+            bl, vl = band_bc(wall_type, wall_v, wall_d, il, j, n, bound)
+            br, vr = band_bc(wall_type, wall_v, wall_d, ir, j, n, bound)
             if bl == INLET:
                 val = vl.x
             elif br == INLET:
@@ -137,8 +141,8 @@ def mac_bc(u: ti.template(), v: ti.template(), ctype: ti.template(), wall_type: 
         tb, tt = ctype[i, jb], ctype[i, jt]
         if tb >= SOLID or tt >= SOLID:
             val = 0.0
-            bb, vb = band_bc(wall_type, wall_v, i, jb, n, bound)
-            bt, vt = band_bc(wall_type, wall_v, i, jt, n, bound)
+            bb, vb = band_bc(wall_type, wall_v, wall_d, i, jb, n, bound)
+            bt, vt = band_bc(wall_type, wall_v, wall_d, i, jt, n, bound)
             if bb == INLET:
                 val = vb.y
             elif bt == INLET:

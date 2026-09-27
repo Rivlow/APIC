@@ -16,10 +16,11 @@ import time
 import numpy as np
 import taichi as ti
 
-from Code_tuto.mpm_solid import (G2P_solid, P2G_solid, clear_eps, scatter_eps, solid_colors,
-                                 solid_stats, update_damage)
+from Solver.physics import grid_step
 from ui import kernels as K
 from ui import kernels_inc as M
+from ui.kernels_solid import (G2P_solid, P2G_solid, clear_eps, scatter_eps, solid_colors,
+                              solid_stats, update_damage)
 
 STRUCTURAL = ("n", "bound", "ppc", "capacity", "seed", "res", "incompressible")   # le reste s'applique à chaud
 
@@ -60,13 +61,13 @@ def _solid_points(cells: np.ndarray, ppc: int) -> np.ndarray:
 
 
 class Solver:
-    def __init__(self, params: dict, matrices: dict, wall_table: tuple[np.ndarray, np.ndarray]):
+    def __init__(self, params: dict, matrices: dict, wall_table: tuple[np.ndarray, np.ndarray, np.ndarray]):
         self.arch = ensure_taichi()
         self.p = dict(params)
         p = self.p
         n, ppc, bound = p["n"], p["ppc"], p["bound"]
         m = matrices
-        wtype, wvel = wall_table                       # (4, n) int32 et (4, n, 2) float32, voir runner.wall_table
+        wtype, wvel, wdepth = wall_table               # (4, n) i32, (4, n, 2) f32, (4, n) i32 : voir Walls.table
         lo, hi = bound / n, 1.0 - bound / n           # bande de paroi : le stencil 3x3 sortirait de la grille
 
         # ---- semis (numpy, une fois) ; vitesse initiale = celle de la cellule d'origine
@@ -122,7 +123,8 @@ class Solver:
         self.cells = ti.field(ti.i32)
         fb.dense(ti.ij, (n, n)).place(self.grid_v, self.grid_m, self.grid_e, self.grid_w, self.cells)
         self.wall_type, self.wall_v, self.emit_acc = ti.field(ti.i32), ti.Vector.field(2, ti.f32), ti.field(ti.f32)
-        fb.dense(ti.ij, (4, n)).place(self.wall_type, self.wall_v, self.emit_acc)
+        self.wall_d = ti.field(ti.i32)                 # position du mur (cellules depuis le bord) : bande ou face d'obstacle
+        fb.dense(ti.ij, (4, n)).place(self.wall_type, self.wall_v, self.emit_acc, self.wall_d)
         self.img = ti.Vector.field(3, ti.u8)
         fb.dense(ti.ij, (p["res"], p["res"])).place(self.img)
         if self.incompressible:                        # grille décalée + gradient conjugué
@@ -142,6 +144,7 @@ class Solver:
         self.cells.from_numpy(cells)
         self.wall_type.from_numpy(np.ascontiguousarray(wtype, np.int32))
         self.wall_v.from_numpy(np.ascontiguousarray(wvel, np.float32))
+        self.wall_d.from_numpy(np.ascontiguousarray(wdepth, np.int32))
         self.t = 0.0
         self.last_step_ms = 0.0
         self.cg_last_iters = 0
@@ -228,7 +231,7 @@ class Solver:
         self.grid_v.fill(0.0)
         P2G_solid(self.grid_m, self.grid_v, self.x_s, self.v_s, self.C_s, self.F_s, self.D_s, self.broken_s,
                   inv_dx, dt_s, dx, self.mu_s, self.la_s, self.p_mass_s, self.p_vol, p["k_res"])
-        K.grid_update(self.grid_m, self.grid_v, self.cells, self.wall_type, self.wall_v, dt_s, p["gravity"], bound, n)
+        grid_step(self.grid_m, self.grid_v, self.cells, self.wall_type, self.wall_v, self.wall_d, dt_s, p["gravity"], 0.0, bound, n)
         if with_pressure:
             M.add_accel(self.grid_v, self.grid_m, self.fp, dt_s)
         G2P_solid(self.grid_v, self.x_s, self.v_s, self.C_s, self.F_s, self.broken_s, inv_dx, dt_s, dx, bound)
@@ -252,14 +255,14 @@ class Solver:
             self.grid_v.fill(0.0)
             P2G_solid(self.grid_m, self.grid_v, self.x_s, self.v_s, self.C_s, self.F_s, self.D_s, self.broken_s,
                       inv_dx, dt_s, dx, self.mu_s, self.la_s, self.p_mass_s, self.p_vol, p["k_res"])
-            K.grid_update(self.grid_m, self.grid_v, self.cells, self.wall_type, self.wall_v, 0.0, 0.0, bound, n)
+            grid_step(self.grid_m, self.grid_v, self.cells, self.wall_type, self.wall_v, self.wall_d, 0.0, 0.0, 0.0, bound, n)
         M.mac_p2g(self.x_f, self.v_f, self.C_f, self.alive, self.u, self.v, self.mu, self.mv, inv_dx, dx)
-        M.mac_classify(self.ctype, self.cells, self.wall_type, self.wall_v, self.x_f, self.alive, self.x_s,
+        M.mac_classify(self.ctype, self.cells, self.wall_type, self.wall_v, self.wall_d, self.x_f, self.alive, self.x_s,
                        int(self.has_solid), inv_dx, n, bound, int(p["free_surface"]))
-        M.mac_bc(self.u, self.v, self.ctype, self.wall_type, self.wall_v, self.grid_v, self.grid_m,
+        M.mac_bc(self.u, self.v, self.ctype, self.wall_type, self.wall_v, self.wall_d, self.grid_v, self.grid_m,
                  dt, p["gravity"], n, bound, 1)
         self._project()
-        M.mac_bc(self.u, self.v, self.ctype, self.wall_type, self.wall_v, self.grid_v, self.grid_m,
+        M.mac_bc(self.u, self.v, self.ctype, self.wall_type, self.wall_v, self.wall_d, self.grid_v, self.grid_m,
                  dt, p["gravity"], n, bound, 0)
         if self.has_solid:
             M.pressure_force(self.fp, self.grid_m, self.q, self.ctype, inv_dx,
@@ -269,11 +272,11 @@ class Solver:
 
     def _advect_and_emit(self, dt: float) -> None:
         p, dx, inv_dx, n, bound = self.p, self.dx, self.inv_dx, self.p["n"], self.p["bound"]
-        K.advect_fluid(self.x_f, self.v_f, self.alive, self.wall_type, inv_dx, dt, bound, dx, n,
+        K.advect_fluid(self.x_f, self.v_f, self.alive, self.wall_type, self.wall_d, inv_dx, dt, bound, dx, n,
                        self.free_stack, self.free_top)
         if self.has_inlet:
             K.emit_wall(self.x_f, self.v_f, self.C_f, self.J_f, self.alive, self.wall_type, self.wall_v,
-                        self.emit_acc, float(p["ppc"] * p["ppc"]), self.free_stack, self.free_top, dt, dx, bound, n)
+                        self.wall_d, self.emit_acc, float(p["ppc"] * p["ppc"]), self.free_stack, self.free_top, dt, dx, bound, n)
 
     # ------------------------------------------------------------ simulation (faiblement compressible)
     def _substep(self) -> None:
@@ -287,7 +290,7 @@ class Solver:
         if self.has_solid:
             P2G_solid(self.grid_m, self.grid_v, self.x_s, self.v_s, self.C_s, self.F_s, self.D_s, self.broken_s,
                       inv_dx, dt, dx, self.mu_s, self.la_s, self.p_mass_s, self.p_vol, p["k_res"])
-        K.grid_update(self.grid_m, self.grid_v, self.cells, self.wall_type, self.wall_v, dt, p["gravity"], bound, n)
+        grid_step(self.grid_m, self.grid_v, self.cells, self.wall_type, self.wall_v, self.wall_d, dt, p["gravity"], 0.0, bound, n)
         if self.has_fluid:
             K.G2P_fluid(self.grid_v, self.x_f, self.v_f, self.C_f, self.J_f, self.alive, inv_dx, dt, dx)
         if self.has_solid:
@@ -361,7 +364,7 @@ class Solver:
             else:
                 K.fluid_scalar_wc(mode, self.x_f, self.v_f, self.J_f, self.alive, self.grid_v, self.sc_f,
                                   self.p["fluid_E"], self.inv_dx, self.p["n"])
-        K.render(self.img, res, x0, y0, scale, self.cells, self.wall_type, self.p["n"], self.p["bound"],
+        K.render(self.img, res, x0, y0, scale, self.cells, self.wall_type, self.wall_d, self.p["n"], self.p["bound"],
                  int(grid), int(tint),
                  self.x_f, self.alive, int(self.has_fluid), 0.35, 0.65, 1.0, r_px,
                  self.sc_f, mode, 1.0 / max(self.scalar_max, 1e-9),
