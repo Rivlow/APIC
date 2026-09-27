@@ -1,4 +1,4 @@
-"""SimulationRunner : définit une simulation (paramètres + matrices n × n), la sauve en JSON, la lance.
+"""SimulationRunner : définit une simulation (paramètres + matrices n × n + parois), la sauve en JSON, la lance.
 
     from ui.runner import SimulationRunner
     r = SimulationRunner(n=128, gravity=9.81)
@@ -6,14 +6,19 @@
     r.set_fluid(Y < 0.2)                    # masque numpy (n, n) : cellules pleines d'eau
     r.set_solid(r.rect(0.55, 0.2, 0.58, 0.55))
     r.set_obstacle(r.circle(0.35, 0.28, 0.05))
-    r.set_inlet((X < 0.05) & (Y > 0.25) & (Y < 0.45), velocity=(3.0, 0.0))
-    r.set_outlet(X > 0.96)
-    r.save("canal.json")                    # paramètres + matrices, un seul fichier
+    r.set_wall("left", "inlet", velocity=(3.0, 0.0), span=(0.25, 0.45))   # condition limite sur un mur
+    r.set_wall("right", "outlet")           # tout le mur droit
+    r.save("canal.json")                    # paramètres + matrices + parois, un seul fichier
     s = r.run(150, callback=lambda s, k: print(k, s.stats()["n_fluid"]))   # sans fenêtre
     r.show()                                # interface Qt
 
 Conventions : domaine [0, 1]², matrices indexées [i, j] = (x, y) comme les champs Taichi
 (cells[:, 0] est la rangée du bas). Un seul matériau fluide et un seul solide (paramètres plats).
+
+Les conditions aux limites n'existent que sur les quatre parois du domaine : un segment de mur
+(côté, étendue le long du mur en unités domaine, type entrée ou sortie, vitesse) ; la paroi par
+défaut est un mur glissant. Un obstacle qui touche un mur a priorité : le segment est rogné là où
+l'obstacle est collé au bord (voir `wall_table`).
 """
 from __future__ import annotations
 
@@ -21,6 +26,10 @@ import base64
 import json
 
 import numpy as np
+
+SIDES = ("left", "right", "bottom", "top")
+WALL, INLET, OUTLET = 0, 1, 2
+WALL_TYPES = {"wall": WALL, "inlet": INLET, "outlet": OUTLET}
 
 
 class SimulationRunner:
@@ -40,13 +49,13 @@ class SimulationRunner:
         "fluid_rho": "Fluide : densité", "fluid_E": "Fluide : raideur E",
         "solid_rho": "Solide : densité", "solid_E": "Solide : module E", "solid_nu": "Solide : Poisson ν",
         "eps0": "ε0 (début endommagement)", "epsf": "εf (rupture)", "tau_D": "τ_D", "k_res": "Raideur résiduelle",
-        "use_damage": "Endommagement", "use_rupture": "Rupture", "color_mode": "Couleur solide (0 dégât, 1 déformation)",
-        "incompressible": "Fluide incompressible (MAC + CG, fluide seul)", "cg_iters": "CG : itérations par sous-pas",
-        "free_surface": "Surface libre (cellule vide = air, p = 0)",
+        "use_damage": "Endommagement", "use_rupture": "Rupture", "color_mode": "Couleur solide",
+        "incompressible": "Fluide incompressible", "cg_iters": "CG : nombre d'itérations ",
+        "free_surface": "Surface libre (cellule vide : p = 0)",
     }
     STRUCTURAL = ("n", "bound", "ppc", "capacity", "seed", "res", "incompressible")
-    BOOL = ("fluid", "solid", "obstacle", "inlet", "outlet")
-    FLOAT = ("vx0", "vy0", "inlet_vx", "inlet_vy")
+    BOOL = ("fluid", "solid", "obstacle")
+    FLOAT = ("vx0", "vy0")
 
     def __init__(self, **params):
         unknown = set(params) - set(self.PARAMS)
@@ -56,6 +65,7 @@ class SimulationRunner:
         n = self.p["n"]
         self.m = {k: np.zeros((n, n), bool) for k in self.BOOL}
         self.m.update({k: np.zeros((n, n), np.float32) for k in self.FLOAT})
+        self.walls: list[dict] = []                 # segments de paroi, le dernier l'emporte
 
     # ------------------------------------------------------------ géométrie
     @property
@@ -68,8 +78,7 @@ class SimulationRunner:
 
     @property
     def band(self) -> float:
-        """Épaisseur de la bande de paroi : les particules restent dans [band, 1 - band] ; une entrée ou
-        une sortie doit avoir des cellules au-delà."""
+        """Épaisseur de la bande de paroi : les particules restent dans [band, 1 - band]."""
         return self.p["bound"] * self.dx
 
     def centers(self) -> tuple[np.ndarray, np.ndarray]:
@@ -90,7 +99,7 @@ class SimulationRunner:
             raise ValueError(f"masque {mask.shape} attendu ({self.n}, {self.n})")
         return mask
 
-    # ------------------------------------------------------------ définition
+    # ------------------------------------------------------------ définition (intérieur)
     def set_fluid(self, mask, velocity=(0.0, 0.0)) -> None:
         mask = self._mask(mask)
         self.m["fluid"][mask], self.m["solid"][mask], self.m["obstacle"][mask] = True, False, False
@@ -105,17 +114,6 @@ class SimulationRunner:
         mask = self._mask(mask)
         self.m["obstacle"][mask], self.m["fluid"][mask], self.m["solid"][mask] = True, False, False
 
-    def set_inlet(self, mask, velocity) -> None:
-        """Entrée : vitesse imposée + émission jusqu'à ppc² particules par cellule (hors bande de paroi)."""
-        mask = self._mask(mask)
-        self.m["inlet"][mask], self.m["outlet"][mask] = True, False
-        self.m["inlet_vx"][mask], self.m["inlet_vy"][mask] = velocity
-
-    def set_outlet(self, mask) -> None:
-        """Sortie : les particules fluides qui y entrent sont détruites (hors bande de paroi)."""
-        mask = self._mask(mask)
-        self.m["outlet"][mask], self.m["inlet"][mask] = True, False
-
     def set_velocity(self, mask, velocity) -> None:
         """Vitesse initiale des particules semées dans ces cellules."""
         mask = self._mask(mask)
@@ -128,8 +126,66 @@ class SimulationRunner:
         for k in self.FLOAT:
             self.m[k][mask] = 0.0
 
+    # ------------------------------------------------------------ définition (parois)
+    def set_wall(self, side: str, kind: str, velocity=(0.0, 0.0), span=(0.0, 1.0)) -> None:
+        """Condition limite sur un mur : side dans left/right/bottom/top, kind dans wall/inlet/outlet,
+        span = étendue le long du mur en unités domaine (x pour bottom/top, y pour left/right).
+        Un nouveau segment remplace les anciens là où il les recouvre."""
+        if side not in SIDES:
+            raise ValueError(f"côté {side!r} inconnu (attendu : {SIDES})")
+        if kind not in WALL_TYPES:
+            raise ValueError(f"type {kind!r} inconnu (attendu : {tuple(WALL_TYPES)})")
+        a, b = sorted((float(span[0]), float(span[1])))
+        a, b = max(a, 0.0), min(b, 1.0)
+        if b <= a:
+            return
+        kept = []
+        for w in self.walls:
+            if w["side"] != side or w["span"][1] <= a or w["span"][0] >= b:
+                kept.append(w)
+                continue
+            if w["span"][0] < a:                      # morceau restant avant
+                kept.append({**w, "span": [w["span"][0], a]})
+            if w["span"][1] > b:                      # morceau restant après
+                kept.append({**w, "span": [b, w["span"][1]]})
+        if kind != "wall":
+            kept.append({"side": side, "span": [a, b], "type": kind,
+                         "velocity": [float(velocity[0]), float(velocity[1])]})
+        self.walls = kept
+
+    def clear_wall(self, side: str, span=(0.0, 1.0)) -> None:
+        self.set_wall(side, "wall", span=span)
+
+    def wall_table(self) -> tuple[np.ndarray, np.ndarray]:
+        """Rastérisation des segments : wtype (4, n) int32 et wvel (4, n, 2) float32, indexés
+        [côté, cellule le long du mur]. Un obstacle collé au bord (dans la bande ou la première cellule
+        utilisable) rogne le segment : la paroi y redevient un mur."""
+        n, bound = self.n, self.p["bound"]
+        wtype = np.zeros((4, n), np.int32)
+        wvel = np.zeros((4, n, 2), np.float32)
+        for w in self.walls:
+            s = SIDES.index(w["side"])
+            k0 = int(np.floor(w["span"][0] * n + 1e-9))
+            k1 = int(np.ceil(w["span"][1] * n - 1e-9))
+            k0, k1 = max(k0, bound), min(k1, n - bound)
+            if k1 <= k0:
+                continue
+            wtype[s, k0:k1] = WALL_TYPES[w["type"]]
+            wvel[s, k0:k1] = w.get("velocity", [0.0, 0.0])
+        o = self.m["obstacle"]
+        edge = bound + 1                              # bande + première cellule utilisable
+        blocked = [o[:edge, :].any(axis=0), o[n - edge:, :].any(axis=0),
+                   o[:, :edge].any(axis=1), o[:, n - edge:].any(axis=1)]
+        for s in range(4):
+            wtype[s, blocked[s]] = WALL
+            wvel[s, blocked[s]] = 0.0
+        wtype[:, :bound] = WALL
+        wtype[:, n - bound:] = WALL
+        return wtype, wvel
+
     def resize(self, n: int) -> None:
-        """Change la grille en rééchantillonnant toutes les matrices (plus proche voisin)."""
+        """Change la grille en rééchantillonnant les matrices (plus proche voisin) ; les parois sont en
+        unités domaine et ne changent pas."""
         old = self.m["fluid"].shape[0]                # taille réelle des matrices (p["n"] peut déjà avoir changé)
         idx = np.minimum((np.arange(n) * old / n).astype(int), old - 1)
         self.m = {k: np.ascontiguousarray(v[idx][:, idx]) for k, v in self.m.items()}
@@ -144,23 +200,64 @@ class SimulationRunner:
             raw = np.packbits(a.ravel()) if a.dtype == bool else a.astype(np.float32).ravel()
             mats[k] = {"dtype": str(a.dtype), "shape": list(a.shape),
                        "data": base64.b64encode(np.ascontiguousarray(raw).tobytes()).decode("ascii")}
-        return {"version": 2, "params": dict(self.p), "matrices": mats}
+        return {"version": 3, "params": dict(self.p), "matrices": mats,
+                "walls": [dict(w) for w in self.walls]}
 
     @classmethod
     def from_dict(cls, d: dict) -> "SimulationRunner":
         params = {k: v for k, v in d.get("params", {}).items() if k in cls.PARAMS}
         r = cls(**params)
         n = r.n
+        legacy = {}
         for k, spec in d.get("matrices", {}).items():
-            if k not in r.m:
-                continue
             buf = base64.b64decode(spec["data"])
             if spec["dtype"] == "bool":
                 a = np.unpackbits(np.frombuffer(buf, np.uint8))[:n * n].astype(bool)
             else:
                 a = np.frombuffer(buf, np.float32)
-            r.m[k] = np.ascontiguousarray(a.reshape(n, n).astype(r.m[k].dtype))
+            a = a.reshape(n, n)
+            if k in r.m:
+                r.m[k] = np.ascontiguousarray(a.astype(r.m[k].dtype))
+            elif k in ("inlet", "outlet", "inlet_vx", "inlet_vy"):
+                legacy[k] = a
+        r.walls = [dict(w) for w in d.get("walls", [])]
+        if legacy:
+            r._migrate_legacy(legacy)
         return r
+
+    def _migrate_legacy(self, legacy: dict) -> None:
+        """Fichiers v2 : les bandes de cellules d'entrée / sortie collées à un mur deviennent des segments."""
+        n, bound = self.n, self.p["bound"]
+        depth = bound + 4
+        zeros = np.zeros((n, n), np.float32)
+        inlet = legacy.get("inlet", np.zeros((n, n), bool))
+        outlet = legacy.get("outlet", np.zeros((n, n), bool))
+        ivx, ivy = legacy.get("inlet_vx", zeros), legacy.get("inlet_vy", zeros)
+        I, J = np.meshgrid(np.arange(n), np.arange(n), indexing="ij")
+        dist = {"left": I, "right": n - 1 - I, "bottom": J, "top": n - 1 - J}
+        owner = np.argmin(np.stack(list(dist.values())), axis=0)   # mur le plus proche (gauche/droite gagnent les égalités)
+        for s, (side, d) in enumerate(dist.items()):  # chaque cellule de bord appartient à un seul mur
+            zone = (d < depth) & (owner == s)
+            axis = 0 if side in ("left", "right") else 1
+            for kind, mask in (("outlet", outlet), ("inlet", inlet)):
+                sel_side = mask & zone
+                along = sel_side.any(axis=axis)
+                k = 0
+                while k < n:
+                    if not along[k]:
+                        k += 1
+                        continue
+                    k0 = k
+                    while k < n and along[k]:
+                        k += 1
+                    run = sel_side & ((J >= k0) & (J < k) if axis == 0 else (I >= k0) & (I < k))
+                    perp = d[run]
+                    if k - k0 <= int(perp.max() - perp.min() + 1) and k - k0 < depth:
+                        continue                      # fragment de coin d'une bande perpendiculaire
+                    vel = (0.0, 0.0)
+                    if kind == "inlet":
+                        vel = (float(ivx[run].mean()), float(ivy[run].mean()))
+                    self.set_wall(side, kind, velocity=vel, span=(k0 / n, k / n))
 
     def save(self, path: str) -> None:
         with open(path, "w", encoding="utf-8") as f:
@@ -172,12 +269,13 @@ class SimulationRunner:
             return cls.from_dict(json.load(f))
 
     def equals(self, other: "SimulationRunner") -> bool:
-        return self.p == other.p and all(np.array_equal(self.m[k], other.m[k]) for k in self.m)
+        return (self.p == other.p and all(np.array_equal(self.m[k], other.m[k]) for k in self.m)
+                and self.walls == other.walls)
 
     # ------------------------------------------------------------ exécution
     def solver(self):
         from ui.solver import Solver
-        return Solver(self.p, self.m)
+        return Solver(self.p, self.m, self.wall_table())
 
     def run(self, frames: int, substeps: int | None = None, callback=None):
         """Calcule `frames` images sans fenêtre ; callback(solver, k) après chaque image. Renvoie le solveur."""

@@ -46,7 +46,7 @@ out["render_scale64_ms"] = timeit(lambda: s.render(0.5, 0.5, 64.0, True, True), 
 out["tiny_launch_ms"] = timeit(lambda: K.init_solid_state(s.C_s, s.F_s, s.D_s, s.broken_s), reps=200)
 # lecture GPU->CPU d'un scalaire
 out["readback_scalar_ms"] = timeit(lambda: float(K.count_alive(s.alive)), reps=20)
-# set_params (2 to_numpy de bc_v)
+# set_params (mesuré avant la refonte des parois : lisait deux fois bc_v.to_numpy())
 out["set_params_ms"] = timeit(lambda: s.set_params({"gravity": 9.81}), reps=10)
 s.release()
 

@@ -55,7 +55,7 @@ def cg_step_fused(q: ti.template(), r: ti.template(), pd: ti.template(), Ap: ti.
 # ---------------------------------------------------------------- prototype : sous-pas solide complet en un seul kernel
 @ti.kernel
 def solid_substep_fused(grid_m: ti.template(), grid_v: ti.template(), grid_e: ti.template(), grid_w: ti.template(),
-                        cells: ti.template(), bc_v: ti.template(), fp: ti.template(),
+                        cells: ti.template(), wall_type: ti.template(), wall_v: ti.template(), fp: ti.template(),
                         x: ti.template(), v: ti.template(), C: ti.template(), F: ti.template(),
                         D: ti.template(), broken: ti.template(),
                         inv_dx: float, dt: float, dx: float, mu: float, la: float, p_mass: float, p_vol: float,
@@ -86,19 +86,32 @@ def solid_substep_fused(grid_m: ti.template(), grid_v: ti.template(), grid_e: ti
         if grid_m[i, j] > 0:
             grid_v[i, j] /= grid_m[i, j]
             grid_v[i, j].y -= dt * g
-            if i < bound and grid_v[i, j].x < 0:
-                grid_v[i, j].x = 0.0
-            if i > n - bound and grid_v[i, j].x > 0:
-                grid_v[i, j].x = 0.0
-            if j < bound and grid_v[i, j].y < 0:
-                grid_v[i, j].y = 0.0
-            if j > n - bound and grid_v[i, j].y > 0:
-                grid_v[i, j].y = 0.0
-            c = cells[i, j]
-            if c & K.OBSTACLE:
+            if cells[i, j] & K.OBSTACLE:
                 grid_v[i, j] = [0.0, 0.0]
-            if c & K.INLET:
-                grid_v[i, j] = bc_v[i, j]
+            if i < bound:                                 # parois : même logique que kernels.grid_update
+                t = wall_type[K.LEFT, j] if bound <= j < n - bound else K.WALL
+                if t == K.INLET:
+                    grid_v[i, j] = wall_v[K.LEFT, j]
+                elif t == K.WALL and grid_v[i, j].x < 0:
+                    grid_v[i, j].x = 0.0
+            if i > n - bound:
+                t = wall_type[K.RIGHT, j] if bound <= j < n - bound else K.WALL
+                if t == K.INLET:
+                    grid_v[i, j] = wall_v[K.RIGHT, j]
+                elif t == K.WALL and grid_v[i, j].x > 0:
+                    grid_v[i, j].x = 0.0
+            if j < bound:
+                t = wall_type[K.BOTTOM, i] if bound <= i < n - bound else K.WALL
+                if t == K.INLET:
+                    grid_v[i, j] = wall_v[K.BOTTOM, i]
+                elif t == K.WALL and grid_v[i, j].y < 0:
+                    grid_v[i, j].y = 0.0
+            if j > n - bound:
+                t = wall_type[K.TOP, i] if bound <= i < n - bound else K.WALL
+                if t == K.INLET:
+                    grid_v[i, j] = wall_v[K.TOP, i]
+                elif t == K.WALL and grid_v[i, j].y > 0:
+                    grid_v[i, j].y = 0.0
             grid_v[i, j] += dt * fp[i, j]
     for p in x:                                           # G2P_solid + scatter_eps
         base = (x[p] * inv_dx - 0.5).cast(int)
@@ -163,7 +176,8 @@ s.step()
 out["arch"] = s.arch
 res = s.p["res"]
 out["render_total_ms"] = timeit(lambda: s.render(0, 0, 1.0, True, True), reps=10)
-out["render_kernel_only_ms"] = timeit(lambda: K.render(s.img, res, 0.0, 0.0, 1.0, s.cells, s.p["n"], 1, 1,
+out["render_kernel_only_ms"] = timeit(lambda: K.render(s.img, res, 0.0, 0.0, 1.0, s.cells, s.wall_type, s.p["n"],
+                                                        s.p["bound"], 1, 1,
                                                         s.x_f, s.alive, 1, 0.35, 0.65, 1.0, 1,
                                                         s.sc_f, 0, 1.0, s.x_s, s.col_s, 1, 1), reps=10)
 out["img_to_numpy_ms"] = timeit(lambda: s.img.to_numpy(), reps=10)
@@ -179,7 +193,7 @@ p = s.p
 out["pont_ms_frame"] = timeit(lambda: s.step(), reps=5)
 out["pont_solid_substep_ms"] = timeit(lambda: s._solid_substep(s.dt_solid, True), reps=30)
 out["pont_solid_substep_fused_ms"] = timeit(
-    lambda: solid_substep_fused(s.grid_m, s.grid_v, s.grid_e, s.grid_w, s.cells, s.bc_v, s.fp,
+    lambda: solid_substep_fused(s.grid_m, s.grid_v, s.grid_e, s.grid_w, s.cells, s.wall_type, s.wall_v, s.fp,
                                 s.x_s, s.v_s, s.C_s, s.F_s, s.D_s, s.broken_s,
                                 s.inv_dx, s.dt_solid, s.dx, s.mu_s, s.la_s, s.p_mass_s, s.p_vol, p["k_res"],
                                 p["gravity"], p["bound"], p["n"], p["eps0"], p["epsf"], s.tau_D, 1), reps=30)

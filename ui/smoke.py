@@ -44,14 +44,20 @@ def main() -> int:
     assert s.stats()["t"] > 0
     s.release()
 
-    # ---- entrée / sortie sur masques numpy
+    # ---- entrée / sortie sur les parois ; un obstacle collé au mur droit rogne la sortie
     r = SimulationRunner(n=96, substeps=10, capacity=60000)
     X, Y = r.centers()
     r.set_fluid(Y < 0.15)
     r.set_solid(r.rect(0.60, 0.15, 0.63, 0.40))
     r.set_obstacle(r.rect(0.55, 0.0, 0.68, 0.15))
-    r.set_inlet((X < 0.06) & (Y > 0.3) & (Y < 0.4), velocity=(3.0, 0.0))
-    r.set_outlet(X > 0.95)
+    r.set_obstacle(r.rect(0.90, 0.5, 1.0, 0.6))                 # bloc collé au mur droit
+    r.set_wall("left", "inlet", velocity=(3.0, 0.0), span=(0.3, 0.4))
+    r.set_wall("right", "outlet")
+    wt, wv = r.wall_table()
+    n, b = r.n, r.p["bound"]
+    assert (wt[0, int(0.3 * n):int(0.4 * n)] == 1).all() and (wv[0, int(0.35 * n)] == [3.0, 0.0]).all(), "entrée"
+    assert (wt[1, b:int(0.5 * n)] == 2).all() and (wt[1, int(0.5 * n) + 1:int(0.6 * n) - 1] == 0).all(), "sortie rognée"
+    assert (wt[:, :b] == 0).all() and (wt[:, n - b:] == 0).all(), "coins"
     s = r.solver()
     s.step()
     n0 = s.stats()["n_fluid"]
@@ -63,8 +69,29 @@ def main() -> int:
     assert st["n_fluid"] - n0 < 40 * 10 * 4 * 30, "émission non bornée"
     x = s.positions()
     assert len(x) == st["n_fluid"] and x.min() >= 0.0, "positions incohérentes"
-    assert (x[:, 0] < 0.97).all(), "la sortie ne détruit pas"
+    assert (x[:, 0] <= 1.0 - r.band + 1e-6).all(), "positions hors bande"
+    assert (x[:, 0] > 0.9).sum() < len(x), "tout le fluide au mur droit"
     s.release()
+
+    # ---- fichier v2 (bandes de cellules d'entrée / sortie) migré en segments de paroi
+    import base64
+    n = 64
+    inlet = np.zeros((n, n), bool)
+    inlet[3:6, 20:30] = True
+    outlet = np.zeros((n, n), bool)
+    outlet[n - 6:, :] = True
+    ivx = np.where(inlet, 2.5, 0.0).astype(np.float32)
+
+    def enc(a):
+        raw = np.packbits(a.ravel()) if a.dtype == bool else a.ravel()
+        return {"dtype": str(a.dtype), "shape": [n, n], "data": base64.b64encode(raw.tobytes()).decode()}
+
+    r2 = SimulationRunner.from_dict({"version": 2, "params": {"n": n},
+                                     "matrices": {"inlet": enc(inlet), "outlet": enc(outlet), "inlet_vx": enc(ivx)}})
+    kinds = sorted((w["side"], w["type"]) for w in r2.walls)
+    assert kinds == [("left", "inlet"), ("right", "outlet")], f"migration v2 : {r2.walls}"
+    w_in = next(w for w in r2.walls if w["type"] == "inlet")
+    assert abs(w_in["span"][0] - 20 / n) < 1e-9 and abs(w_in["span"][1] - 30 / n) < 1e-9 and w_in["velocity"] == [2.5, 0.0]
 
     # ---- incompressible : rupture de barrage, la divergence doit être ~0 après projection
     r = SimulationRunner(n=64, incompressible=True, substeps=2, cg_iters=200)

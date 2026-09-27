@@ -20,8 +20,8 @@ def main() -> None:
     r.set_solid(r.rect(0.55, 0.20, 0.58, 0.55))                      # lame encastrée dans le socle
     r.set_obstacle(r.circle(0.35, 0.28, 0.05))                       # rocher
     r.set_obstacle(r.rect(0.50, 0.0, 0.62, 0.20))                    # socle
-    r.set_inlet((X < 0.06) & (Y > 0.25) & (Y < 0.45), velocity=(3.0, 0.0))   # jet entrant à gauche
-    r.set_outlet(X > 0.95)                                           # tout ce qui touche le bord droit disparaît
+    r.set_wall("left", "inlet", velocity=(3.0, 0.0), span=(0.25, 0.45))   # jet entrant par le mur gauche
+    r.set_wall("right", "outlet")                                    # tout le mur droit est une sortie
 
     def report(s, k):
         if k % 25 == 0:

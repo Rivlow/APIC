@@ -33,43 +33,57 @@ X, Y = r.centers()                                   # (n, n) : X[i, j] = (i + 0
 r.set_fluid(Y < 0.20)                                # masque numpy booléen = cellules pleines d'eau
 r.set_solid(r.rect(0.55, 0.20, 0.58, 0.55))          # rect / circle renvoient un masque
 r.set_obstacle(r.circle(0.35, 0.28, 0.05))
-r.set_inlet((X < 0.06) & (Y > 0.25) & (Y < 0.45), velocity=(3.0, 0.0))
-r.set_outlet(X > 0.95)
+r.set_wall("left", "inlet", velocity=(3.0, 0.0), span=(0.25, 0.45))   # condition limite sur un mur
+r.set_wall("right", "outlet")                        # tout le mur droit
 r.set_velocity(r.rect(0.3, 0.1, 0.5, 0.2), (0.0, 2.0))   # vitesse initiale d'une zone
 
 s = r.run(150, callback=lambda s, k: print(k, s.stats()["n_fluid"]))   # sans fenêtre
 x = s.positions()                                    # (N, 2) numpy, copié du GPU à la demande
-r.save("canal.json")                                 # paramètres + matrices dans un seul fichier
+r.save("canal.json")                                 # paramètres + matrices + parois dans un seul fichier
 r.show()                                             # interface Qt
 ```
 
-Tout est matrices `(n, n)` indexées `[i, j]` = (x, y) comme les champs Taichi (`m[:, 0]` = rangée du bas) :
+L'intérieur est décrit par des matrices `(n, n)` indexées `[i, j]` = (x, y) comme les champs Taichi
+(`m[:, 0]` = rangée du bas) :
 
 | Matrice | Type | Rôle |
 |---|---|---|
 | `fluid`, `solid`, `obstacle` | bool | cellules initialement eau / solide / obstacle (exclusifs, le dernier gagne) |
-| `inlet` + `inlet_vx`, `inlet_vy` | bool + float | entrée : vitesse imposée (grille et particules) et émission jusqu'à `ppc²` particules par cellule |
-| `outlet` | bool | sortie : les particules qui y entrent sont détruites |
 | `vx0`, `vy0` | float | vitesse initiale des particules semées dans la cellule |
+
+**Parois** : les conditions aux limites n'existent que sur les quatre murs du domaine (`r.walls`, liste de
+segments `{"side": left|right|bottom|top, "span": [a, b], "type": inlet|outlet, "velocity": [vx, vy]}`,
+`span` en unités domaine le long du mur). `set_wall(side, kind, velocity, span)` ajoute un segment (il
+remplace les anciens là où il les recouvre ; `kind="wall"` efface). Le mur par défaut est glissant.
+
+- **entrée** : vitesse imposée sur les nœuds de la bande de paroi, émission par flux (`ppc² · v_n dt / dx`
+  particules par cellule de mur et par pas, fraction reportée) dans la lame qui vient d'entrer ;
+- **sortie** : nœuds de bande libres, les particules qui franchissent le mur sont détruites ; en
+  incompressible la bande est de l'air (p = 0 exactement sur le mur) ;
+- **obstacle collé au mur** : il a priorité, le segment est rogné là où une cellule d'obstacle touche le
+  bord (bande ou première cellule utilisable) ; `wall_table()` donne la rastérisation `(4, n)` réelle.
 
 Paramètres (`SimulationRunner.PARAMS`) : `n, bound, ppc, cfl, gravity, substeps, seed, capacity, res,
 fluid_rho, fluid_E, solid_rho, solid_E, solid_nu, eps0, epsf, tau_D, k_res, use_damage, use_rupture,
 color_mode`. Les clés `n, bound, ppc, capacity, seed, res` sont structurelles (nouveau solveur au Reset) ;
 les autres s'appliquent à chaud (`Solver.set_params`).
 
-**Bande de paroi** : les particules restent dans `[bound·dx, 1 − bound·dx]` (`r.band`). Le semis y est
-borné et les cellules d'entrée / sortie situées dans la bande sont ignorées : mettre l'entrée un peu
-au-delà (`X < r.band + 2 * r.dx`). Sans cela le stencil 3 × 3 de P2G sortirait de la grille (corruption
-silencieuse sur Vulkan, « illegal address » sur CUDA).
+**Bande de paroi** : les particules restent dans `[bound·dx, 1 − bound·dx]` (`r.band`) ; c'est là que
+vivent les conditions aux limites. Sans cette bande le stencil 3 × 3 de P2G sortirait de la grille
+(corruption silencieuse sur Vulkan, « illegal address » sur CUDA).
 
 ## Interface
 
 - **Viewport** : molette = zoom autour du curseur (×1,25, jusqu'à 64×), bouton droit ou milieu = déplacer
-  la vue, `F` = vue entière, bouton gauche = boîte de sélection de cellules, `Échap` = désélection. Le
+  la vue, `F` = vue entière, `Échap` = désélection. Bouton gauche à l'intérieur = boîte de sélection de
+  cellules ; près d'un bord (12 px) ou dans la bande de paroi, le mur entier s'éclaire : clic = tout le
+  mur, glisser le long du mur = un segment aimanté aux cellules. Les segments existants sont dessinés sur
+  le bord (vert entrée, rouge sortie, trous là où un obstacle rogne) avec deux poignées à tirer. Le
   maillage s'affiche dès qu'une cellule fait 6 px ; les cellules initiales sont teintées (eau bleu,
-  solide jaune, obstacle gris, entrée vert, sortie rouge).
-- **Cellules** (dock droit) : sur la sélection, Eau / Solide / Obstacle / Entrée (vx, vy) / Sortie /
-  Vitesse initiale / Effacer. Toute modification allume le bandeau orange : `Reset` (R) reconstruit.
+  solide jaune, obstacle gris).
+- **Scène** (dock droit) : sur la sélection de cellules, Eau / Solide / Obstacle / Vitesse initiale /
+  Effacer ; sur la sélection de paroi, Entrée (vx, vy) / Sortie / Mur (effacer). Toute modification allume
+  le bandeau orange : `Reset` (R) reconstruit.
   Liste « Couleur du fluide » : uniforme, |v| (échelle 0…max, bleu → rouge), vx, vy, pression, vorticité
   (échelle ±max, bleu / blanc / rouge). L'échelle est le max courant lissé, recalculé toutes les 6 images
   (`Solver.fluid_mode`, `Solver.scalar_max`). Pression : E (1 − J) en compressible, q ρ / dt en
@@ -127,15 +141,18 @@ grâce au démarrage à chaud.
 ## JSON
 
 ```json
-{"version": 2,
+{"version": 3,
  "params": {"n": 128, "gravity": 9.81, ...},
  "matrices": {"fluid": {"dtype": "bool", "shape": [128, 128], "data": "<base64 packbits>"},
-              "inlet_vx": {"dtype": "float32", "shape": [128, 128], "data": "<base64>"}}}
+              "vx0": {"dtype": "float32", "shape": [128, 128], "data": "<base64>"}},
+ "walls": [{"side": "left", "span": [0.25, 0.45], "type": "inlet", "velocity": [3.0, 0.0]},
+           {"side": "right", "span": [0.0, 1.0], "type": "outlet", "velocity": [0.0, 0.0]}]}
 ```
-Un seul fichier auto-suffisant ; les matrices entièrement nulles sont omises.
+Un seul fichier auto-suffisant ; les matrices entièrement nulles sont omises. Les fichiers v2 (bandes de
+cellules `inlet` / `outlet`) sont convertis à la lecture : chaque bande collée à un mur devient un segment.
 
 ## Limites
 
 - 2D, domaine unitaire `[0, 1]²`, un fluide et un solide.
-- Entrées / sorties : fluide uniquement.
+- Entrées / sorties : fluide uniquement, et seulement sur les parois du domaine.
 - Changer `n` dans l'interface rééchantillonne les matrices au plus proche voisin.

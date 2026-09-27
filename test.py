@@ -19,8 +19,8 @@ X, Y = r.centers()
 
 r.set_fluid(r.rect(r.band, r.band, 1 - r.band, 1 - r.band), velocity=(U, 0.0))   # conduit plein (hors bande de paroi)
 r.set_obstacle(r.circle(0.30, 0.50, 0.05))                          # cylindre au milieu du conduit
-r.set_inlet((X > r.band) & (X < r.band + 3 * r.dx), velocity=(U, 0.0))   # entrée : 3 colonnes à gauche
-r.set_outlet(X > 1.0 - r.band - 3 * r.dx)                                 # sortie : 3 colonnes à droite
+r.set_wall("left", "inlet", velocity=(U, 0.0))                       # tout le mur gauche : entrée
+r.set_wall("right", "outlet")                                        # tout le mur droit : sortie
 
 if "--no-show" in sys.argv:
     s = r.run(100, callback=lambda s, k: k % 20 == 0 and print(k, s.stats()))

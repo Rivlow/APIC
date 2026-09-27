@@ -1,6 +1,7 @@
-"""Solver : reçoit un dict de paramètres et des matrices (n × n), alloue les champs Taichi, calcule.
+"""Solver : reçoit un dict de paramètres, des matrices (n × n) et la table des parois, alloue les champs
+Taichi, calcule.
 
-    solver = Solver(params, matrices)     # semis + allocation + état initial
+    solver = Solver(params, matrices, wall_table)     # semis + allocation + état initial
     solver.step(20)                       # 20 sous-pas
     solver.stats() ; solver.positions()   # lectures GPU -> CPU à la demande
     solver.render(x0, y0, scale, grid, tint) -> image (res, res, 3) u8
@@ -59,12 +60,13 @@ def _solid_points(cells: np.ndarray, ppc: int) -> np.ndarray:
 
 
 class Solver:
-    def __init__(self, params: dict, matrices: dict):
+    def __init__(self, params: dict, matrices: dict, wall_table: tuple[np.ndarray, np.ndarray]):
         self.arch = ensure_taichi()
         self.p = dict(params)
         p = self.p
         n, ppc, bound = p["n"], p["ppc"], p["bound"]
         m = matrices
+        wtype, wvel = wall_table                       # (4, n) int32 et (4, n, 2) float32, voir runner.wall_table
         lo, hi = bound / n, 1.0 - bound / n           # bande de paroi : le stencil 3x3 sortirait de la grille
 
         # ---- semis (numpy, une fois) ; vitesse initiale = celle de la cellule d'origine
@@ -79,13 +81,9 @@ class Solver:
         vf, vs = vel_of(xf), vel_of(xs)
         xf, xs = np.clip(xf, lo, hi), np.clip(xs, lo, hi)
 
-        # ---- grille des cellules (bits) ; entrées / sorties hors bande de paroi uniquement
-        usable = np.zeros((n, n), bool)
-        usable[bound:n - bound, bound:n - bound] = True
-        inlet, outlet = m["inlet"] & usable, m["outlet"] & usable
-        cells = (m["fluid"] * K.FLUID0 | m["solid"] * K.SOLID0 | m["obstacle"] * K.OBSTACLE
-                 | inlet * K.INLET | outlet * K.OUTLET).astype(np.int32)
-        self.has_inlet, self.has_outlet = bool(inlet.any()), bool(outlet.any())
+        # ---- grille des cellules (bits) ; les conditions aux limites sont sur les parois (wtype, wvel)
+        cells = (m["fluid"] * K.FLUID0 | m["solid"] * K.SOLID0 | m["obstacle"] * K.OBSTACLE).astype(np.int32)
+        self.has_inlet, self.has_outlet = bool((wtype == K.INLET).any()), bool((wtype == K.OUTLET).any())
 
         # ---- capacités
         self.n_fluid_init = len(xf)
@@ -121,9 +119,10 @@ class Solver:
 
         self.grid_v, self.grid_m = ti.Vector.field(2, ti.f32), ti.field(ti.f32)
         self.grid_e, self.grid_w = ti.field(ti.f32), ti.field(ti.f32)
-        self.cells, self.cell_count, self.bc_v = ti.field(ti.i32), ti.field(ti.i32), ti.Vector.field(2, ti.f32)
-        fb.dense(ti.ij, (n, n)).place(self.grid_v, self.grid_m, self.grid_e, self.grid_w,
-                                      self.cells, self.cell_count, self.bc_v)
+        self.cells = ti.field(ti.i32)
+        fb.dense(ti.ij, (n, n)).place(self.grid_v, self.grid_m, self.grid_e, self.grid_w, self.cells)
+        self.wall_type, self.wall_v, self.emit_acc = ti.field(ti.i32), ti.Vector.field(2, ti.f32), ti.field(ti.f32)
+        fb.dense(ti.ij, (4, n)).place(self.wall_type, self.wall_v, self.emit_acc)
         self.img = ti.Vector.field(3, ti.u8)
         fb.dense(ti.ij, (p["res"], p["res"])).place(self.img)
         if self.incompressible:                        # grille décalée + gradient conjugué
@@ -141,13 +140,14 @@ class Solver:
         self._tree = fb.finalize()
 
         self.cells.from_numpy(cells)
-        self.bc_v.from_numpy(np.stack([m["inlet_vx"], m["inlet_vy"]], axis=-1).astype(np.float32))
+        self.wall_type.from_numpy(np.ascontiguousarray(wtype, np.int32))
+        self.wall_v.from_numpy(np.ascontiguousarray(wvel, np.float32))
         self.t = 0.0
         self.last_step_ms = 0.0
         self.cg_last_iters = 0
         self.fluid_mode = 0                            # indice dans kernels.FLUID_MODES
         self.scalar_max = 0.0                          # échelle de couleur, mise à jour dans stats()
-        self._inlet_speed = float(np.hypot(m["inlet_vx"], m["inlet_vy"]).max()) if self.has_inlet else 0.0
+        self._inlet_speed = float(np.hypot(wvel[..., 0], wvel[..., 1])[wtype == K.INLET].max()) if self.has_inlet else 0.0
         self.set_params(p)
         self.reset()
 
@@ -172,7 +172,7 @@ class Solver:
         if self.has_solid:
             speeds.append(((self.la_s + 2 * self.mu_s) / p["solid_rho"]) ** 0.5)
         if self.has_inlet:
-            speeds.append(float(np.hypot(self.bc_v.to_numpy()[..., 0], self.bc_v.to_numpy()[..., 1]).max()))
+            speeds.append(self._inlet_speed)
         self.dt = p["cfl"] * self.dx / max(speeds)
         # pas de temps propre du solide (ondes élastiques) : en incompressible, le fluide avance au pas
         # d'advection et le solide est sous-cyclé à dt_solid
@@ -186,6 +186,7 @@ class Solver:
         if self.incompressible:
             self.q.fill(0.0)
             self.fp.fill(0.0)
+        self.emit_acc.fill(0.0)
         self.x_f.from_numpy(self._x0f)
         self.v_f.from_numpy(self._v0f)
         K.init_pool(self.alive, self.x_f, self.C_f, self.J_f, self.n_fluid_init, self.free_stack, self.free_top)
@@ -227,7 +228,7 @@ class Solver:
         self.grid_v.fill(0.0)
         P2G_solid(self.grid_m, self.grid_v, self.x_s, self.v_s, self.C_s, self.F_s, self.D_s, self.broken_s,
                   inv_dx, dt_s, dx, self.mu_s, self.la_s, self.p_mass_s, self.p_vol, p["k_res"])
-        K.grid_update(self.grid_m, self.grid_v, self.cells, self.bc_v, dt_s, p["gravity"], bound, n)
+        K.grid_update(self.grid_m, self.grid_v, self.cells, self.wall_type, self.wall_v, dt_s, p["gravity"], bound, n)
         if with_pressure:
             M.add_accel(self.grid_v, self.grid_m, self.fp, dt_s)
         G2P_solid(self.grid_v, self.x_s, self.v_s, self.C_s, self.F_s, self.broken_s, inv_dx, dt_s, dx, bound)
@@ -251,22 +252,28 @@ class Solver:
             self.grid_v.fill(0.0)
             P2G_solid(self.grid_m, self.grid_v, self.x_s, self.v_s, self.C_s, self.F_s, self.D_s, self.broken_s,
                       inv_dx, dt_s, dx, self.mu_s, self.la_s, self.p_mass_s, self.p_vol, p["k_res"])
-            K.grid_update(self.grid_m, self.grid_v, self.cells, self.bc_v, 0.0, 0.0, bound, n)
+            K.grid_update(self.grid_m, self.grid_v, self.cells, self.wall_type, self.wall_v, 0.0, 0.0, bound, n)
         M.mac_p2g(self.x_f, self.v_f, self.C_f, self.alive, self.u, self.v, self.mu, self.mv, inv_dx, dx)
-        M.mac_classify(self.ctype, self.cells, self.x_f, self.alive, self.x_s, int(self.has_solid),
-                       inv_dx, n, bound, int(p["free_surface"]))
-        M.mac_bc(self.u, self.v, self.ctype, self.cells, self.bc_v, self.grid_v, self.grid_m, dt, p["gravity"], n, 1)
+        M.mac_classify(self.ctype, self.cells, self.wall_type, self.wall_v, self.x_f, self.alive, self.x_s,
+                       int(self.has_solid), inv_dx, n, bound, int(p["free_surface"]))
+        M.mac_bc(self.u, self.v, self.ctype, self.wall_type, self.wall_v, self.grid_v, self.grid_m,
+                 dt, p["gravity"], n, bound, 1)
         self._project()
-        M.mac_bc(self.u, self.v, self.ctype, self.cells, self.bc_v, self.grid_v, self.grid_m, dt, p["gravity"], n, 0)
+        M.mac_bc(self.u, self.v, self.ctype, self.wall_type, self.wall_v, self.grid_v, self.grid_m,
+                 dt, p["gravity"], n, bound, 0)
         if self.has_solid:
             M.pressure_force(self.fp, self.grid_m, self.q, self.ctype, inv_dx,
                              -(p["fluid_rho"] / p["solid_rho"]) / dt, n)
         M.mac_g2p(self.x_f, self.v_f, self.C_f, self.alive, self.u, self.v, self.mu, self.mv, inv_dx, dx)
-        K.advect_fluid(self.x_f, self.v_f, self.alive, self.cells, self.cell_count, inv_dx, dt, bound, dx,
-                       n, self.free_stack, self.free_top)
+        self._advect_and_emit(dt)
+
+    def _advect_and_emit(self, dt: float) -> None:
+        p, dx, inv_dx, n, bound = self.p, self.dx, self.inv_dx, self.p["n"], self.p["bound"]
+        K.advect_fluid(self.x_f, self.v_f, self.alive, self.wall_type, inv_dx, dt, bound, dx, n,
+                       self.free_stack, self.free_top)
         if self.has_inlet:
-            K.emit(self.x_f, self.v_f, self.C_f, self.J_f, self.alive, self.cells, self.bc_v, self.cell_count,
-                   p["ppc"] * p["ppc"], self.free_stack, self.free_top, dx, bound)
+            K.emit_wall(self.x_f, self.v_f, self.C_f, self.J_f, self.alive, self.wall_type, self.wall_v,
+                        self.emit_acc, float(p["ppc"] * p["ppc"]), self.free_stack, self.free_top, dt, dx, bound, n)
 
     # ------------------------------------------------------------ simulation (faiblement compressible)
     def _substep(self) -> None:
@@ -280,10 +287,9 @@ class Solver:
         if self.has_solid:
             P2G_solid(self.grid_m, self.grid_v, self.x_s, self.v_s, self.C_s, self.F_s, self.D_s, self.broken_s,
                       inv_dx, dt, dx, self.mu_s, self.la_s, self.p_mass_s, self.p_vol, p["k_res"])
-        K.grid_update(self.grid_m, self.grid_v, self.cells, self.bc_v, dt, p["gravity"], bound, n)
+        K.grid_update(self.grid_m, self.grid_v, self.cells, self.wall_type, self.wall_v, dt, p["gravity"], bound, n)
         if self.has_fluid:
-            K.G2P_fluid(self.grid_v, self.x_f, self.v_f, self.C_f, self.J_f, self.alive,
-                        self.cells, self.bc_v, inv_dx, dt, dx, n)
+            K.G2P_fluid(self.grid_v, self.x_f, self.v_f, self.C_f, self.J_f, self.alive, inv_dx, dt, dx)
         if self.has_solid:
             G2P_solid(self.grid_v, self.x_s, self.v_s, self.C_s, self.F_s, self.broken_s, inv_dx, dt, dx, bound)
             if p["use_damage"]:
@@ -292,11 +298,7 @@ class Solver:
                 update_damage(self.grid_e, self.grid_w, self.x_s, self.F_s, self.D_s, self.broken_s,
                               inv_dx, dt, p["eps0"], p["epsf"], self.tau_D, int(p["use_rupture"]))
         if self.has_fluid:
-            K.advect_fluid(self.x_f, self.v_f, self.alive, self.cells, self.cell_count, inv_dx, dt, bound, dx,
-                           n, self.free_stack, self.free_top)
-            if self.has_inlet:
-                K.emit(self.x_f, self.v_f, self.C_f, self.J_f, self.alive, self.cells, self.bc_v, self.cell_count,
-                       p["ppc"] * p["ppc"], self.free_stack, self.free_top, dx, bound)
+            self._advect_and_emit(dt)
 
     def step(self, substeps: int | None = None) -> None:
         t0 = time.perf_counter()
@@ -359,7 +361,8 @@ class Solver:
             else:
                 K.fluid_scalar_wc(mode, self.x_f, self.v_f, self.J_f, self.alive, self.grid_v, self.sc_f,
                                   self.p["fluid_E"], self.inv_dx, self.p["n"])
-        K.render(self.img, res, x0, y0, scale, self.cells, self.p["n"], int(grid), int(tint),
+        K.render(self.img, res, x0, y0, scale, self.cells, self.wall_type, self.p["n"], self.p["bound"],
+                 int(grid), int(tint),
                  self.x_f, self.alive, int(self.has_fluid), 0.35, 0.65, 1.0, r_px,
                  self.sc_f, mode, 1.0 / max(self.scalar_max, 1e-9),
                  self.x_s, self.col_s, int(self.has_solid), r_px)

@@ -1,10 +1,14 @@
-"""Kernels Taichi du solveur : fluide APIC avec réservoir de particules, grille, émission, rendu.
+"""Kernels Taichi du solveur : fluide APIC avec réservoir de particules, grille, parois, rendu.
 
 Tous les arguments sont explicites (aucune globale). Les kernels solides (MLS-MPM, endommagement)
 viennent de Code_tuto/mpm_solid.py, inchangé.
 
 Grille `cells` (i32, n × n, indexée [i, j] = (x, y)) : bits  FLUID0 = 1 (eau initiale), SOLID0 = 2,
-OBSTACLE = 4, INLET = 8, OUTLET = 16.  `bc_v` (vec2) : vitesse imposée sur les cellules d'entrée.
+OBSTACLE = 4.  Les conditions aux limites ne vivent que sur les quatre parois du domaine :
+`wall_type` (i32, 4 × n) et `wall_v` (vec2, 4 × n) donnent, pour chaque côté (LEFT, RIGHT, BOTTOM, TOP)
+et chaque cellule le long de ce côté, le type WALL (paroi glissante), INLET (vitesse imposée + émission
+par flux) ou OUTLET (sortie libre : les particules qui franchissent le mur sont détruites). Elles
+s'appliquent dans la bande de `bound` cellules qui borde le domaine, c'est-à-dire sur le mur lui-même.
 
 Réservoir fluide : capacité fixe, drapeau `alive`, particules mortes garées en (-1, -1) et ignorées
 partout ; pile de slots libres (`free_stack`, `free_top[0]`) sur le GPU : une sortie y pousse les
@@ -12,7 +16,10 @@ particules détruites, une entrée y prend les slots des particules émises. Rie
 """
 import taichi as ti
 
-FLUID0, SOLID0, OBSTACLE, INLET, OUTLET = 1, 2, 4, 8, 16
+FLUID0, SOLID0, OBSTACLE = 1, 2, 4
+LEFT, RIGHT, BOTTOM, TOP = 0, 1, 2, 3
+WALL, INLET, OUTLET = 0, 1, 2
+SIDES = ("left", "right", "bottom", "top")
 
 
 @ti.func
@@ -24,6 +31,36 @@ def cell_of(xp, inv_dx: float, n: int):
 @ti.func
 def weights(fx):
     return [0.5 * (1.5 - fx) ** 2, 0.75 - (fx - 1.0) ** 2, 0.5 * (fx - 0.5) ** 2]
+
+
+@ti.func
+def band_cell(i: int, j: int, n: int, bound: int):
+    """Cellule (i, j) dans la bande de paroi -> (côté, indice le long du mur) ; (-1, 0) sinon.
+    Les coins (indice dans la bande transversale) sont toujours de la paroi."""
+    side, k = -1, 0
+    if i < bound:
+        side, k = LEFT, j
+    elif i >= n - bound:
+        side, k = RIGHT, j
+    elif j < bound:
+        side, k = BOTTOM, i
+    elif j >= n - bound:
+        side, k = TOP, i
+    if side >= 0 and (k < bound or k >= n - bound):
+        side = -1
+    return side, k
+
+
+@ti.func
+def band_bc(wall_type: ti.template(), wall_v: ti.template(), i: int, j: int, n: int, bound: int):
+    """Type et vitesse imposée de la cellule de bande (i, j) ; WALL et 0 hors bande ou dans un coin."""
+    t = WALL
+    vel = ti.Vector([0.0, 0.0])
+    side, k = band_cell(i, j, n, bound)
+    if side >= 0:
+        t = wall_type[side, k]
+        vel = wall_v[side, k]
+    return t, vel
 
 
 # ---------------------------------------------------------------- initialisation
@@ -85,34 +122,49 @@ def P2G_fluid(grid_m: ti.template(), grid_v: ti.template(),
 
 # ---------------------------------------------------------------- 2. grille
 @ti.kernel
-def grid_update(grid_m: ti.template(), grid_v: ti.template(), cells: ti.template(), bc_v: ti.template(),
-                dt: float, g: float, bound: int, n: int):
-    """Quantité de mouvement -> vitesse, gravité, parois glissantes, obstacles, vitesse d'entrée imposée."""
+def grid_update(grid_m: ti.template(), grid_v: ti.template(), cells: ti.template(),
+                wall_type: ti.template(), wall_v: ti.template(), dt: float, g: float, bound: int, n: int):
+    """Quantité de mouvement -> vitesse, gravité, obstacles, puis les quatre parois : glissante (composante
+    entrante annulée), entrée (vitesse imposée) ou sortie (nœud libre)."""
     for i, j in grid_m:
         if grid_m[i, j] > 0:
             grid_v[i, j] /= grid_m[i, j]
             grid_v[i, j].y -= dt * g
-            if i < bound and grid_v[i, j].x < 0:
-                grid_v[i, j].x = 0.0
-            if i > n - bound and grid_v[i, j].x > 0:
-                grid_v[i, j].x = 0.0
-            if j < bound and grid_v[i, j].y < 0:
-                grid_v[i, j].y = 0.0
-            if j > n - bound and grid_v[i, j].y > 0:
-                grid_v[i, j].y = 0.0
-            c = cells[i, j]
-            if c & OBSTACLE:
+            if cells[i, j] & OBSTACLE:
                 grid_v[i, j] = [0.0, 0.0]
-            if c & INLET:
-                grid_v[i, j] = bc_v[i, j]
+            # nœuds de bande : i < bound à gauche, i > n - bound à droite (le nœud n - bound est le mur)
+            if i < bound:
+                t = wall_type[LEFT, j] if bound <= j < n - bound else WALL
+                if t == INLET:
+                    grid_v[i, j] = wall_v[LEFT, j]
+                elif t == WALL and grid_v[i, j].x < 0:
+                    grid_v[i, j].x = 0.0
+            if i > n - bound:
+                t = wall_type[RIGHT, j] if bound <= j < n - bound else WALL
+                if t == INLET:
+                    grid_v[i, j] = wall_v[RIGHT, j]
+                elif t == WALL and grid_v[i, j].x > 0:
+                    grid_v[i, j].x = 0.0
+            if j < bound:
+                t = wall_type[BOTTOM, i] if bound <= i < n - bound else WALL
+                if t == INLET:
+                    grid_v[i, j] = wall_v[BOTTOM, i]
+                elif t == WALL and grid_v[i, j].y < 0:
+                    grid_v[i, j].y = 0.0
+            if j > n - bound:
+                t = wall_type[TOP, i] if bound <= i < n - bound else WALL
+                if t == INLET:
+                    grid_v[i, j] = wall_v[TOP, i]
+                elif t == WALL and grid_v[i, j].y > 0:
+                    grid_v[i, j].y = 0.0
 
 
 # ---------------------------------------------------------------- 3. grille -> particules (fluide)
 @ti.kernel
 def G2P_fluid(grid_v: ti.template(),
               x: ti.template(), v: ti.template(), C: ti.template(), J: ti.template(), alive: ti.template(),
-              cells: ti.template(), bc_v: ti.template(), inv_dx: float, dt: float, dx: float, n: int):
-    """v, C, J depuis la grille ; dans une cellule d'entrée la particule garde la vitesse imposée."""
+              inv_dx: float, dt: float, dx: float):
+    """v, C, J depuis la grille."""
     for p in x:
         if alive[p] == 1:
             base = (x[p] * inv_dx - 0.5).cast(int)
@@ -126,60 +178,88 @@ def G2P_fluid(grid_v: ti.template(),
                 weight = w[i].x * w[j].y
                 v_new += weight * grid_v[base + offset]
                 C_new += weight * grid_v[base + offset].outer_product(d_pos) * (4 * inv_dx * inv_dx)
-            c = cell_of(x[p], inv_dx, n)
-            if cells[c.x, c.y] & INLET:
-                v_new = bc_v[c.x, c.y]
-                C_new = ti.Matrix.zero(ti.f32, 2, 2)
             v[p] = v_new
             C[p] = C_new
             J[p] *= 1.0 + dt * C_new.trace()
 
 
-# ---------------------------------------------------------------- 4. advection, sorties, comptage
+# ---------------------------------------------------------------- 4. advection et sorties
+@ti.func
+def outlet_at(wall_type: ti.template(), side: int, k: int, n: int, bound: int) -> bool:
+    return bound <= k < n - bound and wall_type[side, k] == OUTLET
+
+
 @ti.kernel
-def advect_fluid(x: ti.template(), v: ti.template(), alive: ti.template(),
-                 cells: ti.template(), cell_count: ti.template(), inv_dx: float, dt: float, bound: int, dx: float,
-                 n: int, free_stack: ti.template(), free_top: ti.template()):
-    """Advection bornée à la bande [bound dx, 1 - bound dx] ; destruction dans les cellules de sortie ;
-    comptage des particules par cellule d'entrée (pour l'émission)."""
-    for i, j in cell_count:
-        cell_count[i, j] = 0
+def advect_fluid(x: ti.template(), v: ti.template(), alive: ti.template(), wall_type: ti.template(),
+                 inv_dx: float, dt: float, bound: int, dx: float, n: int,
+                 free_stack: ti.template(), free_top: ti.template()):
+    """Advection ; une particule qui franchit un mur de sortie est détruite (slot rendu à la pile),
+    sinon elle reste dans [bound dx, 1 - bound dx]."""
+    lo, hi = bound * dx, 1.0 - bound * dx
     for p in x:
         if alive[p] == 1:
-            x[p] += dt * v[p]
-            x[p] = ti.math.clamp(x[p], bound * dx, 1.0 - bound * dx)
-            c = cell_of(x[p], inv_dx, n)
-            flags = cells[c.x, c.y]
-            if flags & OUTLET:
+            xn = x[p] + dt * v[p]
+            kj = ti.math.clamp(int(xn.y * inv_dx), 0, n - 1)
+            ki = ti.math.clamp(int(xn.x * inv_dx), 0, n - 1)
+            out = ((xn.x < lo and outlet_at(wall_type, LEFT, kj, n, bound))
+                   or (xn.x > hi and outlet_at(wall_type, RIGHT, kj, n, bound))
+                   or (xn.y < lo and outlet_at(wall_type, BOTTOM, ki, n, bound))
+                   or (xn.y > hi and outlet_at(wall_type, TOP, ki, n, bound)))
+            if out:
                 alive[p] = 0
                 x[p] = [-1.0, -1.0]
                 idx = ti.atomic_add(free_top[0], 1)
                 free_stack[idx] = p
-            elif flags & INLET:
-                cell_count[c.x, c.y] += 1
+            else:
+                x[p] = ti.math.clamp(xn, lo, hi)
 
 
-# ---------------------------------------------------------------- 5. émission (par cellule d'entrée)
+# ---------------------------------------------------------------- 5. émission par flux sur les parois d'entrée
 @ti.kernel
-def emit(x: ti.template(), v: ti.template(), C: ti.template(), J: ti.template(), alive: ti.template(),
-         cells: ti.template(), bc_v: ti.template(), cell_count: ti.template(), target: int,
-         free_stack: ti.template(), free_top: ti.template(), dx: float, bound: int):
-    """Complète chaque cellule d'entrée jusqu'à `target` particules (un thread par cellule)."""
-    for i, j in cells:
-        if cells[i, j] & INLET:
-            deficit = ti.max(target - cell_count[i, j], 0)
-            for _ in range(deficit):
-                idx = ti.atomic_sub(free_top[0], 1) - 1
-                if idx >= 0:
-                    p = free_stack[idx]
-                    xp = (ti.Vector([i, j]) + ti.Vector([ti.random(), ti.random()])) * dx
-                    x[p] = ti.math.clamp(xp, bound * dx, 1.0 - bound * dx)
-                    v[p] = bc_v[i, j]
-                    C[p] = ti.Matrix.zero(ti.f32, 2, 2)
-                    J[p] = 1.0
-                    alive[p] = 1
-                else:
-                    ti.atomic_add(free_top[0], 1)     # plus de slot libre : on rend ce qu'on a pris
+def emit_wall(x: ti.template(), v: ti.template(), C: ti.template(), J: ti.template(), alive: ti.template(),
+              wall_type: ti.template(), wall_v: ti.template(), emit_acc: ti.template(), ppc2: float,
+              free_stack: ti.template(), free_top: ti.template(), dt: float, dx: float, bound: int, n: int):
+    """Chaque cellule de mur en entrée injecte ppc² · v_n dt / dx particules par pas (fraction reportée dans
+    emit_acc) : les particules naissent dans la lame [mur, mur + v_n dt] avec la vitesse imposée."""
+    lo, hi = bound * dx, 1.0 - bound * dx
+    for side, k in wall_type:
+        if wall_type[side, k] == INLET and bound <= k < n - bound:
+            vel = wall_v[side, k]
+            vn = 0.0
+            if side == LEFT:
+                vn = vel.x
+            elif side == RIGHT:
+                vn = -vel.x
+            elif side == BOTTOM:
+                vn = vel.y
+            else:
+                vn = -vel.y
+            if vn > 0:
+                emit_acc[side, k] += ppc2 * vn * dt / dx
+                count = int(emit_acc[side, k])
+                emit_acc[side, k] -= count
+                for _ in range(count):
+                    idx = ti.atomic_sub(free_top[0], 1) - 1
+                    if idx >= 0:
+                        p = free_stack[idx]
+                        along = (k + ti.random()) * dx
+                        depth = ti.random() * vn * dt
+                        xp = ti.Vector([0.0, 0.0])
+                        if side == LEFT:
+                            xp = ti.Vector([lo + depth, along])
+                        elif side == RIGHT:
+                            xp = ti.Vector([hi - depth, along])
+                        elif side == BOTTOM:
+                            xp = ti.Vector([along, lo + depth])
+                        else:
+                            xp = ti.Vector([along, hi - depth])
+                        x[p] = ti.math.clamp(xp, lo, hi)
+                        v[p] = vel
+                        C[p] = ti.Matrix.zero(ti.f32, 2, 2)
+                        J[p] = 1.0
+                        alive[p] = 1
+                    else:
+                        ti.atomic_add(free_top[0], 1)     # plus de slot libre : on rend ce qu'on a pris
 
 
 # ---------------------------------------------------------------- 6. quantité colorée du fluide
@@ -268,14 +348,15 @@ def scalar_absmax(sc: ti.template(), alive: ti.template()) -> ti.f32:
 # ---------------------------------------------------------------- 7. rendu
 @ti.kernel
 def render(img: ti.template(), res: int, x0: float, y0: float, scale: float,
-           cells: ti.template(), n: int, grid_on: int, tint_on: int,
+           cells: ti.template(), wall_type: ti.template(), n: int, bound: int, grid_on: int, tint_on: int,
            x_f: ti.template(), alive: ti.template(), has_fluid: int, fr: float, fg: float, fb: float, r_f: int,
            sc: ti.template(), fluid_mode: int, inv_smax: float,
            x_s: ti.template(), col_s: ti.template(), has_solid: int, r_s: int):
     """Image (res, res) u8 indexée [ligne, colonne], ligne 0 en haut (format QImage RGB888).
 
     Vue : x = x0 + (col + 0.5) / (res scale), y = y0 + (res - ligne - 0.5) / (res scale).
-    Fond, obstacles, entrées, sorties, teintes des cellules initiales, maillage, puis particules.
+    Fond, bande de paroi (grise, verte pour une entrée, rouge pour une sortie), obstacles, teintes des
+    cellules initiales, maillage, puis particules.
     """
     k = 1.0 / (res * scale)
     cell_px = res * scale / n
@@ -287,16 +368,22 @@ def render(img: ti.template(), res: int, x0: float, y0: float, scale: float,
             ci = ti.math.clamp(int(xd * n), 0, n - 1)
             cj = ti.math.clamp(int(yd * n), 0, n - 1)
             f = cells[ci, cj]
+            side, kk = band_cell(ci, cj, n, bound)
+            in_band = ci < bound or cj < bound or ci >= n - bound or cj >= n - bound
+            if in_band:
+                c = ti.Vector([0.16, 0.16, 0.19])
+                if side >= 0:
+                    t = wall_type[side, kk]
+                    if t == INLET:
+                        c = ti.Vector([0.15, 0.50, 0.22])
+                    elif t == OUTLET:
+                        c = ti.Vector([0.55, 0.14, 0.14])
             if f & OBSTACLE:
                 c = ti.Vector([0.35, 0.35, 0.35])
-            elif tint_on == 1 and (f & FLUID0):
+            elif not in_band and tint_on == 1 and (f & FLUID0):
                 c = ti.Vector([0.06, 0.10, 0.22])
-            elif tint_on == 1 and (f & SOLID0):
+            elif not in_band and tint_on == 1 and (f & SOLID0):
                 c = ti.Vector([0.22, 0.20, 0.08])
-            if f & INLET:
-                c = c * 0.5 + ti.Vector([0.15, 0.45, 0.20])
-            if f & OUTLET:
-                c = c * 0.5 + ti.Vector([0.45, 0.12, 0.12])
             if grid_on == 1 and cell_px >= 6.0:
                 gx = (xd * n - ci) * cell_px
                 gy = (yd * n - cj) * cell_px
@@ -310,22 +397,24 @@ def render(img: ti.template(), res: int, x0: float, y0: float, scale: float,
         if has_fluid == 1 and alive[p] == 1:
             col = int((x_f[p].x - x0) / k)
             row = res - 1 - int((x_f[p].y - y0) / k)
-            cp = ti.Vector([fr, fg, fb])
-            if fluid_mode == 1:
-                cp = cmap_jet(ti.math.clamp(sc[p] * inv_smax, 0.0, 1.0))
-            elif fluid_mode > 1:
-                cp = cmap_signed(ti.math.clamp(0.5 + 0.5 * sc[p] * inv_smax, 0.0, 1.0))
-            for a, b in ti.ndrange((-r_f, r_f + 1), (-r_f, r_f + 1)):
-                rr, cc = row + a, col + b
-                if 0 <= rr < res and 0 <= cc < res:
-                    img[rr, cc] = ti.cast(cp * 255, ti.u8)
+            if -r_f <= col < res + r_f and -r_f <= row < res + r_f:      # hors champ : rien à dessiner
+                cp = ti.Vector([fr, fg, fb])
+                if fluid_mode == 1:
+                    cp = cmap_jet(ti.math.clamp(sc[p] * inv_smax, 0.0, 1.0))
+                elif fluid_mode > 1:
+                    cp = cmap_signed(ti.math.clamp(0.5 + 0.5 * sc[p] * inv_smax, 0.0, 1.0))
+                for a, b in ti.ndrange((-r_f, r_f + 1), (-r_f, r_f + 1)):
+                    rr, cc = row + a, col + b
+                    if 0 <= rr < res and 0 <= cc < res:
+                        img[rr, cc] = ti.cast(cp * 255, ti.u8)
 
     for p in x_s:
         if has_solid == 1:
             col = int((x_s[p].x - x0) / k)
             row = res - 1 - int((x_s[p].y - y0) / k)
-            cs = col_s[p]
-            for a, b in ti.ndrange((-r_s, r_s + 1), (-r_s, r_s + 1)):
-                rr, cc = row + a, col + b
-                if 0 <= rr < res and 0 <= cc < res:
-                    img[rr, cc] = ti.cast(cs * 255, ti.u8)
+            if -r_s <= col < res + r_s and -r_s <= row < res + r_s:
+                cs = col_s[p]
+                for a, b in ti.ndrange((-r_s, r_s + 1), (-r_s, r_s + 1)):
+                    rr, cc = row + a, col + b
+                    if 0 <= rr < res and 0 <= cc < res:
+                        img[rr, cc] = ti.cast(cs * 255, ti.u8)
