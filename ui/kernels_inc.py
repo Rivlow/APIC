@@ -7,11 +7,14 @@ imposée, Neumann). Les cellules de sortie sont de l'air : pression nulle, écou
 
 On résout A q = b avec q = dt p / rho, A = laplacien positif à 5 points sur les cellules fluides
 (deg = nombre de voisins non solides), b = -dx (u_e - u_w + v_n - v_s), puis u -= grad q.
+Correction de volume : les particules se tassent (la vitesse interpolée aux particules n'est pas à divergence
+nulle près de la surface libre) et le volume d'eau vu par la grille diminue ; le second membre vise donc la
+divergence alpha (rho/rho0 - 1)+ / dt, qui redilate les cellules trop denses (particle_density, cg_init).
 Le gradient conjugué vit sur le GPU : `cg` = [rr, pAp, rr_new] ; α et β sont calculés dans les kernels.
 """
 import taichi as ti
 
-from Solver.boundary import INLET, OBSTACLE, OUTLET, band_bc, band_cell
+from Solver.boundary import INLET, OBSTACLE, OUTLET, band_bc, band_cell, outlet_q
 
 AIR, FLUID, SOLID, MOVING = 0, 1, 2, 3       # MOVING : cellule occupée par le solide MPM (vitesse = celle du solide)
 
@@ -108,7 +111,6 @@ def mac_classify(ctype: ti.template(), cells: ti.template(), wall_type: ti.templ
                 ctype[ci, cj] = FLUID
 
 
-# ---------------------------------------------------------------- 3. gravité + vitesses imposées
 @ti.kernel
 def mac_bc(u: ti.template(), v: ti.template(), ctype: ti.template(), wall_type: ti.template(), wall_v: ti.template(),
            wall_d: ti.template(),
@@ -180,7 +182,22 @@ def add_accel(grid_v: ti.template(), grid_m: ti.template(), fp: ti.template(), d
             grid_v[i, j] += dt * fp[i, j]
 
 
-# ---------------------------------------------------------------- 4. gradient conjugué
+# ---------------------------------------------------------------- 4. densité des particules + gradient conjugué
+@ti.kernel
+def particle_density(x: ti.template(), alive: ti.template(), dens: ti.template(), inv_dx: float, ppc: int):
+    """rho / rho0 aux centres des cellules : somme des poids B-spline quadratiques des particules, divisée par
+    ppc² (densité nominale = 1)."""
+    for i, j in dens:
+        dens[i, j] = 0.0
+    inv = 1.0 / (ppc * ppc)
+    for p in x:
+        if alive[p] == 1:
+            base, fx = stencil(x[p], inv_dx, 0.5, 0.5)                      # centres des cellules
+            w = weights(fx)
+            for i, j in ti.static(ti.ndrange(3, 3)):
+                dens[base + ti.Vector([i, j])] += w[i].x * w[j].y * inv
+
+
 @ti.func
 def apply_A(q, ctype, i, j, n):
     """(A q)_ij = deg q_ij - somme des q des voisins fluides (air : q = 0 ; solide : exclu)."""
@@ -199,15 +216,30 @@ def apply_A(q, ctype, i, j, n):
 
 @ti.kernel
 def cg_init(q: ti.template(), r: ti.template(), pd: ti.template(), rhs: ti.template(),
-            u: ti.template(), v: ti.template(), ctype: ti.template(), cg: ti.template(), dx: float, n: int):
-    """Second membre, résidu initial r = b - A q (q = pression précédente comme point de départ)."""
+            u: ti.template(), v: ti.template(), ctype: ti.template(), cg: ti.template(),
+            wall_type: ti.template(), wall_d: ti.template(), wall_p: ti.template(),
+            dx: float, dt: float, inv_rho: float, n: int, bound: int):
+    """Second membre, résidu initial r = b - A q (q = pression précédente comme point de départ).
+    Cellules d'air : pression de Dirichlet connue, 0 (surface libre) ou pression imposée d'une sortie
+    (outlet_q) ; reportée dans le second membre des cellules fluides voisines
+    (deg q_i - somme q_j fluides = b + somme q_air), et lue telle quelle par mac_project."""
+    for i, j in ctype:
+        if ctype[i, j] != FLUID:
+            q[i, j] = 0.0
+            if ctype[i, j] == AIR:
+                q[i, j] = outlet_q(wall_type, wall_d, wall_p, i, j, n, bound, dt, inv_rho)
     for i, j in ctype:
         if ctype[i, j] == FLUID:
-            rhs[i, j] = -dx * (u[i + 1, j] - u[i, j] + v[i, j + 1] - v[i, j])
+            b = -dx * (u[i + 1, j] - u[i, j] + v[i, j + 1] - v[i, j])
+            for di, dj in ti.static(((1, 0), (-1, 0), (0, 1), (0, -1))):
+                ni, nj = i + di, j + dj
+                if 0 <= ni < n and 0 <= nj < n:
+                    if ctype[ni, nj] == AIR:
+                        b += q[ni, nj]
+            rhs[i, j] = b
         else:
             rhs[i, j] = 0.0
-            q[i, j] = 0.0
-    rr = 0.0                                          # réduction locale (pas d'atomiques sur une seule case)
+    rr = 0.0                                         # réduction locale (pas d'atomiques sur une seule case)
     for i, j in ctype:
         if ctype[i, j] == FLUID:
             r[i, j] = rhs[i, j] - apply_A(q, ctype, i, j, n)
@@ -246,6 +278,91 @@ def cg_update(q: ti.template(), r: ti.template(), pd: ti.template(), Ap: ti.temp
         if ctype[i, j] == FLUID:
             pd[i, j] = r[i, j] + beta * pd[i, j]
     cg[0] = cg[2]
+
+
+# ---------------------------------------------------------------- 4 bis. projection de densité (positions)
+# Deuxième projection, séparée de celle des vitesses (comme DFSPH : solveur de divergence + solveur de densité
+# constante ; Kugelstadt et al. 2019 sur grille). La projection de vitesse rend u à divergence nulle sur la grille,
+# mais la vitesse interpolée aux particules ne l'est pas près de la surface libre : les particules se tassent et
+# le volume d'eau vu par la grille diminue. On corrige donc les POSITIONS, sans toucher aux vitesses (pas
+# d'énergie injectée) : dilatation div(dx_p) = e = rho/rho0 - 1, soit dx_p = -grad phi avec
+# A phi = dx² e (même laplacien que la pression, air et sorties : phi = 0, solides exclus).
+@ti.kernel
+def density_cg_init(phi: ti.template(), r: ti.template(), pd: ti.template(), rhs: ti.template(),
+                    dens: ti.template(), ctype: ti.template(), cg: ti.template(), kappa: float, dx: float, n: int):
+    """Second membre kappa dx² e : e = rho/rho0 - 1 dans les deux sens à l'intérieur (corriger seulement les
+    excès, avec le bruit du semis, gonfle le fluide) ; surdensité seulement dans une cellule de surface (voisine
+    de l'air), naturellement sous-dense car partiellement remplie. Point de départ : phi = 0."""
+    for i, j in ctype:
+        phi[i, j] = 0.0
+        rhs[i, j] = 0.0
+        if ctype[i, j] == FLUID:
+            # bord : voisin d'air (cellule partiellement remplie) ou de solide (noyau de densité tronqué, pas de
+            # particules de l'autre côté) -> densité sous-estimée, on n'y corrige que la surdensité
+            surface = False
+            for di, dj in ti.static(((1, 0), (-1, 0), (0, 1), (0, -1))):
+                ni, nj = i + di, j + dj
+                if 0 <= ni < n and 0 <= nj < n:
+                    if ctype[ni, nj] != FLUID:
+                        surface = True
+            e = dens[i, j] - 1.0
+            if surface:
+                e = ti.max(e, 0.0)
+            rhs[i, j] = kappa * dx * dx * e
+    rr = 0.0
+    for i, j in ctype:
+        r[i, j] = rhs[i, j]
+        pd[i, j] = rhs[i, j]
+        rr += rhs[i, j] * rhs[i, j]
+    cg[0] = rr
+
+
+@ti.kernel
+def density_gradient(phi: ti.template(), du: ti.template(), dv: ti.template(), ctype: ti.template(),
+                     dx: float, n: int):
+    """Déplacement sur les faces : -(phi_j - phi_i) / dx entre deux cellules non solides dont l'une est fluide
+    (air : phi = 0) ; 0 ailleurs (aucune poussée vers un mur, un obstacle ou le solide MPM)."""
+    for i, j in du:
+        val = 0.0
+        if 0 < i < n:
+            tl, tr = ctype[i - 1, j], ctype[i, j]
+            if tl < SOLID and tr < SOLID and (tl == FLUID or tr == FLUID):
+                val = -(phi[i, j] - phi[i - 1, j]) / dx
+        du[i, j] = val
+    for i, j in dv:
+        val = 0.0
+        if 0 < j < n:
+            tb, tt = ctype[i, j - 1], ctype[i, j]
+            if tb < SOLID and tt < SOLID and (tb == FLUID or tt == FLUID):
+                val = -(phi[i, j] - phi[i, j - 1]) / dx
+        dv[i, j] = val
+
+
+@ti.kernel
+def density_shift(x: ti.template(), alive: ti.template(), du: ti.template(), dv: ti.template(),
+                  ctype: ti.template(), inv_dx: float, dx: float, bound: int, n: int):
+    """x_p += déplacement interpolé depuis les faces (mêmes poids que mac_g2p), borné à 0,5 dx par composante,
+    puis écrêté à la bande de paroi. Les vitesses ne changent pas. Un déplacement qui ferait entrer la particule
+    dans une cellule solide (obstacle, paroi, solide MPM) est refusé : la correction de densité ne doit jamais
+    pousser du fluide dans une structure (le couplage fluide-structure s'emballe)."""
+    lo, hi = bound * dx, 1.0 - bound * dx
+    for p in x:
+        if alive[p] == 1:
+            base, fx = stencil(x[p], inv_dx, 0.0, 0.5)
+            w = weights(fx)
+            sx = 0.0
+            for i, j in ti.static(ti.ndrange(3, 3)):
+                sx += w[i].x * w[j].y * du[base + ti.Vector([i, j])]
+            base2, fx2 = stencil(x[p], inv_dx, 0.5, 0.0)
+            w2 = weights(fx2)
+            sy = 0.0
+            for i, j in ti.static(ti.ndrange(3, 3)):
+                sy += w2[i].x * w2[j].y * dv[base2 + ti.Vector([i, j])]
+            d = ti.math.clamp(ti.Vector([sx, sy]), -0.5 * dx, 0.5 * dx)
+            xn = ti.math.clamp(x[p] + d, lo, hi)
+            c = (xn * inv_dx).cast(int)
+            if ctype[ti.math.clamp(c.x, 0, n - 1), ti.math.clamp(c.y, 0, n - 1)] < SOLID:
+                x[p] = xn
 
 
 # ---------------------------------------------------------------- 5. projection
@@ -300,6 +417,57 @@ def mac_g2p(x: ti.template(), vel: ti.template(), C: ti.template(), alive: ti.te
             if sw2 > 0:
                 vel[p].y = sv / sw2
                 C[p][1, 0], C[p][1, 1] = cy.x / sw2 * k, cy.y / sw2 * k
+
+
+# ---------------------------------------------------------------- 7. sortie à hauteur imposée = réservoir aval
+@ti.func
+def _spawn(x: ti.template(), vel: ti.template(), C: ti.template(), J: ti.template(), alive: ti.template(),
+           free_stack: ti.template(), free_top: ti.template(), xp, vp):
+    idx = ti.atomic_sub(free_top[0], 1) - 1
+    if idx >= 0:
+        p = free_stack[idx]
+        x[p] = xp
+        vel[p] = vp
+        C[p] = ti.Matrix.zero(ti.f32, 2, 2)
+        J[p] = 1.0
+        alive[p] = 1
+    else:
+        ti.atomic_add(free_top[0], 1)                 # plus de slot libre : on rend ce qu'on a pris
+
+
+@ti.kernel
+def emit_pressure_outlet(x: ti.template(), vel: ti.template(), C: ti.template(), J: ti.template(),
+                         alive: ti.template(), wall_type: ti.template(), wall_d: ti.template(), wall_p: ti.template(),
+                         acc: ti.template(), ctype: ti.template(), u: ti.template(), v: ti.template(), ppc: int,
+                         free_stack: ti.template(), free_top: ti.template(), dt: float, dx: float, bound: int, n: int):
+    """Sortie à pression imposée p > 0 (il y a de l'eau dehors) : si le gradient de pression fait RENTRER
+    l'écoulement (vitesse de face projetée v_n > 0, cellule devant le mur fluide), l'eau qui entre est émise au
+    flux, comme par une entrée : ppc² v_n dt / dx particules par pas (fraction reportée dans acc), dans la lame
+    [mur, mur + v_n dt], à la vitesse normale v_n. Sinon l'eau aspirée laisserait un vide. La sortie de l'eau
+    ne demande rien : les particules qui franchissent le mur sont détruites (advect_fluid)."""
+    ppc2 = float(ppc * ppc)
+    for side, k in wall_type:
+        if wall_type[side, k] == OUTLET and wall_p[side, k] > 0.0 and bound <= k < n - bound:
+            d = wall_d[side, k]
+            ai, aj, vn = 0, 0, 0.0
+            nrm = ti.Vector([0.0, 0.0])                # normale rentrante
+            if side == 0:                             # LEFT
+                ai, aj, vn, nrm = d, k, u[d, k], ti.Vector([1.0, 0.0])
+            elif side == 1:                           # RIGHT
+                ai, aj, vn, nrm = n - d - 1, k, -u[n - d, k], ti.Vector([-1.0, 0.0])
+            elif side == 2:                           # BOTTOM
+                ai, aj, vn, nrm = k, d, v[k, d], ti.Vector([0.0, 1.0])
+            else:                                     # TOP
+                ai, aj, vn, nrm = k, n - d - 1, -v[k, n - d], ti.Vector([0.0, -1.0])
+            if ctype[ai, aj] == FLUID and vn > 0.0:
+                acc[side, k] += ppc2 * vn * dt / dx
+                count = int(acc[side, k])
+                acc[side, k] -= count
+                wall = ti.Vector([(ai + 0.5) * dx, (aj + 0.5) * dx]) - 0.5 * dx * nrm     # point du mur
+                tang = ti.Vector([nrm.y, nrm.x])
+                for _ in range(count):
+                    xp = wall + nrm * (ti.random() * vn * dt) + tang * (ti.random() - 0.5) * dx
+                    _spawn(x, vel, C, J, alive, free_stack, free_top, xp, nrm * vn)
 
 
 @ti.kernel

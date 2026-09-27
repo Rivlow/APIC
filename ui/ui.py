@@ -478,7 +478,8 @@ class UI(QMainWindow):
         row(self.item_ic, "Obstacles", f"{n_o} cellules" if n_o else "aucun")
 
         row(self.item_bc, "Par défaut", f"mur glissant, bande de {p['bound']} cellules")
-        wtype, _, wdepth = r.wall_table()
+        tab = r.wall_table()
+        wdepth = tab.depth
         if not r.walls:
             row(self.item_bc, "Segments", "aucun (clic sur un bord du domaine)")
         for k, w in enumerate(r.walls, start=1):
@@ -489,6 +490,8 @@ class UI(QMainWindow):
             moved = int((wdepth[s, k0:k1] > p["bound"]).sum()) if k1 > k0 else 0
             kind = "entrée" if w["type"] == "inlet" else "sortie"
             vel = f" v = ({w['velocity'][0]:g}, {w['velocity'][1]:g})," if w["type"] == "inlet" else ""
+            if w["type"] == "outlet":
+                vel = f" pression imposée p = {w['pressure']:g}," if w.get("pressure") else " libre (p = 0),"
             note = f", portée par la face d'un obstacle sur {moved} cellules" if moved else ""
             row(self.item_bc, f"{k}. paroi {SIDE_LABELS[w['side']]}",
                 f"{kind},{vel} {axis} ∈ [{w['span'][0]:.3f}, {w['span'][1]:.3f}]{note}")
@@ -536,15 +539,22 @@ class UI(QMainWindow):
         self.spin_wvy = QDoubleSpinBox()
         self.spin_wvy.setRange(-100, 100)
         grid.addWidget(self.spin_wvy, base + 3, 1)
+        grid.addWidget(QLabel("Sortie : pression p"), base + 4, 0)
+        self.spin_wp = QDoubleSpinBox()                 # pression imposée sur une sortie, 0 = libre
+        self.spin_wp.setRange(0.0, 1e9)
+        self.spin_wp.setDecimals(3)
+        self.spin_wp.setSpecialValueText("libre (p = 0)")
+        self.spin_wp.setToolTip("Pression imposée sur la sortie (Dirichlet, mode incompressible) ; 0 = sortie libre")
+        grid.addWidget(self.spin_wp, base + 4, 1)
         self._wall_buttons = []
         for row, (text, kind) in enumerate([("Entrée (vx, vy)", "inlet"), ("Sortie", "outlet"), ("Mur (effacer)", "wall")],
-                                           start=base + 4):
+                                           start=base + 5):
             b = QPushButton(text)
             b.clicked.connect(lambda _=False, k=kind: self._apply_wall(k))
             b.setEnabled(False)
             grid.addWidget(b, row, 0, 1, 2)
             self._wall_buttons.append(b)
-        base = base + 7
+        base = base + 8
         # ---- affichage
         sep2 = QFrame()
         sep2.setFrameShape(QFrame.Shape.HLine)
@@ -727,8 +737,9 @@ class UI(QMainWindow):
             return
         side, k0, k1 = self.viewport.wsel
         n = self.runner.n
+        pressure = self.spin_wp.value() if kind == "outlet" and self.spin_wp.value() > 0 else None
         self.runner.set_wall(side, kind, velocity=(self.spin_wvx.value(), self.spin_wvy.value()),
-                             span=(k0 / n, (k1 + 1) / n))
+                             span=(k0 / n, (k1 + 1) / n), pressure=pressure)
         self._mark_dirty()
 
     # ------------------------------------------------------------ fichiers

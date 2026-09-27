@@ -75,7 +75,7 @@ grid_v = ti.Vector.field(2, ti.f32, (n_grid, n_grid))
 grid_m = ti.field(ti.f32, (n_grid, n_grid))
 cells = ti.field(ti.i32, (n_grid, n_grid))            # bit OBSTACLE = pilier
 cells.from_numpy(np.where(pillars, OBSTACLE, 0).astype(np.int32))
-wall_type, wall_v, wall_d = walls.fields(n_grid, bound, pillars)
+wall_type, wall_v, wall_d, _ = walls.fields(n_grid, bound, pillars)
 grid_e = ti.field(ti.f32, (n_grid, n_grid))           # allongement pondéré (endommagement non local)
 grid_w = ti.field(ti.f32, (n_grid, n_grid))           # somme des poids associée
 

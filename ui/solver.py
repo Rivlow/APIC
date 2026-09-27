@@ -61,13 +61,13 @@ def _solid_points(cells: np.ndarray, ppc: int) -> np.ndarray:
 
 
 class Solver:
-    def __init__(self, params: dict, matrices: dict, wall_table: tuple[np.ndarray, np.ndarray, np.ndarray]):
+    def __init__(self, params: dict, matrices: dict, wall_table):
         self.arch = ensure_taichi()
         self.p = dict(params)
         p = self.p
         n, ppc, bound = p["n"], p["ppc"], p["bound"]
         m = matrices
-        wtype, wvel, wdepth = wall_table               # (4, n) i32, (4, n, 2) f32, (4, n) i32 : voir Walls.table
+        wtype, wvel, wdepth, wpress = wall_table       # Solver.walls.WallTable (4, n) : type, v, depth, pressure
         lo, hi = bound / n, 1.0 - bound / n           # bande de paroi : le stencil 3x3 sortirait de la grille
 
         # ---- semis (numpy, une fois) ; vitesse initiale = celle de la cellule d'origine
@@ -85,17 +85,23 @@ class Solver:
         # ---- grille des cellules (bits) ; les conditions aux limites sont sur les parois (wtype, wvel)
         cells = (m["fluid"] * K.FLUID0 | m["solid"] * K.SOLID0 | m["obstacle"] * K.OBSTACLE).astype(np.int32)
         self.has_inlet, self.has_outlet = bool((wtype == K.INLET).any()), bool((wtype == K.OUTLET).any())
+        self.incompressible = bool(p.get("incompressible", False))
+        # sortie à pression imposée p > 0 : l'eau peut aussi y rentrer (mode incompressible)
+        self.has_pressure_outlet = bool((wpress > 0).any()) and self.incompressible
+        if not self.incompressible and (wpress != 0).any():     # pression imposée ignorée : sorties libres
+            print("[solver] pression imposée en sortie ignorée : elle n'agit que sur la projection "
+                  "incompressible (incompressible=True)")
+            wpress = np.zeros_like(wpress)
 
         # ---- capacités
         self.n_fluid_init = len(xf)
         self.has_fluid = self.n_fluid_init > 0 or self.has_inlet
         cap = self.n_fluid_init
-        if self.has_inlet:
+        if self.has_inlet or self.has_pressure_outlet:
             cap = max(cap, p["capacity"] or ppc * ppc * n * n)
         self.capacity = max(cap, 1)                    # dense(ti.i, 0) est invalide
         self.n_solid = len(xs)
         self.has_solid = self.n_solid > 0
-        self.incompressible = bool(p.get("incompressible", False))
         self._x0f = np.zeros((self.capacity, 2), np.float32)
         self._v0f = np.zeros((self.capacity, 2), np.float32)
         self._x0f[:self.n_fluid_init], self._v0f[:self.n_fluid_init] = xf, vf
@@ -124,7 +130,8 @@ class Solver:
         fb.dense(ti.ij, (n, n)).place(self.grid_v, self.grid_m, self.grid_e, self.grid_w, self.cells)
         self.wall_type, self.wall_v, self.emit_acc = ti.field(ti.i32), ti.Vector.field(2, ti.f32), ti.field(ti.f32)
         self.wall_d = ti.field(ti.i32)                 # position du mur (cellules depuis le bord) : bande ou face d'obstacle
-        fb.dense(ti.ij, (4, n)).place(self.wall_type, self.wall_v, self.emit_acc, self.wall_d)
+        self.wall_p = ti.field(ti.f32)                 # pression imposée sur une sortie (0 : sortie libre)
+        fb.dense(ti.ij, (4, n)).place(self.wall_type, self.wall_v, self.emit_acc, self.wall_d, self.wall_p)
         self.img = ti.Vector.field(3, ti.u8)
         fb.dense(ti.ij, (p["res"], p["res"])).place(self.img)
         if self.incompressible:                        # grille décalée + gradient conjugué
@@ -139,12 +146,19 @@ class Solver:
             fb.dense(ti.i, 3).place(self.cg)
             self.fp = ti.Vector.field(2, ti.f32)      # accélération de pression sur les nœuds du solide
             fb.dense(ti.ij, (n, n)).place(self.fp)
+            # projection de densité (positions) : rho / rho0 aux centres, potentiel phi, déplacement sur les faces
+            self.dens, self.phi = ti.field(ti.f32), ti.field(ti.f32)
+            fb.dense(ti.ij, (n, n)).place(self.dens, self.phi)
+            self.du, self.dv = ti.field(ti.f32), ti.field(ti.f32)
+            fb.dense(ti.ij, (n + 1, n)).place(self.du)
+            fb.dense(ti.ij, (n, n + 1)).place(self.dv)
         self._tree = fb.finalize()
 
         self.cells.from_numpy(cells)
         self.wall_type.from_numpy(np.ascontiguousarray(wtype, np.int32))
         self.wall_v.from_numpy(np.ascontiguousarray(wvel, np.float32))
         self.wall_d.from_numpy(np.ascontiguousarray(wdepth, np.int32))
+        self.wall_p.from_numpy(np.ascontiguousarray(wpress, np.float32))
         self.t = 0.0
         self.last_step_ms = 0.0
         self.cg_last_iters = 0
@@ -217,12 +231,31 @@ class Solver:
         """Projection de pression : `cg_iters` itérations de gradient conjugué, entièrement sur le GPU,
         sans aucune lecture (le point de départ est la pression du sous-pas précédent)."""
         p = self.p
-        M.cg_init(self.q, self.r, self.pd, self.rhs, self.u, self.v, self.ctype, self.cg, self.dx, p["n"])
+        M.cg_init(self.q, self.r, self.pd, self.rhs, self.u, self.v, self.ctype, self.cg,
+                  self.wall_type, self.wall_d, self.wall_p, self.dx, self.dt, 1.0 / p["fluid_rho"],
+                  p["n"], p["bound"])
         for _ in range(p["cg_iters"]):
             M.cg_apply(self.pd, self.Ap, self.ctype, self.cg, p["n"])
             M.cg_update(self.q, self.r, self.pd, self.Ap, self.ctype, self.cg)
         self.cg_last_iters = p["cg_iters"]
         M.mac_project(self.u, self.v, self.q, self.ctype, self.dx, p["n"])
+
+    def _density_projection(self) -> None:
+        """Deuxième projection, sur les POSITIONS (voir kernels_inc, 4 bis) : les particules tassées sont
+        redistribuées pour que rho = rho0, sans toucher aux vitesses. `density_iters` itérations de gradient
+        conjugué (tampons r, pd, Ap, rhs, cg partagés avec la pression), sans lecture."""
+        p = self.p
+        kappa = float(p["volume_correction"])
+        if kappa <= 0.0:
+            return
+        n = p["n"]
+        M.particle_density(self.x_f, self.alive, self.dens, self.inv_dx, int(p["ppc"]))
+        M.density_cg_init(self.phi, self.r, self.pd, self.rhs, self.dens, self.ctype, self.cg, kappa, self.dx, n)
+        for _ in range(int(p["density_iters"])):
+            M.cg_apply(self.pd, self.Ap, self.ctype, self.cg, n)
+            M.cg_update(self.phi, self.r, self.pd, self.Ap, self.ctype, self.cg)
+        M.density_gradient(self.phi, self.du, self.dv, self.ctype, self.dx, n)
+        M.density_shift(self.x_f, self.alive, self.du, self.dv, self.ctype, self.inv_dx, self.dx, p["bound"], n)
 
     def _solid_substep(self, dt_s: float, with_pressure: bool) -> None:
         """Un pas MPM du solide seul sur la grille collocalisée (+ accélération de pression du fluide)."""
@@ -269,6 +302,7 @@ class Solver:
                              -(p["fluid_rho"] / p["solid_rho"]) / dt, n)
         M.mac_g2p(self.x_f, self.v_f, self.C_f, self.alive, self.u, self.v, self.mu, self.mv, inv_dx, dx)
         self._advect_and_emit(dt)
+        self._density_projection()
 
     def _advect_and_emit(self, dt: float) -> None:
         p, dx, inv_dx, n, bound = self.p, self.dx, self.inv_dx, self.p["n"], self.p["bound"]
@@ -277,6 +311,10 @@ class Solver:
         if self.has_inlet:
             K.emit_wall(self.x_f, self.v_f, self.C_f, self.J_f, self.alive, self.wall_type, self.wall_v,
                         self.wall_d, self.emit_acc, float(p["ppc"] * p["ppc"]), self.free_stack, self.free_top, dt, dx, bound, n)
+        if self.has_pressure_outlet:
+            M.emit_pressure_outlet(self.x_f, self.v_f, self.C_f, self.J_f, self.alive, self.wall_type, self.wall_d,
+                                   self.wall_p, self.emit_acc, self.ctype, self.u, self.v, int(p["ppc"]),
+                                   self.free_stack, self.free_top, dt, dx, bound, n)
 
     # ------------------------------------------------------------ simulation (faiblement compressible)
     def _substep(self) -> None:

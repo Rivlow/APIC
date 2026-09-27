@@ -27,7 +27,7 @@ import json
 
 import numpy as np
 
-from Solver.walls import SIDES, Walls  # noqa: F401  (SIDES réexporté pour ui.ui ; numpy seul, sans Taichi)
+from Solver.walls import SIDES, WallTable, Walls  # noqa: F401  (SIDES réexporté pour ui.ui ; numpy seul, sans Taichi)
 
 
 class SimulationRunner:
@@ -38,7 +38,8 @@ class SimulationRunner:
         "solid_rho": 2.0, "solid_E": 3000.0, "solid_nu": 0.3,
         "eps0": 0.05, "epsf": 0.2, "tau_D": 2e-3, "k_res": 1e-3,
         "use_damage": True, "use_rupture": True, "color_mode": 0,
-        "incompressible": False, "cg_iters": 150, "free_surface": True,
+        "incompressible": False, "cg_iters": 150, "free_surface": True, "volume_correction": 1.0,
+        "density_iters": 20,
     }
     LABELS = {
         "n": "Grille n × n", "bound": "Cellules de bord", "ppc": "Particules / côté de cellule",
@@ -50,6 +51,8 @@ class SimulationRunner:
         "use_damage": "Endommagement", "use_rupture": "Rupture", "color_mode": "Couleur solide",
         "incompressible": "Fluide incompressible", "cg_iters": "CG : nombre d'itérations ",
         "free_surface": "Surface libre (cellule vide : p = 0)",
+        "volume_correction": "Correction de densité (positions, 0 = aucune)",
+        "density_iters": "Correction de densité : itérations CG",
     }
     STRUCTURAL = ("n", "bound", "ppc", "capacity", "seed", "res", "incompressible")
     BOOL = ("fluid", "solid", "obstacle")
@@ -134,17 +137,18 @@ class SimulationRunner:
             self.m[k][mask] = 0.0
 
     # ------------------------------------------------------------ définition (parois)
-    def set_wall(self, side: str, kind: str, velocity=(0.0, 0.0), span=(0.0, 1.0)) -> None:
+    def set_wall(self, side: str, kind: str, velocity=(0.0, 0.0), span=(0.0, 1.0), pressure=None) -> None:
         """Condition limite sur un mur : side dans left/right/bottom/top, kind dans wall/inlet/outlet,
         span = étendue le long du mur en unités domaine (x pour bottom/top, y pour left/right).
-        Un nouveau segment remplace les anciens là où il les recouvre."""
-        self._walls.set(side, kind, velocity, span)
+        pressure (sortie seulement) : pression imposée p, uniforme sur le segment (mode incompressible) ;
+        None = 0 (sortie libre). Un nouveau segment remplace les anciens là où il les recouvre."""
+        self._walls.set(side, kind, velocity, span, pressure)
 
     def clear_wall(self, side: str, span=(0.0, 1.0)) -> None:
         self._walls.clear(side, span)
 
-    def wall_table(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Rastérisation des segments : wtype, wvel, wdepth (voir Walls.table) ; un obstacle collé à une
+    def wall_table(self) -> WallTable:
+        """Rastérisation des segments : type, v, depth, pressure (voir Solver.walls.WallTable) ; un obstacle collé à une
         entrée / sortie en porte la condition sur sa face qui regarde l'intérieur du domaine."""
         return self._walls.table(self.n, self.p["bound"], self.m["obstacle"])
 

@@ -50,7 +50,7 @@ grid_m = ti.field(ti.f32, (nx_grid, nx_grid))                 # Mass
 
 cells = ti.field(ti.i32, (nx_grid, nx_grid))                  # bit OBSTACLE : noeud bloqué
 cells.from_numpy(np.where(obstacle, OBSTACLE, 0).astype(np.int32))
-wall_type, wall_v, wall_d = walls.fields(nx_grid, bound, obstacle)   # table des parois (4, n)
+wall_type, wall_v, wall_d, _ = walls.fields(nx_grid, bound, obstacle)   # table des parois (4, n)
 Image = ti.Vector.field(3, ti.f32, (nx_grid, nx_grid))
 
 

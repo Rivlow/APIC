@@ -120,8 +120,8 @@ def G2P_fluid(grid_v: ti.template(),
 def advect_fluid(x: ti.template(), v: ti.template(), alive: ti.template(), wall_type: ti.template(),
                  wall_d: ti.template(), inv_dx: float, dt: float, bound: int, dx: float, n: int,
                  free_stack: ti.template(), free_top: ti.template()):
-    """Advection ; une particule qui franchit un mur de sortie (ou la face d'obstacle qui le prolonge, à
-    wall_d cellules du bord) est détruite (slot rendu à la pile), sinon elle reste dans [bound dx, 1 - bound dx]."""
+    """Advection ; une particule qui franchit un mur de sortie (ou la face d'obstacle qui le prolonge,
+    à wall_d cellules du bord) est détruite (slot rendu à la pile), sinon elle reste dans [bound dx, 1 - bound dx]."""
     lo, hi = bound * dx, 1.0 - bound * dx
     for p in x:
         if alive[p] == 1:

@@ -4,7 +4,7 @@ sys.path.insert(0, r"C:\Users\lucas\Dev\Fun\APIC")
 from ui.runner import SimulationRunner  # noqa: E402
 
 U = 0.5                                   # vitesse d'entrée (m/s) ; c = sqrt(E/rho) = 20 -> Mach 0.1
-N = 512
+N = 256
 sim = SimulationRunner(n=N, gravity=0.0, fluid_rho=1.0, capacity=int(1.3 * 4 * N * N),
                        incompressible=True, free_surface=False, substeps=2,   # conduit plein : pas d'air, pression résolue partout
                        cg_iters=20)

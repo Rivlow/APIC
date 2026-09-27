@@ -10,8 +10,8 @@
 
 import taichi as ti
 
-from Solver.walls import (BOTTOM, INLET, LEFT, OBSTACLE, OUTLET, RIGHT, SIDES, TOP, WALL,  # noqa: F401
-                          WALL_TYPES, Walls)
+from Solver.walls import (BOTTOM, INLET, LEFT, OBSTACLE, OUTLET, RIGHT, SIDES, TOP,  # noqa: F401
+                          WALL, WALL_TYPES, Walls)
 
 
 @ti.func
@@ -65,6 +65,19 @@ def band_bc(wall_type: ti.template(), wall_v: ti.template(), wall_d: ti.template
         t = wall_type[side, k]
         vel = wall_v[side, k]
     return t, vel
+
+
+@ti.func
+def outlet_q(wall_type: ti.template(), wall_d: ti.template(), wall_p: ti.template(),
+             i: int, j: int, n: int, bound: int, dt: float, inv_rho: float):
+    """Pression imposée d'une cellule de sortie (bande de paroi ou face d'obstacle), en q = dt p / rho ;
+    0 si la cellule n'est pas une sortie."""
+    q = 0.0
+    side, k = band_cell(i, j, n, bound, wall_d)
+    if side >= 0:
+        if wall_type[side, k] == OUTLET:
+            q = dt * wall_p[side, k] * inv_rho
+    return q
 
 
 @ti.func
