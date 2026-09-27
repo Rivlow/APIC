@@ -1,19 +1,20 @@
-"""SimulationRunner : définit une simulation (paramètres + matrices n × n + parois), la sauve en JSON, la lance.
+"""SimulationRunner : définit une simulation (paramètres + matrices nx × ny + parois), la sauve en JSON, la lance.
 
     from ui.runner import SimulationRunner
-    r = SimulationRunner(n=128, gravity=9.81)
-    X, Y = r.centers()                      # centres des cellules, (n, n), X[i, j] = (i + 0.5) dx
-    r.set_fluid(Y < 0.2)                    # masque numpy (n, n) : cellules pleines d'eau
+    r = SimulationRunner(nx=256, ny=64, gravity=9.81)   # ou n=128 : grille carrée
+    X, Y = r.centers()                      # centres des cellules, (nx, ny), X[i, j] = (i + 0.5) dx
+    r.set_fluid(Y < 0.2)                    # masque numpy (nx, ny) : cellules pleines d'eau
     r.set_solid(r.rect(0.55, 0.2, 0.58, 0.55))
     r.set_obstacle(r.circle(0.35, 0.28, 0.05))
     r.set_wall("left", "inlet", velocity=(3.0, 0.0), span=(0.25, 0.45))   # condition limite sur un mur
     r.set_wall("right", "outlet")           # tout le mur droit
+    r.set_wall("bottom", "wall", friction=1.0)   # fond adhérent (0 = glissant, défaut)
     r.save("canal.json")                    # paramètres + matrices + parois, un seul fichier
     s = r.run(150, callback=lambda s, k: print(k, s.stats()["n_fluid"]))   # sans fenêtre
     r.show()                                # interface Qt
 
-Conventions : domaine [0, 1]², matrices indexées [i, j] = (x, y) comme les champs Taichi
-(cells[:, 0] est la rangée du bas). Un seul matériau fluide et un seul solide (paramètres plats).
+Conventions : cellules carrées dx = 1 / max(nx, ny), domaine [0, nx dx] × [0, ny dx] (inclus dans le carré unité,
+r.Lx × r.Ly), matrices indexées [i, j] = (x, y) comme les champs Taichi (cells[:, 0] est la rangée du bas). Un seul matériau fluide et un seul solide (paramètres plats).
 
 Les conditions aux limites n'existent que sur les quatre parois du domaine : un segment de mur
 (côté, étendue le long du mur en unités domaine, type entrée ou sortie, vitesse) ; la paroi par
@@ -32,17 +33,17 @@ from Solver.walls import SIDES, WallTable, Walls  # noqa: F401  (SIDES réexport
 
 class SimulationRunner:
     PARAMS = {
-        "n": 128, "bound": 3, "ppc": 2, "cfl": 0.4, "gravity": 9.81, "substeps": 20, "seed": 0,
+        "nx": 128, "ny": 128, "bound": 3, "ppc": 2, "cfl": 0.4, "gravity": 9.81, "substeps": 20, "seed": 0,
         "capacity": 0, "res": 700,
         "fluid_rho": 1.0, "fluid_E": 400.0,
         "solid_rho": 2.0, "solid_E": 3000.0, "solid_nu": 0.3,
         "eps0": 0.05, "epsf": 0.2, "tau_D": 2e-3, "k_res": 1e-3,
         "use_damage": True, "use_rupture": True, "color_mode": 0,
         "incompressible": False, "cg_iters": 150, "free_surface": True, "volume_correction": 1.0,
-        "density_iters": 20,
+        "density_iters": 20, "obstacle_friction": 1.0,
     }
     LABELS = {
-        "n": "Grille n × n", "bound": "Cellules de bord", "ppc": "Particules / côté de cellule",
+        "nx": "Grille : nx (cellules en x)", "ny": "Grille : ny (cellules en y)", "bound": "Cellules de bord", "ppc": "Particules / côté de cellule",
         "cfl": "CFL", "gravity": "Gravité g", "substeps": "Sous-pas par image", "seed": "Graine",
         "capacity": "Capacité fluide (0 = auto)", "res": "Résolution du rendu",
         "fluid_rho": "Fluide : densité", "fluid_E": "Fluide : raideur E",
@@ -53,19 +54,24 @@ class SimulationRunner:
         "free_surface": "Surface libre (cellule vide : p = 0)",
         "volume_correction": "Correction de densité (positions, 0 = aucune)",
         "density_iters": "Correction de densité : itérations CG",
+        "obstacle_friction": "Obstacles : frottement β (0 glissant, 1 adhérent)",
     }
-    STRUCTURAL = ("n", "bound", "ppc", "capacity", "seed", "res", "incompressible")
+    STRUCTURAL = ("nx", "ny", "bound", "ppc", "capacity", "seed", "res", "incompressible")
     BOOL = ("fluid", "solid", "obstacle")
     FLOAT = ("vx0", "vy0")
 
     def __init__(self, **params):
+        if "n" in params:                           # grille carrée (et anciens fichiers) : n = nx = ny
+            n = int(params.pop("n"))
+            params.setdefault("nx", n)
+            params.setdefault("ny", n)
         unknown = set(params) - set(self.PARAMS)
         if unknown:
             raise KeyError(f"paramètres inconnus : {sorted(unknown)} (connus : {sorted(self.PARAMS)})")
         self.p = {**self.PARAMS, **params}
-        n = self.p["n"]
-        self.m = {k: np.zeros((n, n), bool) for k in self.BOOL}
-        self.m.update({k: np.zeros((n, n), np.float32) for k in self.FLOAT})
+        shape = (self.nx, self.ny)
+        self.m = {k: np.zeros(shape, bool) for k in self.BOOL}
+        self.m.update({k: np.zeros(shape, np.float32) for k in self.FLOAT})
         self._walls = Walls()                       # segments de paroi, le dernier l'emporte
 
     @property
@@ -79,21 +85,39 @@ class SimulationRunner:
 
     # ------------------------------------------------------------ géométrie
     @property
+    def nx(self) -> int:
+        return int(self.p["nx"])
+
+    @property
+    def ny(self) -> int:
+        return int(self.p["ny"])
+
+    @property
     def n(self) -> int:
-        return self.p["n"]
+        """max(nx, ny) : nombre de cellules par unité domaine (dx = 1 / n)."""
+        return max(self.nx, self.ny)
 
     @property
     def dx(self) -> float:
-        return 1.0 / self.p["n"]
+        return 1.0 / self.n
+
+    @property
+    def Lx(self) -> float:
+        return self.nx * self.dx
+
+    @property
+    def Ly(self) -> float:
+        return self.ny * self.dx
 
     @property
     def band(self) -> float:
-        """Épaisseur de la bande de paroi : les particules restent dans [band, 1 - band]."""
+        """Épaisseur de la bande de paroi : les particules restent dans [band, Lx - band] × [band, Ly - band]."""
         return self.p["bound"] * self.dx
 
     def centers(self) -> tuple[np.ndarray, np.ndarray]:
-        c = (np.arange(self.n) + 0.5) * self.dx
-        return np.meshgrid(c, c, indexing="ij")
+        cx = (np.arange(self.nx) + 0.5) * self.dx
+        cy = (np.arange(self.ny) + 0.5) * self.dx
+        return np.meshgrid(cx, cy, indexing="ij")
 
     def rect(self, x0: float, y0: float, x1: float, y1: float) -> np.ndarray:
         X, Y = self.centers()
@@ -105,8 +129,8 @@ class SimulationRunner:
 
     def _mask(self, mask) -> np.ndarray:
         mask = np.asarray(mask, dtype=bool)
-        if mask.shape != (self.n, self.n):
-            raise ValueError(f"masque {mask.shape} attendu ({self.n}, {self.n})")
+        if mask.shape != (self.nx, self.ny):
+            raise ValueError(f"masque {mask.shape} attendu ({self.nx}, {self.ny})")
         return mask
 
     # ------------------------------------------------------------ définition (intérieur)
@@ -137,12 +161,17 @@ class SimulationRunner:
             self.m[k][mask] = 0.0
 
     # ------------------------------------------------------------ définition (parois)
-    def set_wall(self, side: str, kind: str, velocity=(0.0, 0.0), span=(0.0, 1.0), pressure=None) -> None:
+    def set_wall(self, side: str, kind: str, velocity=(0.0, 0.0), span=(0.0, 1.0), pressure=None,
+                 friction=None) -> None:
         """Condition limite sur un mur : side dans left/right/bottom/top, kind dans wall/inlet/outlet,
         span = étendue le long du mur en unités domaine (x pour bottom/top, y pour left/right).
         pressure (sortie seulement) : pression imposée p, uniforme sur le segment (mode incompressible) ;
-        None = 0 (sortie libre). Un nouveau segment remplace les anciens là où il les recouvre."""
-        self._walls.set(side, kind, velocity, span, pressure)
+        None = 0 (sortie libre). friction (mur seulement) : beta dans [0, 1], 0 = glissant (défaut), 1 = adhérent.
+        Un nouveau segment remplace les anciens là où il les recouvre. L'étendue est bornée à la longueur du mur
+        (Ly à gauche / droite, Lx en bas / haut)."""
+        ext = self.Ly if side in ("left", "right") else self.Lx
+        span = (min(max(float(span[0]), 0.0), ext), min(max(float(span[1]), 0.0), ext))
+        self._walls.set(side, kind, velocity, span, pressure, friction)
 
     def clear_wall(self, side: str, span=(0.0, 1.0)) -> None:
         self._walls.clear(side, span)
@@ -150,15 +179,17 @@ class SimulationRunner:
     def wall_table(self) -> WallTable:
         """Rastérisation des segments : type, v, depth, pressure (voir Solver.walls.WallTable) ; un obstacle collé à une
         entrée / sortie en porte la condition sur sa face qui regarde l'intérieur du domaine."""
-        return self._walls.table(self.n, self.p["bound"], self.m["obstacle"])
+        return self._walls.table(self.nx, self.ny, self.p["bound"], self.m["obstacle"])
 
-    def resize(self, n: int) -> None:
-        """Change la grille en rééchantillonnant les matrices (plus proche voisin) ; les parois sont en
-        unités domaine et ne changent pas."""
-        old = self.m["fluid"].shape[0]                # taille réelle des matrices (p["n"] peut déjà avoir changé)
-        idx = np.minimum((np.arange(n) * old / n).astype(int), old - 1)
-        self.m = {k: np.ascontiguousarray(v[idx][:, idx]) for k, v in self.m.items()}
-        self.p["n"] = int(n)
+    def resize(self, nx: int, ny: int | None = None) -> None:
+        """Change la grille en rééchantillonnant les matrices (plus proche voisin) ; les parois sont en unités
+        domaine et ne changent pas. resize(n) : grille carrée."""
+        ny = nx if ny is None else ny
+        ox, oy = self.m["fluid"].shape                 # taille réelle des matrices (p peut déjà avoir changé)
+        ix = np.minimum((np.arange(nx) * ox / nx).astype(int), ox - 1)
+        iy = np.minimum((np.arange(ny) * oy / ny).astype(int), oy - 1)
+        self.m = {k: np.ascontiguousarray(v[ix][:, iy]) for k, v in self.m.items()}
+        self.p["nx"], self.p["ny"] = int(nx), int(ny)
 
     # ------------------------------------------------------------ fichiers
     def to_dict(self) -> dict:
@@ -174,17 +205,17 @@ class SimulationRunner:
 
     @classmethod
     def from_dict(cls, d: dict) -> "SimulationRunner":
-        params = {k: v for k, v in d.get("params", {}).items() if k in cls.PARAMS}
+        params = {k: v for k, v in d.get("params", {}).items() if k in cls.PARAMS or k == "n"}
         r = cls(**params)
-        n = r.n
+        nx, ny = r.nx, r.ny
         legacy = {}
         for k, spec in d.get("matrices", {}).items():
             buf = base64.b64decode(spec["data"])
             if spec["dtype"] == "bool":
-                a = np.unpackbits(np.frombuffer(buf, np.uint8))[:n * n].astype(bool)
+                a = np.unpackbits(np.frombuffer(buf, np.uint8))[:nx * ny].astype(bool)
             else:
                 a = np.frombuffer(buf, np.float32)
-            a = a.reshape(n, n)
+            a = a.reshape(nx, ny)
             if k in r.m:
                 r.m[k] = np.ascontiguousarray(a.astype(r.m[k].dtype))
             elif k in ("inlet", "outlet", "inlet_vx", "inlet_vy"):
@@ -196,14 +227,15 @@ class SimulationRunner:
 
     def _migrate_legacy(self, legacy: dict) -> None:
         """Fichiers v2 : les bandes de cellules d'entrée / sortie collées à un mur deviennent des segments."""
-        n, bound = self.n, self.p["bound"]
+        nx, ny, bound = self.nx, self.ny, self.p["bound"]
+        n = self.n
         depth = bound + 4
-        zeros = np.zeros((n, n), np.float32)
-        inlet = legacy.get("inlet", np.zeros((n, n), bool))
-        outlet = legacy.get("outlet", np.zeros((n, n), bool))
+        zeros = np.zeros((nx, ny), np.float32)
+        inlet = legacy.get("inlet", np.zeros((nx, ny), bool))
+        outlet = legacy.get("outlet", np.zeros((nx, ny), bool))
         ivx, ivy = legacy.get("inlet_vx", zeros), legacy.get("inlet_vy", zeros)
-        I, J = np.meshgrid(np.arange(n), np.arange(n), indexing="ij")
-        dist = {"left": I, "right": n - 1 - I, "bottom": J, "top": n - 1 - J}
+        I, J = np.meshgrid(np.arange(nx), np.arange(ny), indexing="ij")
+        dist = {"left": I, "right": nx - 1 - I, "bottom": J, "top": ny - 1 - J}
         owner = np.argmin(np.stack(list(dist.values())), axis=0)   # mur le plus proche (gauche/droite gagnent les égalités)
         for s, (side, d) in enumerate(dist.items()):  # chaque cellule de bord appartient à un seul mur
             zone = (d < depth) & (owner == s)
@@ -211,13 +243,14 @@ class SimulationRunner:
             for kind, mask in (("outlet", outlet), ("inlet", inlet)):
                 sel_side = mask & zone
                 along = sel_side.any(axis=axis)
+                ln = len(along)
                 k = 0
-                while k < n:
+                while k < ln:
                     if not along[k]:
                         k += 1
                         continue
                     k0 = k
-                    while k < n and along[k]:
+                    while k < ln and along[k]:
                         k += 1
                     run = sel_side & ((J >= k0) & (J < k) if axis == 0 else (I >= k0) & (I < k))
                     perp = d[run]

@@ -50,7 +50,7 @@ grid_m = ti.field(ti.f32, (nx_grid, nx_grid))                 # Mass
 
 cells = ti.field(ti.i32, (nx_grid, nx_grid))                  # bit OBSTACLE : noeud bloqué
 cells.from_numpy(np.where(obstacle, OBSTACLE, 0).astype(np.int32))
-wall_type, wall_v, wall_d, _ = walls.fields(nx_grid, bound, obstacle)   # table des parois (4, n)
+wall_type, wall_v, wall_d, _, wall_f = walls.fields(nx_grid, nx_grid, bound, obstacle)   # table des parois
 Image = ti.Vector.field(3, ti.f32, (nx_grid, nx_grid))
 
 
@@ -108,8 +108,8 @@ def main():
             clear_grid(grid_m, grid_v)
             P2G(fluid, grid_m, grid_v, inv_dx, dx, dt)
 
-            grid_step(grid_m, grid_v, cells, wall_type, wall_v, wall_d,
-                      dt, g, 0.0, bound, nx_grid)
+            grid_step(grid_m, grid_v, cells, wall_type, wall_v, wall_d, wall_f,
+                      dt, g, 0.0, 1.0, bound, nx_grid, nx_grid)      # obstacle adhérent (beta = 1)
 
             G2P(fluid, grid_v, inv_dx, dx, dt)
 

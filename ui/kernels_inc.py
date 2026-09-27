@@ -1,20 +1,21 @@
 """Fluide incompressible : grille décalée (MAC) + projection de pression par gradient conjugué sur GPU.
 
-Grilles : u (n+1, n) sur les faces verticales, en (i, j + 0.5) dx ; v (n, n+1) sur les faces horizontales,
-en (i + 0.5, j) dx ; mu, mv = poids de transfert (0 = face sans particule). Cellules `ctype` (n, n) :
+Grilles (nx × ny cellules carrées, dx = 1 / max(nx, ny)) : u (nx+1, ny) sur les faces verticales, en
+(i, j + 0.5) dx ; v (nx, ny+1) sur les faces horizontales, en (i + 0.5, j) dx ; mu, mv = poids de transfert
+(0 = face sans particule). Cellules `ctype` (nx, ny) :
 AIR = 0 (pression nulle), FLUID = 1 (inconnue), SOLID = 2 (obstacle, entrée, bande de paroi : vitesse
 imposée, Neumann). Les cellules de sortie sont de l'air : pression nulle, écoulement libre.
 
 On résout A q = b avec q = dt p / rho, A = laplacien positif à 5 points sur les cellules fluides
 (deg = nombre de voisins non solides), b = -dx (u_e - u_w + v_n - v_s), puis u -= grad q.
-Correction de volume : les particules se tassent (la vitesse interpolée aux particules n'est pas à divergence
-nulle près de la surface libre) et le volume d'eau vu par la grille diminue ; le second membre vise donc la
-divergence alpha (rho/rho0 - 1)+ / dt, qui redilate les cellules trop denses (particle_density, cg_init).
+Frottement aux parois : faces tangentielles dans une cellule solide = valeur fantôme (1 - 2 beta) u_fluide
+(beta = 0 glissant, 1 adhérent : vitesse moyenne nulle sur la paroi), voir mac_bc. Correction de densité
+sur les positions après l'advection (4 bis).
 Le gradient conjugué vit sur le GPU : `cg` = [rr, pAp, rr_new] ; α et β sont calculés dans les kernels.
 """
 import taichi as ti
 
-from Solver.boundary import INLET, OBSTACLE, OUTLET, band_bc, band_cell, outlet_q
+from Solver.boundary import BOTTOM, INLET, LEFT, OBSTACLE, OUTLET, RIGHT, TOP, band_bc, band_cell, in_band, outlet_q
 
 AIR, FLUID, SOLID, MOVING = 0, 1, 2, 3       # MOVING : cellule occupée par le solide MPM (vitesse = celle du solide)
 
@@ -73,7 +74,8 @@ def mac_p2g(x: ti.template(), vel: ti.template(), C: ti.template(), alive: ti.te
 @ti.kernel
 def mac_classify(ctype: ti.template(), cells: ti.template(), wall_type: ti.template(), wall_v: ti.template(),
                  wall_d: ti.template(), x: ti.template(), alive: ti.template(),
-                 x_s: ti.template(), has_solid: int, inv_dx: float, n: int, bound: int, free_surface: int):
+                 x_s: ti.template(), has_solid: int, inv_dx: float, nx: int, ny: int, bound: int,
+                 free_surface: int):
     """free_surface = 1 : une cellule sans particule est de l'air (p = 0).
     free_surface = 0 : domaine plein, toute cellule non solide est fluide (la pression y est resolue,
     y compris negative).
@@ -82,10 +84,10 @@ def mac_classify(ctype: ti.template(), cells: ti.template(), wall_type: ti.templ
     une particule du solide MPM sont MOVING."""
     for i, j in ctype:
         f = cells[i, j]
-        side, _k = band_cell(i, j, n, bound, wall_d)
-        wall = i < bound or j < bound or i >= n - bound or j >= n - bound or side >= 0
+        side, _k = band_cell(i, j, nx, ny, bound, wall_d)
+        wall = in_band(i, j, nx, ny, bound) or side >= 0
         if wall:
-            t, _ = band_bc(wall_type, wall_v, wall_d, i, j, n, bound)
+            t, _ = band_bc(wall_type, wall_v, wall_d, i, j, nx, ny, bound)
             ctype[i, j] = AIR if t == OUTLET else SOLID
         elif f & OBSTACLE:
             ctype[i, j] = SOLID
@@ -96,77 +98,122 @@ def mac_classify(ctype: ti.template(), cells: ti.template(), wall_type: ti.templ
     for p in x_s:
         if has_solid == 1:
             c = (x_s[p] * inv_dx).cast(int)
-            ci = ti.math.clamp(c.x, 0, n - 1)
-            cj = ti.math.clamp(c.y, 0, n - 1)
+            ci = ti.math.clamp(c.x, 0, nx - 1)
+            cj = ti.math.clamp(c.y, 0, ny - 1)
             if ctype[ci, cj] < SOLID:
                 ctype[ci, cj] = MOVING
     for p in x:
         if alive[p] == 1:
             c = (x[p] * inv_dx).cast(int)
-            ci = ti.math.clamp(c.x, 0, n - 1)
-            cj = ti.math.clamp(c.y, 0, n - 1)
-            side, _k = band_cell(ci, cj, n, bound, wall_d)
-            wall = ci < bound or cj < bound or ci >= n - bound or cj >= n - bound or side >= 0
+            ci = ti.math.clamp(c.x, 0, nx - 1)
+            cj = ti.math.clamp(c.y, 0, ny - 1)
+            side, _k = band_cell(ci, cj, nx, ny, bound, wall_d)
+            wall = in_band(ci, cj, nx, ny, bound) or side >= 0
             if ctype[ci, cj] == AIR and not wall:
                 ctype[ci, cj] = FLUID
 
 
+@ti.func
+def solid_beta(wall_f: ti.template(), i: int, j: int, nx: int, ny: int, bound: int, beta_o: float,
+               horizontal: int) -> float:
+    """Frottement de la cellule solide (i, j) : celui du mur si elle est dans la bande de paroi (horizontal = 1 :
+    face u, tangentielle aux murs du bas / haut, qui ont la priorité dans un coin ; 0 : face v, murs gauche /
+    droite prioritaires), sinon celui des obstacles beta_o."""
+    beta = beta_o
+    on_bt = j < bound or j >= ny - bound
+    on_lr = i < bound or i >= nx - bound
+    if horizontal == 1:
+        if on_bt:
+            beta = wall_f[BOTTOM, i] if j < bound else wall_f[TOP, i]
+        elif on_lr:
+            beta = wall_f[LEFT, j] if i < bound else wall_f[RIGHT, j]
+    else:
+        if on_lr:
+            beta = wall_f[LEFT, j] if i < bound else wall_f[RIGHT, j]
+        elif on_bt:
+            beta = wall_f[BOTTOM, i] if j < bound else wall_f[TOP, i]
+    return beta
+
+
 @ti.kernel
 def mac_bc(u: ti.template(), v: ti.template(), ctype: ti.template(), wall_type: ti.template(), wall_v: ti.template(),
-           wall_d: ti.template(),
-           grid_v: ti.template(), grid_m: ti.template(), dt: float, g: float, n: int, bound: int, with_gravity: int):
-    """Gravité, puis vitesse imposée sur les faces touchant une cellule solide : 0 (paroi, obstacle),
-    (vx, vy) d'une entrée (cellule de bande), ou la vitesse du solide MPM (moyenne des deux nœuds de la
-    grille collocalisée qui encadrent la face) pour une cellule MOVING."""
+           wall_d: ti.template(), wall_f: ti.template(),
+           grid_v: ti.template(), grid_m: ti.template(), dt: float, g: float, beta_o: float,
+           nx: int, ny: int, bound: int, with_gravity: int):
+    """Gravité, puis vitesses sur les faces touchant une cellule solide :
+      - face normale (entre une cellule solide et une non solide) : 0 (imperméable), (vx, vy) d'une entrée, ou la
+        vitesse du solide MPM (moyenne des deux nœuds de la grille collocalisée qui encadrent la face) ;
+      - face tangentielle (entre deux cellules solides fixes, à côté d'une rangée fluide) : valeur fantôme
+        (1 - 2 beta) u_fluide, u_fluide = face voisine côté fluide. beta = 0 : glissant (gradient nul),
+        beta = 1 : adhérent (moyenne nulle sur la paroi). beta : frottement du mur (wall_f) ou des obstacles."""
     for I in ti.grouped(v):
         if with_gravity == 1:
             v[I] -= dt * g
     for i, j in u:                                    # face entre les cellules (i-1, j) et (i, j), nœuds (i, j) et (i, j+1)
-        il, ir = ti.math.clamp(i - 1, 0, n - 1), ti.math.clamp(i, 0, n - 1)
+        il, ir = ti.math.clamp(i - 1, 0, nx - 1), ti.math.clamp(i, 0, nx - 1)
         tl, tr = ctype[il, j], ctype[ir, j]
         if tl >= SOLID or tr >= SOLID:
             val = 0.0
-            bl, vl = band_bc(wall_type, wall_v, wall_d, il, j, n, bound)
-            br, vr = band_bc(wall_type, wall_v, wall_d, ir, j, n, bound)
+            bl, vl = band_bc(wall_type, wall_v, wall_d, il, j, nx, ny, bound)
+            br, vr = band_bc(wall_type, wall_v, wall_d, ir, j, nx, ny, bound)
             if bl == INLET:
                 val = vl.x
             elif br == INLET:
                 val = vr.x
             elif tl == MOVING or tr == MOVING:
-                ii, j1 = ti.math.clamp(i, 0, n - 1), ti.math.clamp(j + 1, 0, n - 1)
+                ii, j1 = ti.math.clamp(i, 0, nx - 1), ti.math.clamp(j + 1, 0, ny - 1)
                 m0, m1 = grid_m[ii, j], grid_m[ii, j1]
                 if m0 + m1 > 0:
                     val = (grid_v[ii, j].x * m0 + grid_v[ii, j1].x * m1) / (m0 + m1)
+            elif tl == SOLID and tr == SOLID and 0 < i < nx:
+                # face tangentielle : voisine fluide au-dessus ou au-dessous (ses deux cellules non solides)
+                jn = -1
+                if j + 1 < ny and ctype[il, j + 1] < SOLID and ctype[ir, j + 1] < SOLID:
+                    jn = j + 1
+                elif j - 1 >= 0 and ctype[il, j - 1] < SOLID and ctype[ir, j - 1] < SOLID:
+                    jn = j - 1
+                if jn >= 0:
+                    beta = solid_beta(wall_f, ir, j, nx, ny, bound, beta_o, 1)
+                    val = (1.0 - 2.0 * beta) * u[i, jn]
             u[i, j] = val
     for i, j in v:                                    # face entre les cellules (i, j-1) et (i, j), nœuds (i, j) et (i+1, j)
-        jb, jt = ti.math.clamp(j - 1, 0, n - 1), ti.math.clamp(j, 0, n - 1)
+        jb, jt = ti.math.clamp(j - 1, 0, ny - 1), ti.math.clamp(j, 0, ny - 1)
         tb, tt = ctype[i, jb], ctype[i, jt]
         if tb >= SOLID or tt >= SOLID:
             val = 0.0
-            bb, vb = band_bc(wall_type, wall_v, wall_d, i, jb, n, bound)
-            bt, vt = band_bc(wall_type, wall_v, wall_d, i, jt, n, bound)
+            bb, vb = band_bc(wall_type, wall_v, wall_d, i, jb, nx, ny, bound)
+            bt, vt = band_bc(wall_type, wall_v, wall_d, i, jt, nx, ny, bound)
             if bb == INLET:
                 val = vb.y
             elif bt == INLET:
                 val = vt.y
             elif tb == MOVING or tt == MOVING:
-                jj, i1 = ti.math.clamp(j, 0, n - 1), ti.math.clamp(i + 1, 0, n - 1)
+                jj, i1 = ti.math.clamp(j, 0, ny - 1), ti.math.clamp(i + 1, 0, nx - 1)
                 m0, m1 = grid_m[i, jj], grid_m[i1, jj]
                 if m0 + m1 > 0:
                     val = (grid_v[i, jj].y * m0 + grid_v[i1, jj].y * m1) / (m0 + m1)
+            elif tb == SOLID and tt == SOLID and 0 < j < ny:
+                ino = -1
+                if i + 1 < nx and ctype[i + 1, jb] < SOLID and ctype[i + 1, jt] < SOLID:
+                    ino = i + 1
+                elif i - 1 >= 0 and ctype[i - 1, jb] < SOLID and ctype[i - 1, jt] < SOLID:
+                    ino = i - 1
+                if ino >= 0:
+                    beta = solid_beta(wall_f, i, jt, nx, ny, bound, beta_o, 0)
+                    val = (1.0 - 2.0 * beta) * v[ino, j]
             v[i, j] = val
 
 
 @ti.kernel
 def pressure_force(fp: ti.template(), grid_m: ti.template(), q: ti.template(), ctype: ti.template(),
-                   inv_dx: float, coef: float, n: int):
+                   inv_dx: float, coef: float, nx: int, ny: int):
     """Accélération −∇p / ρ_s sur les nœuds massiques du solide, à partir de q (cellules fluides seulement,
     0 ailleurs) ; coef = −(ρ_f / ρ_s) / dt_fluide car p = q ρ_f / dt."""
     for i, j in fp:
         a = ti.Vector([0.0, 0.0])
         if grid_m[i, j] > 0:
-            i0, j0 = ti.math.clamp(i - 1, 0, n - 1), ti.math.clamp(j - 1, 0, n - 1)
-            i1, j1 = ti.math.clamp(i, 0, n - 1), ti.math.clamp(j, 0, n - 1)
+            i0, j0 = ti.math.clamp(i - 1, 0, nx - 1), ti.math.clamp(j - 1, 0, ny - 1)
+            i1, j1 = ti.math.clamp(i, 0, nx - 1), ti.math.clamp(j, 0, ny - 1)
             q00 = q[i0, j0] if ctype[i0, j0] == FLUID else 0.0
             q10 = q[i1, j0] if ctype[i1, j0] == FLUID else 0.0
             q01 = q[i0, j1] if ctype[i0, j1] == FLUID else 0.0
@@ -199,13 +246,13 @@ def particle_density(x: ti.template(), alive: ti.template(), dens: ti.template()
 
 
 @ti.func
-def apply_A(q, ctype, i, j, n):
+def apply_A(q, ctype, i, j, nx, ny):
     """(A q)_ij = deg q_ij - somme des q des voisins fluides (air : q = 0 ; solide : exclu)."""
     deg = 0
     s = 0.0
     for di, dj in ti.static(((1, 0), (-1, 0), (0, 1), (0, -1))):
         ni, nj = i + di, j + dj
-        if 0 <= ni < n and 0 <= nj < n:
+        if 0 <= ni < nx and 0 <= nj < ny:
             t = ctype[ni, nj]
             if t < SOLID:                             # solide fixe ou mobile : exclu (Neumann)
                 deg += 1
@@ -218,7 +265,7 @@ def apply_A(q, ctype, i, j, n):
 def cg_init(q: ti.template(), r: ti.template(), pd: ti.template(), rhs: ti.template(),
             u: ti.template(), v: ti.template(), ctype: ti.template(), cg: ti.template(),
             wall_type: ti.template(), wall_d: ti.template(), wall_p: ti.template(),
-            dx: float, dt: float, inv_rho: float, n: int, bound: int):
+            dx: float, dt: float, inv_rho: float, nx: int, ny: int, bound: int):
     """Second membre, résidu initial r = b - A q (q = pression précédente comme point de départ).
     Cellules d'air : pression de Dirichlet connue, 0 (surface libre) ou pression imposée d'une sortie
     (outlet_q) ; reportée dans le second membre des cellules fluides voisines
@@ -227,13 +274,13 @@ def cg_init(q: ti.template(), r: ti.template(), pd: ti.template(), rhs: ti.templ
         if ctype[i, j] != FLUID:
             q[i, j] = 0.0
             if ctype[i, j] == AIR:
-                q[i, j] = outlet_q(wall_type, wall_d, wall_p, i, j, n, bound, dt, inv_rho)
+                q[i, j] = outlet_q(wall_type, wall_d, wall_p, i, j, nx, ny, bound, dt, inv_rho)
     for i, j in ctype:
         if ctype[i, j] == FLUID:
             b = -dx * (u[i + 1, j] - u[i, j] + v[i, j + 1] - v[i, j])
             for di, dj in ti.static(((1, 0), (-1, 0), (0, 1), (0, -1))):
                 ni, nj = i + di, j + dj
-                if 0 <= ni < n and 0 <= nj < n:
+                if 0 <= ni < nx and 0 <= nj < ny:
                     if ctype[ni, nj] == AIR:
                         b += q[ni, nj]
             rhs[i, j] = b
@@ -242,7 +289,7 @@ def cg_init(q: ti.template(), r: ti.template(), pd: ti.template(), rhs: ti.templ
     rr = 0.0                                         # réduction locale (pas d'atomiques sur une seule case)
     for i, j in ctype:
         if ctype[i, j] == FLUID:
-            r[i, j] = rhs[i, j] - apply_A(q, ctype, i, j, n)
+            r[i, j] = rhs[i, j] - apply_A(q, ctype, i, j, nx, ny)
             pd[i, j] = r[i, j]
             rr += r[i, j] * r[i, j]
         else:
@@ -252,11 +299,11 @@ def cg_init(q: ti.template(), r: ti.template(), pd: ti.template(), rhs: ti.templ
 
 
 @ti.kernel
-def cg_apply(pd: ti.template(), Ap: ti.template(), ctype: ti.template(), cg: ti.template(), n: int):
+def cg_apply(pd: ti.template(), Ap: ti.template(), ctype: ti.template(), cg: ti.template(), nx: int, ny: int):
     pAp = 0.0
     for i, j in ctype:
         if ctype[i, j] == FLUID:
-            Ap[i, j] = apply_A(pd, ctype, i, j, n)
+            Ap[i, j] = apply_A(pd, ctype, i, j, nx, ny)
             pAp += pd[i, j] * Ap[i, j]
     cg[1] = pAp
 
@@ -289,7 +336,8 @@ def cg_update(q: ti.template(), r: ti.template(), pd: ti.template(), Ap: ti.temp
 # A phi = dx² e (même laplacien que la pression, air et sorties : phi = 0, solides exclus).
 @ti.kernel
 def density_cg_init(phi: ti.template(), r: ti.template(), pd: ti.template(), rhs: ti.template(),
-                    dens: ti.template(), ctype: ti.template(), cg: ti.template(), kappa: float, dx: float, n: int):
+                    dens: ti.template(), ctype: ti.template(), cg: ti.template(), kappa: float, dx: float,
+                    nx: int, ny: int):
     """Second membre kappa dx² e : e = rho/rho0 - 1 dans les deux sens à l'intérieur (corriger seulement les
     excès, avec le bruit du semis, gonfle le fluide) ; surdensité seulement dans une cellule de surface (voisine
     de l'air), naturellement sous-dense car partiellement remplie. Point de départ : phi = 0."""
@@ -302,7 +350,7 @@ def density_cg_init(phi: ti.template(), r: ti.template(), pd: ti.template(), rhs
             surface = False
             for di, dj in ti.static(((1, 0), (-1, 0), (0, 1), (0, -1))):
                 ni, nj = i + di, j + dj
-                if 0 <= ni < n and 0 <= nj < n:
+                if 0 <= ni < nx and 0 <= nj < ny:
                     if ctype[ni, nj] != FLUID:
                         surface = True
             e = dens[i, j] - 1.0
@@ -319,19 +367,19 @@ def density_cg_init(phi: ti.template(), r: ti.template(), pd: ti.template(), rhs
 
 @ti.kernel
 def density_gradient(phi: ti.template(), du: ti.template(), dv: ti.template(), ctype: ti.template(),
-                     dx: float, n: int):
+                     dx: float, nx: int, ny: int):
     """Déplacement sur les faces : -(phi_j - phi_i) / dx entre deux cellules non solides dont l'une est fluide
     (air : phi = 0) ; 0 ailleurs (aucune poussée vers un mur, un obstacle ou le solide MPM)."""
     for i, j in du:
         val = 0.0
-        if 0 < i < n:
+        if 0 < i < nx:
             tl, tr = ctype[i - 1, j], ctype[i, j]
             if tl < SOLID and tr < SOLID and (tl == FLUID or tr == FLUID):
                 val = -(phi[i, j] - phi[i - 1, j]) / dx
         du[i, j] = val
     for i, j in dv:
         val = 0.0
-        if 0 < j < n:
+        if 0 < j < ny:
             tb, tt = ctype[i, j - 1], ctype[i, j]
             if tb < SOLID and tt < SOLID and (tb == FLUID or tt == FLUID):
                 val = -(phi[i, j] - phi[i, j - 1]) / dx
@@ -340,12 +388,13 @@ def density_gradient(phi: ti.template(), du: ti.template(), dv: ti.template(), c
 
 @ti.kernel
 def density_shift(x: ti.template(), alive: ti.template(), du: ti.template(), dv: ti.template(),
-                  ctype: ti.template(), inv_dx: float, dx: float, bound: int, n: int):
+                  ctype: ti.template(), inv_dx: float, dx: float, bound: int, nx: int, ny: int):
     """x_p += déplacement interpolé depuis les faces (mêmes poids que mac_g2p), borné à 0,5 dx par composante,
     puis écrêté à la bande de paroi. Les vitesses ne changent pas. Un déplacement qui ferait entrer la particule
     dans une cellule solide (obstacle, paroi, solide MPM) est refusé : la correction de densité ne doit jamais
     pousser du fluide dans une structure (le couplage fluide-structure s'emballe)."""
-    lo, hi = bound * dx, 1.0 - bound * dx
+    lo = ti.Vector([bound * dx, bound * dx])
+    hi = ti.Vector([(nx - bound) * dx, (ny - bound) * dx])
     for p in x:
         if alive[p] == 1:
             base, fx = stencil(x[p], inv_dx, 0.0, 0.5)
@@ -361,21 +410,22 @@ def density_shift(x: ti.template(), alive: ti.template(), du: ti.template(), dv:
             d = ti.math.clamp(ti.Vector([sx, sy]), -0.5 * dx, 0.5 * dx)
             xn = ti.math.clamp(x[p] + d, lo, hi)
             c = (xn * inv_dx).cast(int)
-            if ctype[ti.math.clamp(c.x, 0, n - 1), ti.math.clamp(c.y, 0, n - 1)] < SOLID:
+            if ctype[ti.math.clamp(c.x, 0, nx - 1), ti.math.clamp(c.y, 0, ny - 1)] < SOLID:
                 x[p] = xn
 
 
 # ---------------------------------------------------------------- 5. projection
 @ti.kernel
-def mac_project(u: ti.template(), v: ti.template(), q: ti.template(), ctype: ti.template(), dx: float, n: int):
+def mac_project(u: ti.template(), v: ti.template(), q: ti.template(), ctype: ti.template(), dx: float,
+                nx: int, ny: int):
     """u -= grad q sur les faces entre deux cellules non solides dont l'une est fluide (air : q = 0)."""
     for i, j in u:
-        if 0 < i < n:
+        if 0 < i < nx:
             tl, tr = ctype[i - 1, j], ctype[i, j]
             if tl < SOLID and tr < SOLID and (tl == FLUID or tr == FLUID):
                 u[i, j] -= (q[i, j] - q[i - 1, j]) / dx
     for i, j in v:
-        if 0 < j < n:
+        if 0 < j < ny:
             tb, tt = ctype[i, j - 1], ctype[i, j]
             if tb < SOLID and tt < SOLID and (tb == FLUID or tt == FLUID):
                 v[i, j] -= (q[i, j] - q[i, j - 1]) / dx
@@ -439,7 +489,8 @@ def _spawn(x: ti.template(), vel: ti.template(), C: ti.template(), J: ti.templat
 def emit_pressure_outlet(x: ti.template(), vel: ti.template(), C: ti.template(), J: ti.template(),
                          alive: ti.template(), wall_type: ti.template(), wall_d: ti.template(), wall_p: ti.template(),
                          acc: ti.template(), ctype: ti.template(), u: ti.template(), v: ti.template(), ppc: int,
-                         free_stack: ti.template(), free_top: ti.template(), dt: float, dx: float, bound: int, n: int):
+                         free_stack: ti.template(), free_top: ti.template(), dt: float, dx: float, bound: int,
+                         nx: int, ny: int):
     """Sortie à pression imposée p > 0 (il y a de l'eau dehors) : si le gradient de pression fait RENTRER
     l'écoulement (vitesse de face projetée v_n > 0, cellule devant le mur fluide), l'eau qui entre est émise au
     flux, comme par une entrée : ppc² v_n dt / dx particules par pas (fraction reportée dans acc), dans la lame
@@ -447,18 +498,19 @@ def emit_pressure_outlet(x: ti.template(), vel: ti.template(), C: ti.template(),
     ne demande rien : les particules qui franchissent le mur sont détruites (advect_fluid)."""
     ppc2 = float(ppc * ppc)
     for side, k in wall_type:
-        if wall_type[side, k] == OUTLET and wall_p[side, k] > 0.0 and bound <= k < n - bound:
+        ln = ny if side <= RIGHT else nx
+        if wall_type[side, k] == OUTLET and wall_p[side, k] > 0.0 and bound <= k < ln - bound:
             d = wall_d[side, k]
             ai, aj, vn = 0, 0, 0.0
             nrm = ti.Vector([0.0, 0.0])                # normale rentrante
             if side == 0:                             # LEFT
                 ai, aj, vn, nrm = d, k, u[d, k], ti.Vector([1.0, 0.0])
             elif side == 1:                           # RIGHT
-                ai, aj, vn, nrm = n - d - 1, k, -u[n - d, k], ti.Vector([-1.0, 0.0])
+                ai, aj, vn, nrm = nx - d - 1, k, -u[nx - d, k], ti.Vector([-1.0, 0.0])
             elif side == 2:                           # BOTTOM
                 ai, aj, vn, nrm = k, d, v[k, d], ti.Vector([0.0, 1.0])
             else:                                     # TOP
-                ai, aj, vn, nrm = k, n - d - 1, -v[k, n - d], ti.Vector([0.0, -1.0])
+                ai, aj, vn, nrm = k, ny - d - 1, -v[k, ny - d], ti.Vector([0.0, -1.0])
             if ctype[ai, aj] == FLUID and vn > 0.0:
                 acc[side, k] += ppc2 * vn * dt / dx
                 count = int(acc[side, k])

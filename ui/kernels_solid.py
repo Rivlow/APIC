@@ -102,10 +102,13 @@ def grid_update(grid_m: ti.template(), grid_v: ti.template(), mask: ti.template(
 def G2P_solid(grid_v: ti.template(),
               x: ti.template(), v: ti.template(), C: ti.template(), F: ti.template(),
               broken: ti.template(),
-              inv_dx: float, dt: float, dx: float, bound: int):
-    """v, C depuis la grille ; F <- (I + dt C) F ; écrêtage des particules rompues ; advection."""
+              inv_dx: float, dt: float, dx: float, bound: int, nx: int, ny: int):
+    """v, C depuis la grille ; F <- (I + dt C) F ; écrêtage des particules rompues ; advection
+    (écrêtée à la zone utilisable [bound dx, (nx - bound) dx] × [bound dx, (ny - bound) dx])."""
 
     I = ti.Matrix.identity(ti.f32, 2)
+    lo = ti.Vector([bound * dx, bound * dx])
+    hi = ti.Vector([(nx - bound) * dx, (ny - bound) * dx])
 
     for p in x:
 
@@ -144,7 +147,7 @@ def G2P_solid(grid_v: ti.template(),
 
         # --- advection
         x[p] += dt * v[p]
-        x[p] = ti.math.clamp(x[p], bound * dx, 1.0 - bound * dx)
+        x[p] = ti.math.clamp(x[p], lo, hi)
 
 
 # ---------------------------------------------------------------- 4. Endommagement non local

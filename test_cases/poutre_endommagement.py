@@ -75,7 +75,7 @@ grid_v = ti.Vector.field(2, ti.f32, (n_grid, n_grid))
 grid_m = ti.field(ti.f32, (n_grid, n_grid))
 cells = ti.field(ti.i32, (n_grid, n_grid))            # bit OBSTACLE = pilier
 cells.from_numpy(np.where(pillars, OBSTACLE, 0).astype(np.int32))
-wall_type, wall_v, wall_d, _ = walls.fields(n_grid, bound, pillars)
+wall_type, wall_v, wall_d, _, wall_f = walls.fields(n_grid, n_grid, bound, pillars)
 grid_e = ti.field(ti.f32, (n_grid, n_grid))           # allongement pondéré (endommagement non local)
 grid_w = ti.field(ti.f32, (n_grid, n_grid))           # somme des poids associée
 
@@ -101,9 +101,10 @@ def reset():
 def substep(load, use_damage, use_rupture):
     clear_grid(grid_m, grid_v)
     P2G(solid, grid_m, grid_v, inv_dx, dx, dt)
-    grid_step(grid_m, grid_v, cells, wall_type, wall_v, wall_d, dt, load * g, damp, bound, n_grid)
+    grid_step(grid_m, grid_v, cells, wall_type, wall_v, wall_d, wall_f, dt, load * g, damp,
+              1.0, bound, n_grid, n_grid)                     # piliers adhérents (beta = 1)
     G2P(solid, grid_v, inv_dx, dx, dt)
-    advect(solid, dt, bound, dx)
+    advect(solid, dt, bound, dx, n_grid, n_grid)
     if use_damage == 1:
         solid.damage_step(grid_e, grid_w, inv_dx, dt, eps0, epsf, tau_D, use_rupture)
 
