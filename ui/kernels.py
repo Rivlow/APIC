@@ -358,6 +358,104 @@ def sdf_at(sdf: ti.template(), xp, inv_dx: float):
     return phi, grad * inv_dx
 
 
+# ---------------------------------------------------------------- 4 bis. obstacle tournant (rotor)
+# Le rotor est voxelisé une fois à l'angle 0 (distance signée sdf0, même grille que le domaine). À l'angle theta,
+# un point p est dans le rotor si sdf0(c + R(-theta)(p - c)) < 0 : mouvement rigide exact de la forme voxelisée,
+# entièrement sur le GPU. Vitesse de paroi : omega axe × (p - c) (2D : rotation dans le plan, axe ignoré).
+@ti.func
+def rotate(v, axis, ang):
+    """Rotate v by ang (rad) about a unit axis (Rodrigues ; 2D : in-plane rotation, axis ignored).
+
+    **Inputs**
+
+    - `v` : vec dim ; `axis` : vec3 unit ; `ang` : float
+
+    **Outputs**
+
+    - vec dim
+    """
+    c, s = ti.cos(ang), ti.sin(ang)
+    r = v
+    if ti.static(v.n == 2):
+        r = ti.Vector([c * v[0] - s * v[1], s * v[0] + c * v[1]])
+    else:
+        r = v * c + axis.cross(v) * s + axis * axis.dot(v) * (1.0 - c)
+    return r
+
+
+@ti.func
+def rotor_velocity(p, center, axis, omega):
+    """Rigid velocity omega axis × (p - center) of the rotor at point p.
+
+    **Inputs**
+
+    - `p`, `center` : vec dim ; `axis` : vec3 unit ; `omega` : float rad/s
+
+    **Outputs**
+
+    - vec dim
+    """
+    d = p - center
+    vel = d * 0.0
+    if ti.static(d.n == 2):
+        vel = omega * ti.Vector([-d[1], d[0]])
+    else:
+        vel = omega * axis.cross(d)
+    return vel
+
+
+@ti.func
+def rotor_sdf(sdf0: ti.template(), p, center, axis, theta, inv_dx: float):
+    """Signed distance to the rotor at angle theta, and its gradient (world frame).
+
+    **Inputs**
+
+    - `sdf0` : f32 field (n) rotor distance at angle 0 ; `p`, `center` : vec dim ; `axis` : vec3 unit
+    - `theta` : float rad ; `inv_dx` : float
+
+    **Outputs**
+
+    - (phi float m, grad vec dim)
+    """
+    q = center + rotate(p - center, axis, -theta)
+    phi, g0 = sdf_at(sdf0, q, inv_dx)
+    return phi, rotate(g0, axis, theta)
+
+
+@ti.kernel
+def rotor_push(x: ti.template(), v: ti.template(), alive: ti.template(), sdf0: ti.template(),
+               rc: ti.template(), axis: ti.types.vector(3, ti.f32), theta: float, omega: float, inv_dx: float,
+               dx: float):
+    """Push fluid particles out of the rotor (after advection) ; normal velocity relative to the wall >= 0.
+
+    **Inputs**
+
+    - `x`, `v` : vec dim f32 field (cap,) ; `alive` : i32 field (cap,)
+    - `sdf0` : f32 field (n) rotor distance at angle 0 ; `rc` : vec dim f32 field () rotor center
+    - `axis` : vec3 unit ; `theta`, `omega`, `inv_dx`, `dx` : float
+
+    **Outputs**
+
+    - x, v written in place
+    """
+    margin = 0.1 * dx
+    center = rc[None]
+    for p in x:
+        if alive[p] == 1:
+            xp = x[p]
+            for _ in ti.static(range(2)):
+                phi, grad = rotor_sdf(sdf0, xp, center, axis, theta, inv_dx)
+                gn = grad.norm()
+                if phi < margin and gn > 1e-6:
+                    nrm = grad / gn
+                    xp += (margin - phi) * nrm
+                    vw = rotor_velocity(xp, center, axis, omega)
+                    vn = (v[p] - vw).dot(nrm)
+                    if vn < 0.0:                              # imperméable : pas d'entrée relative dans le rotor
+                        v[p] -= vn * nrm
+            x[p] = xp
+
+
 # ---------------------------------------------------------------- 5. émission par flux sur les parois d'entrée
 @ti.kernel
 def emit_wall(x: ti.template(), v: ti.template(), C: ti.template(), J: ti.template(), alive: ti.template(),

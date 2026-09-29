@@ -119,6 +119,14 @@ r.set_wall("front", "wall", friction=1.0)                                    # f
   solide, obstacle ou effacer ; appliquées dans l'ordre par-dessus les matrices (`r.masks()`). Un maillage
   est voxelisé au centre des cellules (parité des croisements, restreinte à la coque remplie : tolère de
   petits trous). Plusieurs fichiers importés ensemble gardent un pivot commun (assemblage aligné).
+- **Rotor** (matériau `rotor`, mode incompressible) : obstacle rigide qui tourne à vitesse imposée
+  (`rpm`, `axis`, `center` de la primitive). Voxelisé une fois (distance signée à l'angle 0) ; à chaque sous-pas
+  le GPU l'échantillonne tourné de omega t : ses cellules imposent omega × r aux faces, les particules qui y
+  entrent sont repoussées. `stats()` donne `rotor_torque` (couple de pression autour de l'axe, N·m) et
+  `rotor_power` (W), affichés dans la barre d'état. Un rotor par scène. Exemple :
+  `python ui/examples/turbine_3d.py` (turbine Francis simplifiée : conduite tangentielle, chambre, roue STL,
+  tube d'aspiration ; cocher « Coupe » axe y pour ouvrir le bloc).
+- **Coupe** : masque les particules et ouvre les obstacles fixes au-delà du plan (le rotor reste entier).
 - **Vue 3D** : bouton gauche glissé = rotation, droit ou milieu = déplacement, molette = zoom, `F` = vue
   entière. Clic sur une primitive = sélection ; clic sur une face du fond = tout le mur ; Maj + glisser sur
   une face = un rectangle aimanté aux cellules, puis Entrée (vx, vy, vz) / Sortie / Mur. Dock « Primitives » :
@@ -130,6 +138,23 @@ r.set_wall("front", "wall", friction=1.0)                                    # f
   que si la vue, la scène ou la couleur change.
 - **Compilation** : ~30 à 50 s la première fois pour une taille de grille donnée (solide compris), puis
   cache hors ligne de Taichi.
+
+## Export VTK (ParaView)
+
+Bouton **Export VTK** de la barre d'outils (choix d'un dossier, puis un instant tous les N pas), ou en script :
+
+```python
+from ui.export_vtk import VTKExporter
+ex = VTKExporter("sortie_vtk", runner, solver)   # maillages STL fixes écrits une fois (mesh_K.vtp)
+solver.step(); ex.write()                        # un instant, séries .pvd mises à jour
+```
+
+`python ui/examples/turbine_3d.py --headless --frames 200 --vtk sortie_vtk --every 5` fait la même chose.
+Dans ParaView, ouvrir `fluid.pvd` (particules : velocity, speed, pressure, density ; filtre *Point Gaussian*),
+`grid.pvd` (cellules : pressure, cell_type, obstacle ; *Slice*, *Contour*), `rotor.pvd` (roue STL à son angle ω·t)
+et `mesh_*.vtp`. Format VTK XML binaire écrit en numpy, sans dépendance. Chaque instant copie les particules et la
+grille du GPU vers le CPU (≈ 0,3 s et ~65 Mo pour la turbine 96³ à 640 k particules) : c'est pour ça qu'on n'exporte
+que tous les N pas.
 
 ## Trafic GPU ↔ CPU
 

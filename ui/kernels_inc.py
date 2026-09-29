@@ -19,9 +19,9 @@ import taichi as ti
 
 from Solver.boundary import (FRAMES, INLET, OBSTACLE, OUTLET, band_bc, band_cell,  # noqa: F401
                              in_band, outlet_q)
-from ui.kernels import cell_of, stencil3, weights, wprod
+from ui.kernels import cell_of, rotor_sdf, rotor_velocity, stencil3, weights, wprod
 
-AIR, FLUID, SOLID, MOVING = 0, 1, 2, 3       # MOVING : cellule occupée par le solide MPM (vitesse = celle du solide)
+AIR, FLUID, SOLID, MOVING, ROTOR = 0, 1, 2, 3, 4   # MOVING : solide MPM ; ROTOR : obstacle tournant (vitesse imposée)
 VISC_OFF, VISC_FREE, VISC_FIXED = 0, 1, 2
 # décalage (en cellules) des faces de l'axe a : 0 sur a, 0.5 sur les autres axes ; centres des cellules ; axes
 # tangents à a ; ordre de priorité des murs pour le frottement d'une face de l'axe a (tangents puis a)
@@ -166,6 +166,12 @@ class MAC:
                                    self.bvol, self.nu_c, self.fp, self.cbc, self.cvel, self.cbeta)
         self.cg, self.cg_visc = ti.field(ti.f32), ti.field(ti.f32)
         fb.dense(ti.i, 3).place(self.cg, self.cg_visc)
+        # obstacle tournant : distance signée à l'angle 0, centre ; couple de pression (diagnostic)
+        self.rsdf = ti.field(ti.f32)
+        fb.dense(ax, self.n).place(self.rsdf)
+        self.rc = ti.Vector.field(self.dim, ti.f32)
+        self.torque = ti.Vector.field(3, ti.f32)
+        fb.place(self.rc, self.torque)
 
     # ------------------------------------------------------------ 1. particules -> faces (APIC)
     def p2g(self, x, vel, C, alive, inv_dx: float, dx: float) -> None:
@@ -285,6 +291,59 @@ class MAC:
                 if self.ctype[c] == AIR and not wall:
                     self.ctype[c] = FLUID
 
+    @ti.kernel
+    def rotor_classify(self, axis: ti.types.vector(3, ti.f32), theta: float, inv_dx: float):
+        """Mark the cells covered by the rotor at angle theta (after classify ; walls and obstacles win).
+
+        **Inputs**
+
+        - `axis` : vec3 unit ; `theta` : float rad ; `inv_dx` : float
+
+        **Outputs**
+
+        - ctype = ROTOR where the rotated rotor distance is negative
+        """
+        center = self.rc[None]
+        for I in ti.grouped(self.ctype):
+            if self.ctype[I] < SOLID:
+                pc = (I.cast(ti.f32) + 0.5) / inv_dx
+                phi, _g = rotor_sdf(self.rsdf, pc, center, axis, theta, inv_dx)
+                if phi < 0.0:
+                    self.ctype[I] = ROTOR
+
+    @ti.kernel
+    def rotor_torque(self, rho_over_dt: float, dx: float):
+        """Pressure torque of the fluid on the rotor about its center (diagnostic, read by stats).
+
+        **Inputs**
+
+        - `rho_over_dt` : float (p = q rho / dt) ; `dx` : float
+
+        **Outputs**
+
+        - torque[None] (3,) N m (per unit depth in 2D, along z)
+        """
+        n = ti.static(self.n)
+        dim = ti.static(self.dim)
+        center = self.rc[None]
+        self.torque[None] = ti.Vector([0.0, 0.0, 0.0])
+        area = dx ** (dim - 1)
+        for I in ti.grouped(self.ctype):
+            if self.ctype[I] == FLUID:
+                for a in ti.static(range(dim)):
+                    for sg in ti.static((1, -1)):
+                        J = I + sg * ti.Vector.unit(dim, a, ti.i32)
+                        if 0 <= J[a] < n[a]:
+                            if self.ctype[J] == ROTOR:
+                                # force de pression sur la face du rotor : -p n_rotor dA, n_rotor = -sg e_a
+                                pf = (I.cast(ti.f32) + 0.5 + 0.5 * sg * ti.Vector.unit(dim, a, ti.f32)) * dx
+                                f = ti.Vector.unit(dim, a, ti.f32) * (sg * self.q[I] * rho_over_dt * area)
+                                r = pf - center
+                                if ti.static(dim == 3):
+                                    self.torque[None] += r.cross(f)
+                                else:
+                                    self.torque[None][2] += r[0] * f[1] - r[1] * f[0]
+
     @ti.func
     def solid_beta(self, wall_f: ti.template(), C, bound: int, beta_o: float, a: ti.template()) -> float:
         """Friction of solid cell C next to a tangential face of axis a: wall friction in the band, else beta_o.
@@ -324,14 +383,15 @@ class MAC:
     @ti.kernel
     def bc(self, wall_type: ti.template(), wall_v: ti.template(), wall_d: ti.template(), wall_f: ti.template(),
            grid_v: ti.template(), grid_m: ti.template(), dt: float, g: float, beta_o: float, bound: int,
-           with_gravity: int):
-        """Apply gravity and face BCs (walls, inlets, moving solid, friction ghosts).
+           with_gravity: int, dx: float, axis: ti.types.vector(3, ti.f32), omega: float):
+        """Apply gravity and face BCs (walls, inlets, moving solid, rotor, friction ghosts).
 
         **Inputs**
 
         - `wall_type`, `wall_d` : i32 field (2 dim, na, nb) ; `wall_v` : vec dim f32 ; `wall_f` : f32
         - `grid_v` : vec dim f32 field (n) solid node velocities ; `grid_m` : f32 field (n) solid node masses
         - `dt`, `g`, `beta_o` : float ; `bound`, `with_gravity` : int
+        - `dx` : float ; `axis` : vec3 unit, `omega` : float rad/s (rotor, center in rc)
 
         **Outputs**
 
@@ -357,6 +417,9 @@ class MAC:
                         val = self.cvel[Il][a]
                     elif self.cbc[Ir] == INLET:
                         val = self.cvel[Ir][a]
+                    elif tl == ROTOR or tr == ROTOR:            # paroi tournante : vitesse rigide au centre de la face
+                        pf = (I.cast(ti.f32) + ti.Vector(OFFS[dim][a])) * dx
+                        val = rotor_velocity(pf, self.rc[None], axis, omega)[a]
                     elif tl == MOVING or tr == MOVING:
                         # nœuds de la face : Ir + {0, 1} sur les axes tangents (2^(dim-1) nœuds)
                         sm, sv = 0.0, 0.0
@@ -773,7 +836,7 @@ class MAC:
                     for sg in ti.static((1, -1)):
                         J = I + sg * ti.Vector.unit(dim, a, ti.i32)
                         if 0 <= J[a] < n[a]:
-                            if self.ctype[J] == AIR or self.ctype[J] == MOVING:   # parois : dans la volume map
+                            if self.ctype[J] == AIR or self.ctype[J] >= MOVING:   # parois : dans la volume map
                                 surface = True
                 e = self.dens[I] - 1.0
                 if surface:

@@ -46,7 +46,7 @@ import numpy as np
 
 from Solver.walls import SIDES, WallTable, Walls, frame, span_box  # noqa: F401  (SIDES réexporté pour ui.ui ; numpy seul)
 
-MATERIALS = ("fluid", "solid", "obstacle", "clear")
+MATERIALS = ("fluid", "solid", "obstacle", "clear", "rotor")
 PRIM_KINDS = ("box", "sphere", "cylinder", "mesh")
 
 
@@ -672,7 +672,7 @@ class SimulationRunner:
         """
         from ui.solver import Solver
         return Solver({**self.p, "ny": self.ny, "nz": self.nz}, self.masks(), self.wall_table(),
-                      self.all_constants())
+                      self.all_constants(), self.rotor())
 
     # ------------------------------------------------------------ primitives (scène éditable, 3D surtout)
     def add_prim(self, kind: str, material: str, velocity=(0.0, 0.0, 0.0), **params) -> dict:
@@ -681,10 +681,11 @@ class SimulationRunner:
         **Inputs**
 
         - `kind` : str in box / sphere / cylinder / mesh
-        - `material` : str in fluid / solid / obstacle / clear
+        - `material` : str in fluid / solid / obstacle / clear / rotor (rigid obstacle turning at imposed speed)
         - `velocity` : (dim,) float initial velocity (fluid / solid)
         - **params : box lo, hi ; sphere center, radius ; cylinder p0, p1, radius ; mesh path, scale, rotate (deg),
-          translate (m, where the pivot lands), pivot (file units, None = mesh center), fill (bool)
+          translate (m, where the pivot lands), pivot (file units, None = mesh center), fill (bool) ; rotor : rpm
+          (tr/min, sign = direction), axis ((3,) direction, default y), center (m, default: primitive center)
 
         **Outputs**
 
@@ -767,12 +768,56 @@ class SimulationRunner:
                                                   fill=bool(prim.get("fill", True)))
         return self._mesh_cache[key]
 
+    def prim_center(self, prim: dict) -> np.ndarray:
+        """Center of a primitive (rotor axis point by default).
+
+        **Inputs**
+
+        - `prim` : dict
+
+        **Outputs**
+
+        - np.ndarray (dim,) m
+        """
+        k = prim["kind"]
+        if "center" in prim and k != "sphere":
+            c = prim["center"]
+        elif k == "box":
+            c = 0.5 * (np.asarray(prim["lo"], float) + np.asarray(prim["hi"], float))
+        elif k == "sphere":
+            c = prim["center"]
+        elif k == "cylinder":
+            c = 0.5 * (np.asarray(prim["p0"], float) + np.asarray(prim["p1"], float))
+        else:
+            c = prim.get("translate", [0.0, 0.0, 0.0])
+        return np.asarray(c, np.float64)[:self.dim]
+
+    def rotor(self):
+        """The rotating obstacle of the scene (first primitive of material rotor), at angle 0.
+
+        **Outputs**
+
+        - dict (mask bool (shape), center (dim,) m, axis (3,) unit, omega rad/s) | None
+
+        **Note** : one rotor per scene ; its cells are cleared in masks() (no particle seeded inside).
+        """
+        rot = [q for q in self.prims if q["material"] == "rotor"]
+        if not rot:
+            return None
+        prim = rot[0]
+        axis = np.asarray(prim.get("axis", [0.0, 1.0, 0.0]), np.float64)
+        axis = axis / max(np.linalg.norm(axis), 1e-12)
+        return {"mask": self.prim_mask(prim), "center": self.prim_center(prim), "axis": axis,
+                "omega": float(prim.get("rpm", 60.0)) * 2.0 * np.pi / 60.0}
+
     def masks(self) -> dict:
         """Effective matrices: self.m with the primitives applied in order.
 
         **Outputs**
 
         - dict of np.ndarray (shape) : fluid, solid, obstacle (bool), vx0, vy0, vz0 (f32)
+
+        **Note** : a rotor clears its initial cells (it is handled by the solver as a moving obstacle).
         """
         if not self.prims:
             return self.m
@@ -808,12 +853,13 @@ class SimulationRunner:
                 callback(s, k)
         return s
 
-    def show(self, path: str | None = None) -> int:
+    def show(self, path: str | None = None, vtk_dir: str | None = None, vtk_every: int | None = None) -> int:
         """Open the Qt GUI on this simulation (blocking).
 
         **Inputs**
 
         - `path` : str | None   file path shown / used for saving
+        - `vtk_dir` : str | None   VTK export folder (export on from the start) ; `vtk_every` : int | None steps
 
         **Outputs**
 
@@ -825,7 +871,7 @@ class SimulationRunner:
 
         from ui.ui import UI
         app = QApplication.instance() or QApplication(sys.argv)
-        win = UI(self, path=path)
+        win = UI(self, path=path, vtk_dir=vtk_dir, vtk_every=vtk_every)
         win.show()
         return app.exec()
 

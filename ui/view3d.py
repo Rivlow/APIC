@@ -22,8 +22,10 @@ from ui.render3d import Camera, ray_box
 from ui.runner import MATERIALS, SimulationRunner
 
 WALL_RGB = {"inlet": (60, 200, 90), "outlet": (230, 70, 70), "wall": (230, 190, 60)}
-MAT_RGB = {"fluid": (90, 160, 255), "solid": (230, 200, 90), "obstacle": (200, 200, 200), "clear": (255, 120, 255)}
-MAT_LABELS = {"fluid": "eau", "solid": "solide", "obstacle": "obstacle", "clear": "effacer"}
+MAT_RGB = {"fluid": (90, 160, 255), "solid": (230, 200, 90), "obstacle": (200, 200, 200), "clear": (255, 120, 255),
+           "rotor": (230, 150, 70)}
+MAT_LABELS = {"fluid": "eau", "solid": "solide", "obstacle": "obstacle", "clear": "effacer",
+              "rotor": "rotor (tourne)"}
 KIND_LABELS = {"box": "boîte", "sphere": "sphère", "cylinder": "cylindre", "mesh": "maillage"}
 SIDE_LABELS = {"left": "gauche", "right": "droite", "bottom": "bas", "top": "haut", "back": "arrière",
                "front": "avant"}
@@ -578,15 +580,28 @@ class PrimPanel(QWidget):
             fill.toggled.connect(lambda v: self._set(i, "fill", bool(v)))
             self.form.addRow("", fill)
             self.form.addRow("fichier", QLabel(os.path.basename(prim["path"])))
-        ed = QLineEdit(_txt(list(prim.get("velocity", [0, 0, 0])) + [0.0] * (3 - len(prim.get("velocity", [])))))
-        ed.editingFinished.connect(lambda e=ed: self._set_vec(i, "velocity", e))
-        self.form.addRow("vitesse initiale (m/s)", ed)
+        if prim["material"] == "rotor":                 # obstacle tournant : vitesse imposée, axe
+            sp = QDoubleSpinBox()
+            sp.setDecimals(1)
+            sp.setRange(-1e5, 1e5)
+            sp.setValue(float(prim.get("rpm", 60.0)))
+            sp.setKeyboardTracking(False)
+            sp.valueChanged.connect(lambda v: self._set(i, "rpm", float(v)))
+            self.form.addRow("vitesse (tr/min, signe = sens)", sp)
+            ed = QLineEdit(_txt(prim.get("axis", [0.0, 1.0, 0.0])))
+            ed.editingFinished.connect(lambda e=ed: self._set_vec(i, "axis", e))
+            self.form.addRow("axe de rotation", ed)
+        else:
+            ed = QLineEdit(_txt(list(prim.get("velocity", [0, 0, 0])) + [0.0] * (3 - len(prim.get("velocity", [])))))
+            ed.editingFinished.connect(lambda e=ed: self._set_vec(i, "velocity", e))
+            self.form.addRow("vitesse initiale (m/s)", ed)
         self.selected.emit(i)
 
     def _set(self, i: int, key: str, value) -> None:
         if 0 <= i < len(self.runner.prims) and self.runner.prims[i].get(key) != value:
             self.runner.prims[i][key] = value
-            self.refresh(i) if key == "material" else None
+            if key == "material":
+                self.refresh(i)                               # libellé + champs (rotor : vitesse, axe)
             self.changed.emit()
 
     def _set_vec(self, i: int, key: str, editor: QLineEdit) -> None:

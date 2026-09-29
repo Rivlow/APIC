@@ -18,7 +18,7 @@ import numpy as np
 import taichi as ti
 
 from Solver.boundary import FRAMES, INLET, OUTLET
-from ui.kernels import particle_color, sdf_at
+from ui.kernels import particle_color, rotor_sdf, sdf_at
 
 WORLD_UP = np.array([0.0, 1.0, 0.0])
 
@@ -161,10 +161,14 @@ class View3D:
         """
         self.res = res
         self.zbuf = ti.field(ti.f32)
-        fb.dense(ti.ij, (res, res)).place(self.zbuf)
+        self.odepth = ti.field(ti.f32)                   # obstacles translucides : premier contact (distance)
+        self.ocol = ti.Vector.field(3, ti.f32)           # et sa couleur ombrée
+        fb.dense(ti.ij, (res, res)).place(self.zbuf, self.odepth, self.ocol)
+        self.rc0 = ti.Vector.field(3, ti.f32)            # centre de rotor factice (scène sans rotor)
+        fb.place(self.rc0)
 
     def draw(self, s, cam: Camera, w: int, h: int, mode: int, signed: int, inv_smax: float, clip=None,
-             prims=None) -> None:
+             prims=None, obs_alpha: float = 1.0) -> None:
         """Render a solver state into s.img[:h, :w].
 
         **Inputs**
@@ -172,14 +176,20 @@ class View3D:
         - `s` : ui.solver.Solver (3D) ; `cam` : Camera ; `w`, `h` : int image size
         - `mode`, `signed`, `inv_smax` : fluid colors (see Solver._colors)
         - `clip` : (axis, position m, keep_below bool) | None ; `prims` : unused (overlays are drawn by the UI)
+        - `obs_alpha` : float opacity of the fixed obstacles (1 opaque ; < 1 : translucent, the fluid inside a
+          closed casing shows through ; the rotor stays opaque)
         """
         eye, fwd, right, up = cam.basis()
         th = cam.tan_half()
         ext = np.array(s.shape, np.float64) * s.dx
         ca, cpos, ckeep = (-1, 0.0, 1) if clip is None else (int(clip[0]), float(clip[1]), int(bool(clip[2])))
         cam_v = [ti.Vector(list(map(float, v))) for v in (eye, fwd, right, up)]
+        has_rot = int(s.rotor is not None)
+        rsdf = s.mac.rsdf if has_rot else s.sdf
+        rc = s.mac.rc if has_rot else self.rc0
         self._background(s.img, w, h, *cam_v, th, s.sdf, s.use_sdf, s.wall_type, s.p["bound"], s.dx,
-                         ti.Vector(list(map(float, ext))))
+                         ti.Vector(list(map(float, ext))), rsdf, rc, has_rot, s.rot_axis, s.rot_omega * s.t,
+                         ca, cpos, ckeep, int(obs_alpha < 0.999))
         radius = 0.5 * s.p_spacing * 1.15                 # sphères légèrement jointives
         base = ti.Vector([0.35, 0.65, 1.0])
         if s.has_fluid:
@@ -191,14 +201,29 @@ class View3D:
                               ca, cpos, ckeep)
         if s.has_solid:
             self._shade_solid(s.img, s.x_s, s.col_s, w, h, *cam_v, th, radius, ca, cpos, ckeep)
+        if obs_alpha < 0.999 and s.use_sdf:
+            self._composite(s.img, w, h, float(obs_alpha))
+
+    @ti.kernel
+    def _composite(self, img: ti.template(), w: int, h: int, alpha: float):
+        """Blend the translucent obstacle over whatever lies behind it (particles, rotor, far walls)."""
+        for row, col in ti.ndrange(h, w):
+            if self.odepth[row, col] < self.zbuf[row, col]:
+                c = img[row, col].cast(ti.f32) / 255.0
+                c = c * (1.0 - alpha) + self.ocol[row, col] * alpha
+                img[row, col] = ti.cast(ti.math.clamp(c, 0.0, 1.0) * 255, ti.u8)
 
     # ------------------------------------------------------------ 1. fond : boîte, parois, obstacles
     @ti.kernel
     def _background(self, img: ti.template(), w: int, h: int, eye: ti.types.vector(3, ti.f32),
                     fwd: ti.types.vector(3, ti.f32), right: ti.types.vector(3, ti.f32),
                     up: ti.types.vector(3, ti.f32), th: float, sdf: ti.template(), use_sdf: int,
-                    wall_type: ti.template(), bound: int, dx: float, ext: ti.types.vector(3, ti.f32)):
-        """Background pass: obstacles (sphere tracing on sdf), far box faces colored by wall type.
+                    wall_type: ti.template(), bound: int, dx: float, ext: ti.types.vector(3, ti.f32),
+                    rsdf: ti.template(), rc: ti.template(), has_rot: int, axis: ti.types.vector(3, ti.f32),
+                    theta: float, ca: int, cpos: float, ckeep: int, translucent: int):
+        """Background pass: obstacles and rotor at angle theta (sphere tracing on the signed distances), far box
+        faces colored by wall type. The clipping plane also cuts the fixed obstacles (open a closed casing), not
+        the rotor.
 
         **Outputs**
 
@@ -215,20 +240,42 @@ class View3D:
             tf = ti.max(t0, t1).min()
             c = ti.Vector([0.06, 0.06, 0.08]) + 0.05 * (1.0 - (row + 0.5) / h)
             z = 1e30
+            self.odepth[row, col] = 1e30
             if tn < tf:
                 hit = False
-                if use_sdf == 1:                              # obstacles : sphere tracing sur la distance signée
+                skip = False                                   # translucide : obstacle fixe déjà rencontré
+                if use_sdf == 1 or has_rot == 1:              # obstacles et rotor : sphere tracing sur les distances
                     t = tn
                     for _ in range(160):
                         if not hit and t < tf:
                             p = eye + t * d
-                            phi, grad = sdf_at(sdf, p, 1.0 / dx)
+                            phi, grad = 1e3, ti.Vector([0.0, 1.0, 0.0])
+                            if use_sdf == 1 and not skip:
+                                phi, grad = sdf_at(sdf, p, 1.0 / dx)
+                                for a in ti.static(range(3)):            # coupe : obstacle ∩ demi-espace gardé
+                                    if ca == a:
+                                        hc = p[a] - cpos if ckeep == 1 else cpos - p[a]
+                                        if hc > phi:
+                                            phi = hc
+                                            grad = ti.Vector.unit(3, a, ti.f32) * (1.0 if ckeep == 1 else -1.0)
+                            rot = False
+                            if has_rot == 1:
+                                pr, gr = rotor_sdf(rsdf, p, rc[None], axis, theta, 1.0 / dx)
+                                if pr < phi:
+                                    phi, grad, rot = pr, gr, True
                             if phi < 0.3 * dx:
-                                hit = True
                                 nrm = grad.normalized()
                                 lam = ti.max(nrm.dot(light), 0.0)
-                                c = ti.Vector([0.45, 0.45, 0.47]) * (0.35 + 0.65 * lam)
-                                z = t
+                                base = ti.Vector([0.80, 0.55, 0.25]) if rot else ti.Vector([0.45, 0.45, 0.47])
+                                if translucent == 1 and not rot:     # mémorisé, on continue derrière
+                                    self.odepth[row, col] = t
+                                    self.ocol[row, col] = base * (0.35 + 0.65 * lam)
+                                    skip = True
+                                    phi = 0.4 * dx
+                                else:
+                                    hit = True
+                                    c = base * (0.35 + 0.65 * lam)
+                                    z = t
                             t += ti.max(phi, 0.4 * dx)
                 if not hit:                                   # face du fond : type de paroi
                     p = eye + tf * d

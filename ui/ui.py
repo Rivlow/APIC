@@ -692,13 +692,16 @@ class Viewport(QWidget):
 
 
 class UI(QMainWindow):
-    def __init__(self, runner: SimulationRunner, path: str | None = None):
+    def __init__(self, runner: SimulationRunner, path: str | None = None, vtk_dir: str | None = None,
+                 vtk_every: int | None = None):
         """Build the main window (viewport, docks, toolbar, status bar) and start the frame timer.
 
         **Inputs**
 
         - `runner` : SimulationRunner
         - `path` : str | None         file path for save
+        - `vtk_dir` : str | None      VTK export folder: the export starts with the solver, no folder dialog
+        - `vtk_every` : int | None    VTK export period (steps)
 
         **Note** : the solver is built after the window is shown; APIC_UI_AUTOQUIT=<s> autoplays then quits.
         """
@@ -732,9 +735,13 @@ class UI(QMainWindow):
         self._build_statusbar()
         self._connect_viewport()
         self._setup_mode()
+        self.vtk, self.vtk_dir = None, vtk_dir
+        if vtk_every:
+            self.spin_vtk.setValue(int(vtk_every))
 
         self.solver = None                                # construit après l'affichage de la fenêtre
         self.statusBar().showMessage("Semis et compilation des kernels…")
+        self._vtk_autostart = bool(vtk_dir)               # export lancé à la fin du premier _rebuild
         QTimer.singleShot(0, self._rebuild)
         self._update_title()
 
@@ -1063,11 +1070,16 @@ class UI(QMainWindow):
         self.spin_clip.setSingleStep(0.02)
         self.spin_clip.setValue(0.5 * float(self.runner.p.get("Lz", 1.0)))
         self.spin_clip.valueChanged.connect(self._need_render)
+        self.chk_translucent = QCheckBox("Obstacles translucides (voir l'eau dedans)")
+        self.chk_translucent.setChecked(True)
+        self.chk_translucent.toggled.connect(self._need_render)
+        grid.addWidget(self.chk_translucent, base + 7, 0, 1, 2)
         grid.addWidget(self.chk_clip, base + 5, 0, 1, 2)
         grid.addWidget(self.combo_clip, base + 6, 0)
         grid.addWidget(self.spin_clip, base + 6, 1)
-        grid.setRowStretch(base + 7, 1)
-        self._3d_widgets = [self.chk_clip, self.combo_clip, self.spin_clip, self.lbl_wvz, self.spin_wvz]
+        grid.setRowStretch(base + 8, 1)
+        self._3d_widgets = [self.chk_clip, self.combo_clip, self.spin_clip, self.lbl_wvz, self.spin_wvz,
+                            self.chk_translucent]
         dock = QDockWidget("Scène", self)
         dock.setWidget(w)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
@@ -1120,6 +1132,16 @@ class UI(QMainWindow):
         act("Ouvrir…", self._open, "Ctrl+O")
         act("Enregistrer", self._save, "Ctrl+S")
         act("Enregistrer sous…", self._save_as, "Ctrl+Shift+S")
+        tb.addSeparator()
+        self.act_vtk = act("Export VTK", self._set_vtk, checkable=True)
+        self.act_vtk.setToolTip("Écrit particules, grille et maillages (roue à son angle) dans un dossier, "
+                                "séries .pvd à ouvrir dans ParaView")
+        self.spin_vtk = QSpinBox()
+        self.spin_vtk.setRange(1, 10000)
+        self.spin_vtk.setValue(5)
+        self.spin_vtk.setPrefix("tous les ")
+        self.spin_vtk.setSuffix(" pas")
+        tb.addWidget(self.spin_vtk)
 
     def _build_statusbar(self) -> None:
         """Build the status bar labels (hover, time, particles, perf)."""
@@ -1143,6 +1165,7 @@ class UI(QMainWindow):
             return
         if self.playing:
             self.solver.step()
+            self._vtk_after_step()
         elif not self._render_needed:                     # pause, rien n'a changé : pas de rendu ni de copie
             return
         self._render_needed = False
@@ -1151,7 +1174,8 @@ class UI(QMainWindow):
         if self.solver.dim == 3:
             cam, size = vp.render_view()
             clip = (self.combo_clip.currentIndex(), self.spin_clip.value(), True) if self.chk_clip.isChecked() else None
-            img = self.solver.render3d(cam, size=size, clip=clip)
+            alpha = 0.25 if self.chk_translucent.isChecked() else 1.0
+            img = self.solver.render3d(cam, size=size, clip=clip, obs_alpha=alpha)
         else:
             x0, y0, k, size = vp.render_view()
             img = self.solver.render(x0, y0, grid=self.chk_grid.isChecked(), tint=self.chk_tint.isChecked(), k=k,
@@ -1174,7 +1198,11 @@ class UI(QMainWindow):
                 else:
                     rng = f"−{m:.3g} … +{m:.3g}"
                 self.lbl_scale.setText(f"échelle : {rng} (auto)")
-            self.lbl_time.setText(f"t = {st['t']:.3f} s   dt = {st['dt']:.2e}")
+            rotor = ""
+            if "rotor_rpm" in st:                         # roue : vitesse imposée, couple et puissance de l'eau
+                rotor = (f"   roue {st['rotor_rpm']:.0f} tr/min, couple {st['rotor_torque']:.3g} N·m, "
+                         f"puissance {st['rotor_power']:.3g} W")
+            self.lbl_time.setText(f"t = {st['t']:.3f} s   dt = {st['dt']:.2e}{rotor}")
             cap = f" / {st['capacity']}" if st["capacity"] != st["n_fluid"] else ""
             self.lbl_particles.setText(f"fluide {st['n_fluid']}{cap}   solide {st['n_solid']}   "
                                        f"D max {st['D_max']:.2f}   rompues {st['n_broken']}")
@@ -1206,6 +1234,11 @@ class UI(QMainWindow):
         self._need_render()
         self.banner.hide()
         self.statusBar().clearMessage()
+        if self._vtk_autostart:                           # dossier imposé (show(vtk_dir=...)) : pas de dialogue
+            self._vtk_autostart = False
+            self.act_vtk.setChecked(True)
+        else:
+            self._vtk_restart()
 
     def _mark_dirty(self) -> None:
         """Flag the scene as modified (Reset required).
@@ -1249,14 +1282,78 @@ class UI(QMainWindow):
             self._rebuild()
         if self.solver is not None:
             self.solver.step()
+            self._vtk_after_step()
         self._need_render()
 
+    def _set_vtk(self, on: bool) -> None:
+        """Start (choose a folder, write the current state) or stop the VTK export.
+
+        **Inputs**
+
+        - `on` : bool
+
+        **Outputs**
+
+        - self.vtk exporter | None ; files written by ui.export_vtk (GPU -> CPU copy at each export only)
+        """
+        if not on:
+            if getattr(self, "vtk", None) is not None:
+                self.statusBar().showMessage(f"Export VTK arrêté : {self.vtk.count} instants dans {self.vtk.folder}",
+                                             5000)
+            self.vtk = None
+            return
+        if self.dirty or self.solver is None:
+            self._rebuild()
+        folder = self.vtk_dir
+        if not folder:
+            start = os.path.join(os.path.dirname(os.path.abspath(self.path)) if self.path else os.getcwd(), "vtk")
+            folder = QFileDialog.getExistingDirectory(self, "Dossier d'export VTK (ParaView)", start)
+        if not folder or self.solver is None:
+            self.act_vtk.blockSignals(True)
+            self.act_vtk.setChecked(False)
+            self.act_vtk.blockSignals(False)
+            return
+        from ui.export_vtk import VTKExporter
+        self.vtk = VTKExporter(folder, self.runner, self.solver)
+        self._vtk_steps = 0
+        self.vtk.write()
+        self.statusBar().showMessage(f"Export VTK vers {folder} : ouvrir les .pvd dans ParaView", 5000)
+
+    def _vtk_after_step(self) -> None:
+        """Export one VTK instant every spin_vtk steps while the export is on."""
+        ex = getattr(self, "vtk", None)
+        if ex is None:
+            return
+        if ex.s is not self.solver:                       # solveur remplacé sans passer par _rebuild / _reset
+            self._vtk_restart()
+            return
+        self._vtk_steps += 1
+        if self._vtk_steps % self.spin_vtk.value() == 0:
+            ex.write()
+
+    def _vtk_restart(self) -> None:
+        """Keep an active export going after a reset / rebuild: new series (t = 0) in the same folder.
+
+        **Outputs**
+
+        - self.vtk bound to the current solver, initial state written (instants renumbered from 00000)
+        """
+        ex = getattr(self, "vtk", None)
+        if ex is None or self.solver is None:
+            return
+        from ui.export_vtk import VTKExporter
+        self.vtk = VTKExporter(ex.folder, self.runner, self.solver)
+        self._vtk_steps = 0
+        self.vtk.write()
+        self.statusBar().showMessage(f"Export VTK : nouvelle série (t = 0) dans {ex.folder}", 5000)
+
     def _reset(self) -> None:
-        """Reset the solver, rebuilding it if the scene is dirty."""
+        """Reset the solver, rebuilding it if the scene is dirty (an active VTK export starts a new series)."""
         if self.dirty or self.solver is None:
             self._rebuild()
         else:
             self.solver.reset()
+            self._vtk_restart()
         self._need_render()
 
     def _on_param(self, key: str, value) -> None:

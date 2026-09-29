@@ -157,7 +157,7 @@ def _wall_band(shape: tuple, bound: int, wtype: np.ndarray, open_type: int) -> n
 
 
 class Solver:
-    def __init__(self, params: dict, matrices: dict, wall_table, consts: dict | None = None):
+    def __init__(self, params: dict, matrices: dict, wall_table, consts: dict | None = None, rotor: dict | None = None):
         """Seed particles, allocate Taichi fields and set the initial state.
 
         **Inputs**
@@ -166,6 +166,8 @@ class Solver:
         - `matrices` : dict of np.ndarray (n)   fluid/solid/obstacle masks, vx0/vy0[/vz0]
         - `wall_table` : Solver.walls.WallTable (2 dim, na, nb)   type, v, depth, pressure, friction, expr
         - `consts` : dict | None   constants of the boundary expressions
+        - `rotor` : dict | None   rotating obstacle (SimulationRunner.rotor : mask at angle 0, center, axis, omega),
+          incompressible only
         """
         self.arch = ensure_taichi()
         self.p = dict(params)
@@ -275,6 +277,17 @@ class Solver:
         self.cells.from_numpy(cells)
         # obstacles : distance signée (une fois), garde-fou contre la pénétration à l'advection
         self.use_sdf = int(bool(m["obstacle"].any()))
+        # obstacle tournant (roue) : distance signée à l'angle 0, une fois ; sa position suit theta = omega t
+        self.rotor = rotor if (rotor is not None and self.incompressible and rotor["mask"].any()) else None
+        if rotor is not None and self.rotor is None:
+            print("[solver] rotor ignoré : il faut le mode incompressible et une primitive non vide")
+        self.rot_axis = ti.Vector([0.0, 1.0, 0.0])
+        self.rot_omega = 0.0
+        if self.rotor is not None:
+            self.mac.rsdf.from_numpy(_signed_distance(self.rotor["mask"], dx0))
+            self.mac.rc[None] = list(map(float, self.rotor["center"]))
+            self.rot_axis = ti.Vector(list(map(float, self.rotor["axis"])))
+            self.rot_omega = float(self.rotor["omega"])
         self.sdf.from_numpy(_signed_distance(m["obstacle"], dx0) if self.use_sdf
                             else np.full(shape, 1e3, np.float32))
         if self.incompressible:                        # volume map des parois (statique) pour la densité ;
@@ -528,12 +541,14 @@ class Solver:
         mac.cell_bc(self.wall_type, self.wall_v, self.wall_d, self.wall_f, bound, p["obstacle_friction"])
         mac.classify(self.cells, self.wall_type, self.wall_v, self.wall_d, self.x_f, self.alive, self.x_s,
                      int(self.has_solid), inv_dx, bound, int(p["free_surface"]))
+        if self.rotor is not None:                     # roue à l'angle omega t : cellules ROTOR, vitesse omega × r
+            mac.rotor_classify(self.rot_axis, self.rot_omega * self.t, inv_dx)
         mac.bc(self.wall_type, self.wall_v, self.wall_d, self.wall_f, self.grid_v, self.grid_m, dt, p["gravity"],
-               p["obstacle_friction"], bound, 1)
+               p["obstacle_friction"], bound, 1, dx, self.rot_axis, self.rot_omega)
         self._viscosity()
         self._project()
         mac.bc(self.wall_type, self.wall_v, self.wall_d, self.wall_f, self.grid_v, self.grid_m, dt, p["gravity"],
-               p["obstacle_friction"], bound, 0)
+               p["obstacle_friction"], bound, 0, dx, self.rot_axis, self.rot_omega)
         if self.has_solid:
             mac.pressure_force(self.grid_m, inv_dx, -(p["fluid_rho"] / p["solid_rho"]) / dt)
         mac.g2p(self.x_f, self.v_f, self.C_f, self.alive, inv_dx, dx)
@@ -555,6 +570,9 @@ class Solver:
         ppc_face = float(p["ppc"] ** self.dim)       # flux : ppc^dim particules par cellule et par (v_n dt / dx)
         K.advect_fluid(self.x_f, self.v_f, self.alive, self.wall_type, self.wall_v, self.wall_d, self.sdf, self.cells,
                        self.use_sdf, inv_dx, dt, bound, dx, self.free_stack, self.free_top)
+        if self.rotor is not None:                     # roue à sa position en fin de pas
+            K.rotor_push(self.x_f, self.v_f, self.alive, self.mac.rsdf, self.mac.rc, self.rot_axis,
+                         self.rot_omega * (self.t + dt), self.rot_omega, inv_dx, dx)
         if self.has_inlet:
             K.emit_wall(self.x_f, self.v_f, self.C_f, self.J_f, self.alive, self.wall_type, self.wall_v,
                         self.wall_d, self.emit_acc, ppc_face, self.free_stack, self.free_top, dt, dx, bound,
@@ -644,6 +662,15 @@ class Solver:
             st["cg_iters"] = self.cg_last_iters
             st["cg_rr"] = float(M.cg_residual(self.mac.cg))
             st["div_max"] = float(self.mac.divergence_max(self.dx))
+        if self.rotor is not None:                     # couple de pression de l'eau sur la roue, autour de son axe
+            self.mac.rotor_torque(self.p["fluid_rho"] / self.dt, self.dx)
+            tq = self.mac.torque[None]
+            ax = self.rotor["axis"]
+            t_ax = float(tq[0] * ax[0] + tq[1] * ax[1] + tq[2] * ax[2]) if self.dim == 3 else float(tq[2])
+            st["rotor_rpm"] = self.rot_omega * 60.0 / (2.0 * np.pi)
+            st["rotor_angle"] = float(np.degrees(self.rot_omega * self.t) % 360.0)
+            st["rotor_torque"] = t_ax
+            st["rotor_power"] = t_ax * self.rot_omega
         if self.has_fluid and self.fluid_mode > 0:    # échelle de couleur lissée (max de la quantité affichée)
             if self.fluid_mode == K.MODE_DENSITY:      # 3 rms : quelques particules de bord (sortie) hors échelle
                 m = 3.0 * float(K.scalar_rms(self.sc_f, self.alive))
@@ -750,7 +777,7 @@ class Solver:
                  self.x_s, self.col_s, int(self.has_solid), r_px)
         return self.img.to_numpy()[:res_y, :res_x]
 
-    def render3d(self, camera, size=None, clip=None, prims=None) -> np.ndarray:
+    def render3d(self, camera, size=None, clip=None, prims=None, obs_alpha: float = 1.0) -> np.ndarray:
         """Render the 3D view (spheres with depth, obstacles, walls) to an image on the GPU.
 
         **Inputs**
@@ -758,7 +785,8 @@ class Solver:
         - `camera` : ui.render3d.Camera
         - `size` : tuple[int, int] | None   image (width, height) px, each <= res ; None : res × res
         - `clip` : tuple (axis, position m, keep_below bool) | None   clipping plane for the particles
-        - `prims` : np.ndarray | None   primitive preview table (see ui.render3d.View3D.set_prims)
+        - `prims` : unused (primitive overlays are drawn by the UI)
+        - `obs_alpha` : float opacity of the fixed obstacles (< 1 : translucent casing, the fluid shows through)
 
         **Outputs**
 
@@ -771,5 +799,5 @@ class Solver:
         res = int(self.p["res"])
         w, h = (res, res) if size is None else (max(1, min(int(v), res)) for v in size)
         mode, signed, inv_smax = self._colors()
-        self.view3d.draw(self, camera, w, h, mode, signed, inv_smax, clip, prims)
+        self.view3d.draw(self, camera, w, h, mode, signed, inv_smax, clip, prims, obs_alpha)
         return self.img.to_numpy()[:h, :w]
