@@ -1,23 +1,25 @@
 """SimulationRunner : définit une simulation (paramètres + matrices nx × ny + parois), la sauve en JSON, la lance.
 
     from ui.runner import SimulationRunner
-    r = SimulationRunner(nx=256, ny=64, gravity=9.81)   # ou n=128 : grille carrée
-    X, Y = r.centers()                      # centres des cellules, (nx, ny), X[i, j] = (i + 0.5) dx
+    r = SimulationRunner(Lx=4.0, Ly=1.0, nx=256, gravity=9.81)   # boîte 4 m × 1 m, dx = Lx / nx, ny déduit
+    X, Y = r.centers()                      # centres des cellules (m), (nx, ny), X[i, j] = (i + 0.5) dx
     r.set_fluid(Y < 0.2)                    # masque numpy (nx, ny) : cellules pleines d'eau
-    r.set_solid(r.rect(0.55, 0.2, 0.58, 0.55))
-    r.set_obstacle(r.circle(0.35, 0.28, 0.05))
-    r.set_wall("left", "inlet", velocity=(3.0, 0.0), span=(0.25, 0.45))   # condition limite sur un mur
+    r.set_solid(r.rect(2.2, 0.2, 2.3, 0.55))
+    r.set_obstacle(r.circle(1.4, 0.28, 0.05))
+    r.set_wall("left", "inlet", velocity=(3.0, 0.0), span=(0.25, 0.45))   # condition limite sur un mur (m, m/s)
     r.set_wall("right", "outlet")           # tout le mur droit
     r.set_wall("bottom", "wall", friction=1.0)   # fond adhérent (0 = glissant, défaut)
     r.save("canal.json")                    # paramètres + matrices + parois, un seul fichier
     s = r.run(150, callback=lambda s, k: print(k, s.stats()["n_fluid"]))   # sans fenêtre
     r.show()                                # interface Qt
 
-Conventions : cellules carrées dx = 1 / max(nx, ny), domaine [0, nx dx] × [0, ny dx] (inclus dans le carré unité,
-r.Lx × r.Ly), matrices indexées [i, j] = (x, y) comme les champs Taichi (cells[:, 0] est la rangée du bas). Un seul matériau fluide et un seul solide (paramètres plats).
+Conventions : unités physiques SI (m, s, kg, Pa). Boîte Lx × Ly (m), cellules carrées dx = Lx / nx, ny = Ly / dx
+arrondi (r.Ly est la hauteur réelle de la grille), matrices indexées [i, j] = (x, y) comme les champs Taichi
+(cells[:, 0] est la rangée du bas). Anciens paramètres sans dimensions (n, ou nx + ny) : domaine normalisé
+Lx = nx / max(nx, ny), Ly = ny / max(nx, ny), comme avant. Un seul matériau fluide et un seul solide (paramètres plats).
 
 Les conditions aux limites n'existent que sur les quatre parois du domaine : un segment de mur
-(côté, étendue le long du mur en unités domaine, type entrée ou sortie, vitesse) ; la paroi par
+(côté, étendue le long du mur en mètres, type entrée ou sortie, vitesse) ; la paroi par
 défaut est un mur glissant. Un obstacle collé à une entrée / sortie en devient la surface : sa face de
 même normale que le mur porte la condition (voir Solver/walls.py).
 """
@@ -33,30 +35,33 @@ from Solver.walls import SIDES, WallTable, Walls  # noqa: F401  (SIDES réexport
 
 class SimulationRunner:
     PARAMS = {
-        "nx": 128, "ny": 128, "bound": 3, "ppc": 2, "cfl": 0.4, "gravity": 9.81, "substeps": 20, "seed": 0,
+        "Lx": 1.0, "Ly": 1.0, "nx": 128, "bound": 3, "ppc": 2, "cfl": 0.4, "gravity": 9.81, "substeps": 20, "seed": 0,
         "capacity": 0, "res": 700,
-        "fluid_rho": 1.0, "fluid_E": 400.0,
+        "fluid_rho": 1.0, "fluid_E": 400.0, "fluid_nu": 0.0, "smagorinsky": 0.0, "visc_iters": 20,
         "solid_rho": 2.0, "solid_E": 3000.0, "solid_nu": 0.3,
         "eps0": 0.05, "epsf": 0.2, "tau_D": 2e-3, "k_res": 1e-3,
         "use_damage": True, "use_rupture": True, "color_mode": 0,
-        "incompressible": False, "cg_iters": 150, "free_surface": True, "volume_correction": 1.0,
+        "incompressible": False, "cg_iters": 150, "multigrid": True, "free_surface": True, "volume_correction": 1.0,
         "density_iters": 20, "obstacle_friction": 1.0,
     }
     LABELS = {
-        "nx": "Grille : nx (cellules en x)", "ny": "Grille : ny (cellules en y)", "bound": "Cellules de bord", "ppc": "Particules / côté de cellule",
+        "Lx": "Boîte : Lx (m)", "Ly": "Boîte : Ly (m)", "nx": "Grille : nx (cellules en x ; ny déduit)", "bound": "Cellules de bord", "ppc": "Particules / côté de cellule",
         "cfl": "CFL", "gravity": "Gravité g", "substeps": "Sous-pas par image", "seed": "Graine",
         "capacity": "Capacité fluide (0 = auto)", "res": "Résolution du rendu",
         "fluid_rho": "Fluide : densité", "fluid_E": "Fluide : raideur E",
+        "fluid_nu": "Fluide : viscosité ν (m²/s, incompressible)", "visc_iters": "Viscosité : itérations CG",
+        "smagorinsky": "Fluide : Smagorinsky C_s (ν_t = (C_s dx)² |S|, 0 = aucun, incompressible)",
         "solid_rho": "Solide : densité", "solid_E": "Solide : module E", "solid_nu": "Solide : Poisson ν",
         "eps0": "ε0 (début endommagement)", "epsf": "εf (rupture)", "tau_D": "τ_D", "k_res": "Raideur résiduelle",
         "use_damage": "Endommagement", "use_rupture": "Rupture", "color_mode": "Couleur solide",
         "incompressible": "Fluide incompressible", "cg_iters": "CG : nombre d'itérations ",
+        "multigrid": "CG : préconditionneur multigrille",
         "free_surface": "Surface libre (cellule vide : p = 0)",
         "volume_correction": "Correction de densité (positions, 0 = aucune)",
         "density_iters": "Correction de densité : itérations CG",
         "obstacle_friction": "Obstacles : frottement β (0 glissant, 1 adhérent)",
     }
-    STRUCTURAL = ("nx", "ny", "bound", "ppc", "capacity", "seed", "res", "incompressible")
+    STRUCTURAL = ("Lx", "Ly", "nx", "bound", "ppc", "capacity", "seed", "res", "incompressible")
     BOOL = ("fluid", "solid", "obstacle")
     FLOAT = ("vx0", "vy0")
 
@@ -65,12 +70,20 @@ class SimulationRunner:
 
         **Inputs**
 
-        - **params  parameter overrides (keys of PARAMS; n = square grid nx = ny)
+        - **params  parameter overrides (keys of PARAMS: Lx, Ly in m, nx ; legacy n or nx + ny without
+          dimensions = normalized domain Lx = nx / max(nx, ny), Ly = ny / max(nx, ny))
         """
-        if "n" in params:                           # grille carrée (et anciens fichiers) : n = nx = ny
+        if "n" in params:                           # grille carrée (anciens scripts / fichiers) : n = nx = ny
             n = int(params.pop("n"))
             params.setdefault("nx", n)
             params.setdefault("ny", n)
+        if "ny" in params:                          # ny donné : sans dimensions, domaine normalisé comme avant
+            ny = int(params.pop("ny"))
+            nx = int(params.get("nx", self.PARAMS["nx"]))
+            if "Lx" not in params and "Ly" not in params:
+                params["Lx"], params["Ly"] = nx / max(nx, ny), ny / max(nx, ny)
+            else:
+                params.setdefault("Ly", ny * params.get("Lx", self.PARAMS["Lx"]) / nx)
         unknown = set(params) - set(self.PARAMS)
         if unknown:
             raise KeyError(f"paramètres inconnus : {sorted(unknown)} (connus : {sorted(self.PARAMS)})")
@@ -79,6 +92,7 @@ class SimulationRunner:
         self.m = {k: np.zeros(shape, bool) for k in self.BOOL}
         self.m.update({k: np.zeros(shape, np.float32) for k in self.FLOAT})
         self._walls = Walls()                       # segments de paroi, le dernier l'emporte
+        self.consts: dict[str, float] = {}          # constantes des conditions limites données par expression
 
     @property
     def walls(self) -> list[dict]:
@@ -108,32 +122,27 @@ class SimulationRunner:
 
     @property
     def ny(self) -> int:
-        """Number of cells in y (int)."""
-        return int(self.p["ny"])
+        """Number of cells in y, round(Ly / dx) (int)."""
+        return max(1, int(round(float(self.p["Ly"]) / self.dx)))
 
     @property
     def n(self) -> int:
-        """Cells per domain unit.
-
-        **Outputs**
-
-        - `int` : max(nx, ny) (dx = 1 / n)
-        """
+        """Longest side in cells, max(nx, ny) (int)."""
         return max(self.nx, self.ny)
 
     @property
     def dx(self) -> float:
-        """Cell size 1 / max(nx, ny) (float)."""
-        return 1.0 / self.n
+        """Cell size Lx / nx, m (float)."""
+        return float(self.p["Lx"]) / self.nx
 
     @property
     def Lx(self) -> float:
-        """Domain width nx dx (float)."""
+        """Box width nx dx, m (float)."""
         return self.nx * self.dx
 
     @property
     def Ly(self) -> float:
-        """Domain height ny dx (float)."""
+        """Box height ny dx, m (float) ; may differ slightly from p["Ly"] (rounded to whole cells)."""
         return self.ny * self.dx
 
     @property
@@ -164,7 +173,7 @@ class SimulationRunner:
 
         **Inputs**
 
-        - `x0`, `y0`, `x1`, `y1` : float   corners in domain units (any order)
+        - `x0`, `y0`, `x1`, `y1` : float   corners in m (any order)
 
         **Outputs**
 
@@ -178,7 +187,7 @@ class SimulationRunner:
 
         **Inputs**
 
-        - `cx`, `cy`, `r` : float   center and radius in domain units
+        - `cx`, `cy`, `r` : float   center and radius in m
 
         **Outputs**
 
@@ -283,7 +292,7 @@ class SimulationRunner:
             self.m[k][mask] = 0.0
 
     # ------------------------------------------------------------ définition (parois)
-    def set_wall(self, side: str, kind: str, velocity=(0.0, 0.0), span=(0.0, 1.0), pressure=None,
+    def set_wall(self, side: str, kind: str, velocity=(0.0, 0.0), span=None, pressure=None,
                  friction=None) -> None:
         """Set a wall boundary segment.
 
@@ -291,9 +300,10 @@ class SimulationRunner:
 
         - `side` : str                   left / right / bottom / top
         - `kind` : str                   wall / inlet / outlet
-        - `velocity` : tuple[float, float]   inlet velocity
-        - `span` : tuple[float, float]   extent along the wall, domain units
-        - `pressure` : float | None          outlet pressure (incompressible only; None = 0, free outlet)
+        - `velocity` : tuple[float | str, float | str]   inlet velocity ; str = expression of x, y, t
+        - `span` : tuple[float, float] | None   extent along the wall, m (None : whole wall)
+        - `pressure` : float | str | None    outlet pressure (incompressible only; None = 0, free outlet) ;
+          str = expression of x, y, t, e.g. "rho*g*(H - y)" (constants: rho, g, pi, Lx, Ly, dx, self.consts)
         - `friction` : float | None          wall beta in [0, 1] (0 slip, 1 no-slip)
 
         **Outputs**
@@ -303,54 +313,95 @@ class SimulationRunner:
         **Note** : span clipped to wall length (Ly for left/right, Lx for bottom/top).
         """
         ext = self.Ly if side in ("left", "right") else self.Lx
+        span = (0.0, ext) if span is None else span              # défaut : tout le mur
         span = (min(max(float(span[0]), 0.0), ext), min(max(float(span[1]), 0.0), ext))
         self._walls.set(side, kind, velocity, span, pressure, friction)
 
-    def clear_wall(self, side: str, span=(0.0, 1.0)) -> None:
+    def clear_wall(self, side: str, span=None) -> None:
         """Reset part of a wall to the default slip wall.
 
         **Inputs**
 
         - `side` : str                   left / right / bottom / top
-        - `span` : tuple[float, float]   extent along the wall, domain units
+        - `span` : tuple[float, float] | None   extent along the wall, m (None : whole wall)
 
         **Outputs**
 
         - self._walls updated
         """
-        self._walls.clear(side, span)
+        ext = self.Ly if side in ("left", "right") else self.Lx
+        self._walls.clear(side, (0.0, ext) if span is None else span)
 
-    def wall_table(self) -> WallTable:
-        """Rasterize wall segments.
+    def set_constants(self, **consts) -> None:
+        """Define constants usable in boundary expressions (e.g. set_constants(H=0.333, U=1.2)).
+
+        **Inputs**
+
+        - `**consts` : float values by name
 
         **Outputs**
 
-        - `WallTable` : type, v, depth, pressure, friction per wall cell (4, max(nx, ny)[, 2])
+        - self.consts updated
+        """
+        self.consts.update({k: float(v) for k, v in consts.items()})
+
+    def all_constants(self) -> dict:
+        """Constants available in boundary expressions.
+
+        **Outputs**
+
+        - dict[str, float] : rho, g (from params), pi, Lx, Ly, dx, then self.consts
+
+        **Note** : rho and g are taken when the solver is built (Reset), not updated live.
+        """
+        return {"rho": float(self.p["fluid_rho"]), "g": float(self.p["gravity"]), "pi": float(np.pi),
+                "Lx": self.Lx, "Ly": self.Ly, "dx": self.dx, **self.consts}
+
+    def wall_table(self) -> WallTable:
+        """Rasterize wall segments (expressions without t evaluated here).
+
+        **Outputs**
+
+        - `WallTable` : type, v, depth, pressure, friction, expr per wall cell (4, max(nx, ny)[, 2 | 3]), sources
 
         **Note** : an obstacle glued to an inlet/outlet carries it on its inward face.
         """
-        return self._walls.table(self.nx, self.ny, self.p["bound"], self.m["obstacle"])
+        return self._walls.table(self.nx, self.ny, self.p["bound"], self.m["obstacle"], self.all_constants(),
+                                 self.dx)
 
     def resize(self, nx: int, ny: int | None = None) -> None:
-        """Change the grid size.
+        """Change the resolution, box size unchanged.
 
         **Inputs**
 
         - `nx` : int          new cells in x
-        - `ny` : int | None   new cells in y (None: square nx × nx)
+        - `ny` : int | None   new cells in y (then Ly = ny dx) ; None : ny follows from Ly
 
         **Outputs**
 
-        - self.m and self.p["nx"], self.p["ny"] updated
-
-        **Note** : resamples matrices (nearest neighbor), walls unchanged (domain units).
+        - self.m and self.p updated (see regrid)
         """
-        ny = nx if ny is None else ny
+        self.p["nx"] = int(nx)
+        if ny is not None:
+            self.p["Ly"] = int(ny) * self.dx
+        self.regrid()
+
+    def regrid(self) -> None:
+        """Resample the matrices to the current grid (after a change of Lx, Ly or nx).
+
+        **Outputs**
+
+        - self.m resampled to (nx, ny) (nearest cell center, same physical position)
+
+        **Note** : walls are in metres and unchanged ; matrices keep their physical position when the box grows.
+        """
         ox, oy = self.m["fluid"].shape                 # taille réelle des matrices (p peut déjà avoir changé)
+        nx, ny = self.nx, self.ny
+        if (ox, oy) == (nx, ny):
+            return
         ix = np.minimum((np.arange(nx) * ox / nx).astype(int), ox - 1)
         iy = np.minimum((np.arange(ny) * oy / ny).astype(int), oy - 1)
         self.m = {k: np.ascontiguousarray(v[ix][:, iy]) for k, v in self.m.items()}
-        self.p["nx"], self.p["ny"] = int(nx), int(ny)
 
     # ------------------------------------------------------------ fichiers
     def to_dict(self) -> dict:
@@ -367,8 +418,8 @@ class SimulationRunner:
             raw = np.packbits(a.ravel()) if a.dtype == bool else a.astype(np.float32).ravel()
             mats[k] = {"dtype": str(a.dtype), "shape": list(a.shape),
                        "data": base64.b64encode(np.ascontiguousarray(raw).tobytes()).decode("ascii")}
-        return {"version": 3, "params": dict(self.p), "matrices": mats,
-                "walls": [dict(w) for w in self.walls]}
+        return {"version": 4, "params": dict(self.p), "matrices": mats,
+                "walls": [dict(w) for w in self.walls], "consts": dict(self.consts)}
 
     @classmethod
     def from_dict(cls, d: dict) -> "SimulationRunner":
@@ -382,7 +433,7 @@ class SimulationRunner:
 
         - SimulationRunner
         """
-        params = {k: v for k, v in d.get("params", {}).items() if k in cls.PARAMS or k == "n"}
+        params = {k: v for k, v in d.get("params", {}).items() if k in cls.PARAMS or k in ("n", "ny")}
         r = cls(**params)
         nx, ny = r.nx, r.ny
         legacy = {}
@@ -398,6 +449,7 @@ class SimulationRunner:
             elif k in ("inlet", "outlet", "inlet_vx", "inlet_vy"):
                 legacy[k] = a
         r.walls = [dict(w) for w in d.get("walls", [])]
+        r.consts = {k: float(v) for k, v in d.get("consts", {}).items()}
         if legacy:
             r._migrate_legacy(legacy)
         return r
@@ -445,7 +497,7 @@ class SimulationRunner:
                     vel = (0.0, 0.0)
                     if kind == "inlet":
                         vel = (float(ivx[run].mean()), float(ivy[run].mean()))
-                    self.set_wall(side, kind, velocity=vel, span=(k0 / n, k / n))
+                    self.set_wall(side, kind, velocity=vel, span=(k0 * self.dx, k * self.dx))
 
     def save(self, path: str) -> None:
         """Save params, matrices and walls to a JSON file.
@@ -484,7 +536,7 @@ class SimulationRunner:
         - bool
         """
         return (self.p == other.p and all(np.array_equal(self.m[k], other.m[k]) for k in self.m)
-                and self.walls == other.walls)
+                and self.walls == other.walls and self.consts == other.consts)
 
     # ------------------------------------------------------------ exécution
     def solver(self):
@@ -495,7 +547,7 @@ class SimulationRunner:
         - `Solver` : (allocates Taichi fields)
         """
         from ui.solver import Solver
-        return Solver(self.p, self.m, self.wall_table())
+        return Solver({**self.p, "ny": self.ny}, self.m, self.wall_table(), self.all_constants())
 
     def run(self, frames: int, substeps: int | None = None, callback=None):
         """Run headless for a number of frames.

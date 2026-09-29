@@ -1,8 +1,8 @@
 # Solver/walls.py -- Définition des conditions aux limites (numpy seul, importable sans Taichi).
 #
-# Grille nx × ny de cellules carrées, dx = 1 / max(nx, ny) : le domaine est [0, nx dx] × [0, ny dx] (unités domaine).
-# Une condition limite est un SEGMENT de mur : côté (left, right, bottom, top), étendue le long du mur en unités
-# domaine (y pour left/right, x pour bottom/top), type et paramètres :
+# Grille nx × ny de cellules carrées de côté dx (en mètres, SI) : le domaine est [0, nx dx] × [0, ny dx].
+# Une condition limite est un SEGMENT de mur : côté (left, right, bottom, top), étendue le long du mur en mètres
+# (y pour left/right, x pour bottom/top), type et paramètres :
 #   - wall   : mur imperméable (composante entrante annulée) -- partout par défaut. Frottement beta dans [0, 1] :
 #              0 = glissant (défaut), 1 = adhérent (no-slip), entre les deux = vitesse tangentielle réduite.
 #   - inlet  : vitesse imposée
@@ -21,6 +21,8 @@
 from typing import NamedTuple
 
 import numpy as np
+
+from Solver import bc_expr
 
 SIDES = ("left", "right", "bottom", "top")
 LEFT, RIGHT, BOTTOM, TOP = 0, 1, 2, 3
@@ -52,6 +54,25 @@ class WallTable(NamedTuple):
     depth: np.ndarray                         # int32 : position du mur en cellules depuis le bord
     pressure: np.ndarray                      # float32 : pression imposée sur une sortie (0 = libre)
     friction: np.ndarray                      # float32 : frottement beta d'un mur (0 glissant, 1 adhérent)
+    expr: np.ndarray                          # (…, 3) int32 : expression dépendant de t pour (vx, vy, p), -1 = aucune
+    sources: tuple                            # expressions dépendant de t (indice = expr), réévaluées sur le GPU
+
+
+def _value(v):
+    """Normalize a boundary value: number -> float, expression -> validated str.
+
+    **Inputs**
+
+    - `v` : float | int | str
+
+    **Outputs**
+
+    - float | str ; ValueError if the expression is not allowed
+    """
+    if bc_expr.is_expr(v):
+        bc_expr.check(v)
+        return v.strip()
+    return float(v)
 
 
 class Walls:
@@ -81,9 +102,9 @@ class Walls:
 
         - `side` : str in left/right/bottom/top
         - `kind` : str in wall/inlet/outlet
-        - `velocity` : (2,) float, inlet velocity
+        - `velocity` : (2,) float | str, inlet velocity ; str = expression of x, y, t (see Solver/bc_expr.py)
         - `span` : (2,) float, extent along the wall in domain units
-        - `pressure` : float or None, outlet only (None = 0, free outlet)
+        - `pressure` : float | str or None, outlet only (None = 0, free outlet) ; str = expression of x, y, t
         - `friction` : float in [0, 1] or None, wall only (0 slip, 1 no-slip)
 
         **Outputs**
@@ -101,7 +122,7 @@ class Walls:
         if friction is not None and not 0.0 <= float(friction) <= 1.0:
             raise ValueError("friction doit être dans [0, 1] (0 glissant, 1 adhérent)")
         a, b = sorted((float(span[0]), float(span[1])))
-        a, b = max(a, 0.0), min(b, 1.0)
+        a = max(a, 0.0)                               # borné à la longueur du mur par le runner
         if b <= a:
             return
         kept = []
@@ -115,9 +136,9 @@ class Walls:
                 kept.append({**w, "span": [b, w["span"][1]]})
         if kind != "wall":
             seg = {"side": side, "span": [a, b], "type": kind,
-                   "velocity": [float(velocity[0]), float(velocity[1])]}
+                   "velocity": [_value(velocity[0]), _value(velocity[1])]}
             if pressure is not None:
-                seg["pressure"] = float(pressure)
+                seg["pressure"] = _value(pressure)
             kept.append(seg)
         elif friction:                                # mur glissant = défaut : pas de segment
             kept.append({"side": side, "span": [a, b], "type": "wall", "friction": float(friction)})
@@ -137,13 +158,15 @@ class Walls:
         """
         self.set(side, "wall", span=span)
 
-    def table(self, nx: int, ny: int, bound: int, obstacle=None) -> WallTable:
+    def table(self, nx: int, ny: int, bound: int, obstacle=None, consts=None, dx=None) -> WallTable:
         """Rasterize wall segments into per-cell tables.
 
         **Inputs**
 
         - `nx`, `ny`, `bound` : int
         - `obstacle` : np.ndarray bool (nx, ny) or None
+        - `consts` : dict[str, float] or None, constants usable in expressions (pi, Lx, Ly, dx always defined)
+        - `dx` : float or None, cell size (m) ; None = 1 / max(nx, ny) (normalized domain)
 
         **Outputs**
 
@@ -151,16 +174,19 @@ class Walls:
 
         **Note** : corners (k in the transverse band) are always walls; an obstacle glued to an inlet / outlet carries it.
         """
-        nm = max(nx, ny)                              # dx = 1 / nm : cellule k couvre [k dx, (k + 1) dx]
+        nm = max(nx, ny)                              # longueur des tables
+        dx = 1.0 / nm if dx is None else float(dx)    # cellule k couvre [k dx, (k + 1) dx]
         wtype = np.zeros((4, nm), np.int32)
         wvel = np.zeros((4, nm, 2), np.float32)
         wpress = np.zeros((4, nm), np.float32)
         wfric = np.zeros((4, nm), np.float32)
+        wexpr = np.full((4, nm, 3), -1, np.int32)
+        pending = []                                  # expressions : (côté, k0, k1, canal 0 vx / 1 vy / 2 p, source)
         for w in self.segments:
             s = SIDES.index(w["side"])
             ln = side_length(s, nx, ny)
-            k0 = max(int(np.floor(w["span"][0] * nm + 1e-9)), 0)
-            k1 = min(int(np.ceil(w["span"][1] * nm - 1e-9)), ln)
+            k0 = max(int(np.floor(w["span"][0] / dx + 1e-9)), 0)
+            k1 = min(int(np.ceil(w["span"][1] / dx - 1e-9)), ln)
             if w["type"] == "wall":                   # frottement : y compris dans les coins
                 if k1 > k0:
                     wfric[s, k0:k1] = w.get("friction", 0.0)
@@ -169,17 +195,48 @@ class Walls:
             if k1 <= k0:
                 continue
             wtype[s, k0:k1] = WALL_TYPES[w["type"]]
-            wvel[s, k0:k1] = w.get("velocity", [0.0, 0.0])
-            wpress[s, k0:k1] = w.get("pressure", 0.0)
+            vals = list(w.get("velocity", [0.0, 0.0])) + [w.get("pressure", 0.0)]
+            for ch, val in enumerate(vals):
+                if bc_expr.is_expr(val):
+                    pending.append((s, k0, k1, ch, val))
+                    val = 0.0
+                if ch < 2:
+                    wvel[s, k0:k1, ch] = val
+                    wexpr[s, k0:k1, ch] = -1
+                else:
+                    wpress[s, k0:k1] = val
+                    wexpr[s, k0:k1, 2] = -1
         for s in range(4):
             ln = side_length(s, nx, ny)
             wtype[s, :bound] = WALL
             wtype[s, ln - bound:] = WALL
-        wpress[wtype != OUTLET] = 0.0
         wdepth = np.full((4, nm), bound, np.int32)
         if obstacle is not None:
             wdepth = self._depth(np.asarray(obstacle, dtype=bool), wtype, nx, ny, bound)
-        return WallTable(wtype, wvel, wdepth, wpress, wfric)
+        # expressions : sans t, évaluées ici une fois ; avec t, numérotées pour le kernel GPU (valeur initiale à t = 0)
+        cst = {"pi": np.pi, "Lx": nx * dx, "Ly": ny * dx, "dx": dx, **(consts or {})}
+        sources = []
+        for s, k0, k1, ch, src in pending:
+            if wtype[s, k0] != (INLET if ch < 2 else OUTLET):   # segment recouvert par un autre
+                continue
+            ks = np.arange(k0, k1)
+            d = wdepth[s, ks]
+            along = (ks + 0.5) * dx
+            x = {LEFT: d * dx, RIGHT: (nx - d) * dx}.get(s, along)
+            y = {BOTTOM: d * dx, TOP: (ny - d) * dx}.get(s, along)
+            val = bc_expr.evaluate(src, x, y, 0.0, cst)
+            if ch < 2:
+                wvel[s, ks, ch] = val
+            else:
+                wpress[s, ks] = val
+            if bc_expr.uses_time(src):
+                if src not in sources:
+                    sources.append(src)
+                wexpr[s, ks, ch] = sources.index(src)
+        wexpr[wtype != INLET, 0:2] = -1
+        wexpr[wtype != OUTLET, 2] = -1
+        wpress[wtype != OUTLET] = 0.0
+        return WallTable(wtype, wvel, wdepth, wpress, wfric, wexpr, tuple(sources))
 
     @staticmethod
     def _depth(o: np.ndarray, wtype: np.ndarray, nx: int, ny: int, bound: int) -> np.ndarray:
@@ -215,22 +272,26 @@ class Walls:
                 wdepth[s, k] = max(d, bound)
         return wdepth
 
-    def fields(self, nx: int, ny: int, bound: int, obstacle=None):
+    def fields(self, nx: int, ny: int, bound: int, obstacle=None, consts=None, dx=None):
         """Rasterize and upload the wall table to Taichi fields (once).
 
         **Inputs**
 
         - `nx`, `ny`, `bound` : int
         - `obstacle` : np.ndarray bool (nx, ny) or None
+        - `consts` : dict[str, float] or None, constants for expressions
+        - `dx` : float or None, cell size ; None = 1 / max(nx, ny)
 
         **Outputs**
 
         - `wall_type`, `wall_d` : i32 field (4, nm)
         - `wall_v` : vec2 f32 field (4, nm)
         - `wall_p`, `wall_f` : f32 field (4, nm)
+
+        **Note** : time-dependent expressions are frozen at t = 0 here (only ui.solver.Solver re-evaluates them).
         """
         import taichi as ti                           # import local : ce module reste utilisable sans Taichi
-        t = self.table(nx, ny, bound, obstacle)
+        t = self.table(nx, ny, bound, obstacle, consts, dx)
         nm = max(nx, ny)
         wall_type = ti.field(ti.i32, (4, nm))
         wall_v = ti.Vector.field(2, ti.f32, (4, nm))

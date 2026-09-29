@@ -59,7 +59,8 @@ def main() -> int:
     r.set_obstacle(r.rect(0.90, 0.5, 1.0, 0.6))                 # bloc collé au mur droit
     r.set_wall("left", "inlet", velocity=(3.0, 0.0), span=(0.3, 0.4))
     r.set_wall("right", "outlet")
-    wt, wv, wd, wp, wf = r.wall_table()
+    tab = r.wall_table()
+    wt, wv, wd = tab.type, tab.v, tab.depth
     n, b = r.n, r.p["bound"]
     assert (wt[0, int(0.3 * n):int(0.4 * n)] == 1).all() and (wv[0, int(0.35 * n)] == [3.0, 0.0]).all(), "entrée"
     assert (wt[1, b:n - b] == 2).all(), "sortie"

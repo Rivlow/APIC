@@ -163,6 +163,35 @@ def outlet_at(wall_type: ti.template(), side: int, k: int, nx: int, ny: int, bou
 
 
 @ti.func
+def exit_at(wall_type: ti.template(), wall_v: ti.template(), side: int, k: int, nx: int, ny: int,
+            bound: int) -> bool:
+    """Test whether particles leave through wall entry (side, k): outlet, or inlet whose velocity points out of the
+    domain (velocity outlet, e.g. u = q / h_aval ; no emission there, emit_wall only emits for inward velocity).
+
+    **Inputs**
+
+    - `wall_type` : i32 field (4, nm)
+    - `wall_v` : vec2 f32 field (4, nm) imposed velocity
+    - `side`, `k`, `nx`, `ny`, `bound` : int
+
+    **Outputs**
+
+    - bool
+    """
+    ln = ny if side <= RIGHT else nx
+    vel = wall_v[side, k]
+    vn = vel.x                                        # composante entrante (normale intérieure)
+    if side == RIGHT:
+        vn = -vel.x
+    elif side == BOTTOM:
+        vn = vel.y
+    elif side == TOP:
+        vn = -vel.y
+    t = wall_type[side, k]
+    return bound <= k < ln - bound and (t == OUTLET or (t == INLET and vn < 0.0))
+
+
+@ti.func
 def is_bc_face(i: int, j: int, nx: int, ny: int, bound: int, wall_d: ti.template()) -> bool:
     """Test whether node (i, j) is an obstacle face carrying a wall BC.
 

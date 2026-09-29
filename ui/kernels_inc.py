@@ -9,7 +9,8 @@ imposée, Neumann). Les cellules de sortie sont de l'air : pression nulle, écou
 On résout A q = b avec q = dt p / rho, A = laplacien positif à 5 points sur les cellules fluides
 (deg = nombre de voisins non solides), b = -dx (u_e - u_w + v_n - v_s), puis u -= grad q.
 Frottement aux parois : faces tangentielles dans une cellule solide = valeur fantôme (1 - 2 beta) u_fluide
-(beta = 0 glissant, 1 adhérent : vitesse moyenne nulle sur la paroi), voir mac_bc. Correction de densité
+(beta = 0 glissant, 1 adhérent : vitesse moyenne nulle sur la paroi), voir mac_bc. Viscosité implicite sur
+les faces avant la projection (3 bis). Correction de densité
 sur les positions après l'advection (4 bis).
 Le gradient conjugué vit sur le GPU : `cg` = [rr, pAp, rr_new] ; α et β sont calculés dans les kernels.
 """
@@ -331,23 +332,27 @@ def add_accel(grid_v: ti.template(), grid_m: ti.template(), fp: ti.template(), d
 
 # ---------------------------------------------------------------- 4. densité des particules + gradient conjugué
 @ti.kernel
-def particle_density(x: ti.template(), alive: ti.template(), dens: ti.template(), inv_dx: float, ppc: int):
-    """Particle density rho / rho0 at cell centers.
+def particle_density(x: ti.template(), alive: ti.template(), dens: ti.template(), bvol: ti.template(),
+                     inv_dx: float, ppc: int):
+    """rho / rho0 at cell centers : boundary volume map + quadratic B-spline weights of the particles / ppc².
 
     **Inputs**
 
     - `x` : vec2 f32 field (cap,) positions
     - `alive` : i32 field (cap,) 1 = live particle
-    - `dens` : f32 field (nx, ny)
-    - `inv_dx` : float
-    - `ppc` : int
+    - `dens` : f32 field (nx, ny) output
+    - `bvol` : f32 field (nx, ny) boundary volume map (walls and obstacles seen by the kernel, static)
+    - `inv_dx` : float ; `ppc` : int
 
     **Outputs**
 
-    - dens written in place (1 = nominal)
+    - dens written in place (1 = nominal density, walls included)
+
+    **Note** : as SPlisHSPlasH volume maps, the boundary counts in the density : no truncated kernel near a wall, and
+    fluid pressed against it becomes overdense, so the density projection pushes it away.
     """
     for i, j in dens:
-        dens[i, j] = 0.0
+        dens[i, j] = bvol[i, j]
     inv = 1.0 / (ppc * ppc)
     for p in x:
         if alive[p] == 1:
@@ -492,6 +497,242 @@ def cg_update(q: ti.template(), r: ti.template(), pd: ti.template(), Ap: ti.temp
     cg[0] = cg[2]
 
 
+# ---------------------------------------------------------------- 3 bis. viscosité implicite (faces)
+# Diffusion implicite (I - dt div(nu grad)) u* = u, résolue séparément sur les faces u et v avant la projection.
+# nu par cellule = nu0 + nu_t, nu_t = (C_s dx)^2 |S| (Smagorinsky, cellules fluides seulement) : nul dans un
+# écoulement uniforme, fort dans les zones cisaillées (rouleau d'un ressaut). nu d'une face = moyenne de ses deux
+# cellules ; couplage entre deux faces voisines = k (nu_f + nu_n) / 2, k = dt / dx² : matrice SPD.
+# Type de face `ft` : VISC_FREE (inconnue : aucune cellule voisine solide, au moins une fluide), VISC_FIXED
+# (Dirichlet : une cellule solide, valeur posée par mac_bc, fantômes de frottement compris), VISC_OFF (air ou
+# hors domaine : Neumann, surface libre sans cisaillement). CG à itérations fixes, sans lecture GPU -> CPU.
+VISC_OFF, VISC_FREE, VISC_FIXED = 0, 1, 2
+
+
+@ti.func
+def face_cells(ctype, i, j, nx, ny, axis: ti.template()):
+    """Values of a cell field (types, viscosity) on each side of face (i, j).
+
+    **Inputs**
+
+    - `ctype` : field (nx, ny)
+    - `i`, `j`, `nx`, `ny` : int
+    - `axis` : 0 = u face (cells (i-1, j), (i, j)), 1 = v face (cells (i, j-1), (i, j))
+
+    **Outputs**
+
+    - (a, b) cell values, clamped to the grid as in mac_bc
+    """
+    ia, ja, ib, jb = ti.math.clamp(i - 1, 0, nx - 1), j, ti.math.clamp(i, 0, nx - 1), j
+    if ti.static(axis == 1):
+        ia, ja, ib, jb = i, ti.math.clamp(j - 1, 0, ny - 1), i, ti.math.clamp(j, 0, ny - 1)
+    return ctype[ia, ja], ctype[ib, jb]
+
+
+@ti.func
+def _cell_grad(f0, fm, fp, okm, okp, inv_dx):
+    """Central difference at a cell, one-sided if a neighbor is not fluid, 0 if none is."""
+    g = 0.0
+    if okm and okp:
+        g = (fp - fm) * 0.5 * inv_dx
+    elif okp:
+        g = (fp - f0) * inv_dx
+    elif okm:
+        g = (f0 - fm) * inv_dx
+    return g
+
+
+@ti.kernel
+def visc_nu(nu_c: ti.template(), u: ti.template(), v: ti.template(), ctype: ti.template(), nu0: float, l2: float,
+            inv_dx: float, nx: int, ny: int):
+    """Viscosity per cell: nu0 + Smagorinsky nu_t = l2 |S| on fluid cells, |S| = sqrt(2 S:S).
+
+    **Inputs**
+
+    - `nu_c` : f32 field (nx, ny) output
+    - `u`, `v` : f32 fields (nx+1, ny), (nx, ny+1) MAC face velocities
+    - `ctype` : i32 field (nx, ny)
+    - `nu0` : float molecular viscosity (m²/s) ; `l2` : float (C_s dx)² (m²)
+    - `inv_dx` : float ; `nx`, `ny` : int
+
+    **Outputs**
+
+    - nu_c written in place
+
+    **Note** : cross derivatives from cell-centered velocities of fluid neighbors only (no air/solid garbage at the
+    free surface).
+    """
+    for i, j in nu_c:
+        nu = nu0
+        if l2 > 0 and ctype[i, j] == FLUID:
+            sxx = (u[i + 1, j] - u[i, j]) * inv_dx
+            syy = (v[i, j + 1] - v[i, j]) * inv_dx
+            okl = i > 0 and ctype[ti.max(i - 1, 0), j] == FLUID
+            okr = i < nx - 1 and ctype[ti.min(i + 1, nx - 1), j] == FLUID
+            okb = j > 0 and ctype[i, ti.max(j - 1, 0)] == FLUID
+            okt = j < ny - 1 and ctype[i, ti.min(j + 1, ny - 1)] == FLUID
+            il, ir = ti.max(i - 1, 0), ti.min(i + 1, nx - 1)
+            jb, jt = ti.max(j - 1, 0), ti.min(j + 1, ny - 1)
+            uc = 0.5 * (u[i, j] + u[i + 1, j])
+            vc = 0.5 * (v[i, j] + v[i, j + 1])
+            dudy = _cell_grad(uc, 0.5 * (u[i, jb] + u[i + 1, jb]), 0.5 * (u[i, jt] + u[i + 1, jt]), okb, okt, inv_dx)
+            dvdx = _cell_grad(vc, 0.5 * (v[il, j] + v[il, j + 1]), 0.5 * (v[ir, j] + v[ir, j + 1]), okl, okr, inv_dx)
+            s2 = 2.0 * (sxx * sxx + syy * syy) + (dudy + dvdx) ** 2
+            nu += l2 * ti.sqrt(s2)
+        nu_c[i, j] = nu
+
+
+@ti.kernel
+def visc_classify(ft: ti.template(), nuf: ti.template(), ctype: ti.template(), nu_c: ti.template(), nx: int, ny: int,
+                  axis: ti.template()):
+    """Viscosity: classify faces (free unknown, fixed Dirichlet, off) and face viscosity.
+
+    **Inputs**
+
+    - `ft` : i32 field, face grid shape (u or v)
+    - `nuf` : f32 field, face grid shape, face viscosity (output)
+    - `ctype` : i32 field (nx, ny)
+    - `nu_c` : f32 field (nx, ny) cell viscosity (visc_nu)
+    - `nx`, `ny` : int
+    - `axis` : 0 = u faces, 1 = v faces
+
+    **Outputs**
+
+    - ft, nuf written in place
+    """
+    for i, j in ft:
+        ta, tb = face_cells(ctype, i, j, nx, ny, axis)
+        t = VISC_OFF
+        if ta >= SOLID or tb >= SOLID:
+            t = VISC_FIXED
+        elif ta == FLUID or tb == FLUID:
+            t = VISC_FREE
+        ft[i, j] = t
+        na, nb = face_cells(nu_c, i, j, nx, ny, axis)
+        nuf[i, j] = 0.5 * (na + nb)
+
+
+@ti.func
+def visc_A(x, ft, nuf, i, j, k):
+    """Apply (I - dt div(nu grad)) at free face (i, j) (fixed neighbors: moved to the rhs, off: Neumann).
+
+    **Inputs**
+
+    - `x` : f32 field, face grid
+    - `ft` : i32 field, face types ; `nuf` : f32 field, face viscosity
+    - `i`, `j` : int ; `k` : float dt / dx²
+
+    **Outputs**
+
+    - float (A x)_ij
+    """
+    diag = 1.0
+    s = 0.0
+    for di, dj in ti.static(((1, 0), (-1, 0), (0, 1), (0, -1))):
+        ni, nj = i + di, j + dj
+        if 0 <= ni < x.shape[0] and 0 <= nj < x.shape[1]:
+            t = ft[ni, nj]
+            if t != VISC_OFF:
+                c = k * 0.5 * (nuf[i, j] + nuf[ni, nj])
+                diag += c
+                if t == VISC_FREE:
+                    s += c * x[ni, nj]
+    return diag * x[i, j] - s
+
+
+@ti.kernel
+def visc_cg_init(w: ti.template(), r: ti.template(), pd: ti.template(), rhs: ti.template(), ft: ti.template(),
+                 nuf: ti.template(), cg: ti.template(), k: float):
+    """Viscosity: CG init (rhs = w + coupling-weighted fixed neighbors, warm start x = w).
+
+    **Inputs**
+
+    - `w` : f32 field, face velocities (u or v), solved in place
+    - `r`, `pd`, `rhs` : f32 fields, same shape
+    - `ft` : i32 field, face types ; `nuf` : f32 field, face viscosity
+    - `cg` : f32 field (3,) [rr, pAp, rr_new]
+    - `k` : float dt / dx²
+
+    **Outputs**
+
+    - r, pd, rhs, cg[0] written in place
+    """
+    for i, j in w:
+        if ft[i, j] == VISC_FREE:
+            b = w[i, j]
+            for di, dj in ti.static(((1, 0), (-1, 0), (0, 1), (0, -1))):
+                ni, nj = i + di, j + dj
+                if 0 <= ni < w.shape[0] and 0 <= nj < w.shape[1]:
+                    if ft[ni, nj] == VISC_FIXED:
+                        b += k * 0.5 * (nuf[i, j] + nuf[ni, nj]) * w[ni, nj]
+            rhs[i, j] = b
+    rr = 0.0
+    for i, j in w:
+        if ft[i, j] == VISC_FREE:
+            r[i, j] = rhs[i, j] - visc_A(w, ft, nuf, i, j, k)
+            pd[i, j] = r[i, j]
+            rr += r[i, j] * r[i, j]
+        else:
+            r[i, j] = 0.0
+            pd[i, j] = 0.0
+    cg[0] = rr
+
+
+@ti.kernel
+def visc_apply(pd: ti.template(), Ap: ti.template(), ft: ti.template(), nuf: ti.template(), cg: ti.template(),
+               k: float):
+    """Viscosity: CG step A p and pAp.
+
+    **Inputs**
+
+    - `pd`, `Ap` : f32 fields, face grid
+    - `ft` : i32 field, face types ; `nuf` : f32 field, face viscosity
+    - `cg` : f32 field (3,) [rr, pAp, rr_new]
+    - `k` : float dt / dx²
+
+    **Outputs**
+
+    - Ap, cg[1] written in place
+    """
+    pAp = 0.0
+    for i, j in pd:
+        if ft[i, j] == VISC_FREE:
+            Ap[i, j] = visc_A(pd, ft, nuf, i, j, k)
+            pAp += pd[i, j] * Ap[i, j]
+    cg[1] = pAp
+
+
+@ti.kernel
+def visc_update(w: ti.template(), r: ti.template(), pd: ti.template(), Ap: ti.template(), ft: ti.template(),
+                cg: ti.template()):
+    """Viscosity: CG update of w, r, p.
+
+    **Inputs**
+
+    - `w`, `r`, `pd`, `Ap` : f32 fields, face grid
+    - `ft` : i32 field, face types
+    - `cg` : f32 field (3,) [rr, pAp, rr_new]
+
+    **Outputs**
+
+    - w, r, pd, cg written in place
+
+    **Note** : alpha, beta computed on GPU (no read-back).
+    """
+    alpha = cg[0] / ti.max(cg[1], 1e-30)
+    rr_new = 0.0
+    for i, j in w:
+        if ft[i, j] == VISC_FREE:
+            w[i, j] += alpha * pd[i, j]
+            r[i, j] -= alpha * Ap[i, j]
+            rr_new += r[i, j] * r[i, j]
+    cg[2] = rr_new
+    beta = cg[2] / ti.max(cg[0], 1e-30)
+    for i, j in w:
+        if ft[i, j] == VISC_FREE:
+            pd[i, j] = r[i, j] + beta * pd[i, j]
+    cg[0] = cg[2]
+
+
 # ---------------------------------------------------------------- 4 bis. projection de densité (positions)
 # Deuxième projection, séparée de celle des vitesses (comme DFSPH : solveur de divergence + solveur de densité
 # constante ; Kugelstadt et al. 2019 sur grille). La projection de vitesse rend u à divergence nulle sur la grille,
@@ -530,7 +771,7 @@ def density_cg_init(phi: ti.template(), r: ti.template(), pd: ti.template(), rhs
             for di, dj in ti.static(((1, 0), (-1, 0), (0, 1), (0, -1))):
                 ni, nj = i + di, j + dj
                 if 0 <= ni < nx and 0 <= nj < ny:
-                    if ctype[ni, nj] != FLUID:
+                    if ctype[ni, nj] == AIR or ctype[ni, nj] == MOVING:   # parois : dans la volume map
                         surface = True
             e = dens[i, j] - 1.0
             if surface:

@@ -6,7 +6,10 @@
       "PowerShell(& C:\\\\Users\\\\lucas\\\\miniconda3\\\\python.exe \"$env:LOCALAPPDATA\\\\Temp\\\\claude\\\\c--Users-lucas-Dev-Fun-APIC\\\\4594f13a-c779-42d4-8db7-96fd7976fac6\\\\scratchpad\\\\split_boundary.py\")",
       "PowerShell(& C:\\\\Users\\\\lucas\\\\miniconda3\\\\python.exe \"$env:LOCALAPPDATA\\\\Temp\\\\claude\\\\c--Users-lucas-Dev-Fun-APIC\\\\4594f13a-c779-42d4-8db7-96fd7976fac6\\\\scratchpad\\\\check_ui_faces.py\" 2>&1 | Select-String -NotMatch \"Taichi\\\\]\")",
       "PowerShell(cd c:\\\\Users\\\\lucas\\\\Dev\\\\Fun\\\\APIC; foreach \\($f in 'Solver/APIC.py','Solver/physics.py','Solver/boundary.py','Solver/walls.py','Solver/Fluid/fluid.py','Solver/Solid/solid.py','Solver/Solid/concrete.py','Solver/Time_integration/time_integration.py'\\) { \"$f $\\(\\(Get-Content $f\\).Count\\)\" })",
-      "PowerShell(cd c:\\\\Users\\\\lucas\\\\Dev\\\\Fun\\\\APIC; foreach \\($f in \"main.py\",\"test_cases\\\\poutre_endommagement.py\",\"test_cases\\\\beton_arme_flexion.py\",\"test_cases\\\\beton_arme_section.py\",\"test_cases\\\\hydraulic_jump.py\"\\) { & C:\\\\Users\\\\lucas\\\\miniconda3\\\\python.exe -m py_compile $f; \"$f -> $LASTEXITCODE\" }; git diff --stat)"
+      "PowerShell(cd c:\\\\Users\\\\lucas\\\\Dev\\\\Fun\\\\APIC; foreach \\($f in \"main.py\",\"test_cases\\\\poutre_endommagement.py\",\"test_cases\\\\beton_arme_flexion.py\",\"test_cases\\\\beton_arme_section.py\",\"test_cases\\\\hydraulic_jump.py\"\\) { & C:\\\\Users\\\\lucas\\\\miniconda3\\\\python.exe -m py_compile $f; \"$f -> $LASTEXITCODE\" }; git diff --stat)",
+      "PowerShell(& C:\\\\Users\\\\lucas\\\\miniconda3\\\\python.exe \"$env:LOCALAPPDATA\\\\Temp\\\\claude\\\\c--Users-lucas-Dev-Fun-APIC\\\\4594f13a-c779-42d4-8db7-96fd7976fac6\\\\scratchpad\\\\patch_expr_walls.py\")",
+      "PowerShell(& C:\\\\Users\\\\lucas\\\\miniconda3\\\\python.exe \"$env:LOCALAPPDATA\\\\Temp\\\\claude\\\\c--Users-lucas-Dev-Fun-APIC\\\\4594f13a-c779-42d4-8db7-96fd7976fac6\\\\scratchpad\\\\patch_phys_ui2.py\"; Select-String -Path ui\\\\ui.py -Pattern \"_square|runner\\\\.n\\\\b|r\\\\.n\\\\b|1\\\\.0 - span\" | Select-Object LineNumber, Line)",
+      "PowerShell(& C:\\\\Users\\\\lucas\\\\miniconda3\\\\python.exe \"$env:LOCALAPPDATA\\\\Temp\\\\claude\\\\c--Users-lucas-Dev-Fun-APIC\\\\4594f13a-c779-42d4-8db7-96fd7976fac6\\\\scratchpad\\\\patch_view_ui.py\")"
     ]
   }
 }

@@ -16,19 +16,53 @@ import numpy as np
 from PySide6.QtCore import QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QBrush, QColor, QImage, QKeySequence, QPainter, QPen
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDockWidget, QDoubleSpinBox, QFileDialog,
-                               QFrame, QGridLayout, QHeaderView, QLabel, QMainWindow, QMessageBox, QPushButton,
+                               QFrame, QGridLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
+                               QPushButton,
                                QSpinBox, QToolBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
-from ui.kernels import FLUID_MODES
+from ui.kernels import FLUID_MODES, MODE_DENSITY, MODE_NU
 from ui.runner import SIDES, SimulationRunner
 
-INT_RANGES = {"nx": (8, 4096), "ny": (8, 4096), "bound": (1, 16), "ppc": (1, 4), "substeps": (1, 1000), "seed": (0, 10**9),
+INT_RANGES = {"nx": (8, 8192), "bound": (1, 16), "ppc": (1, 4), "substeps": (1, 1000), "seed": (0, 10**9),
               "capacity": (0, 5_000_000), "res": (200, 2000), "color_mode": (0, 1)}
 SIDE_LABELS = {"left": "gauche", "right": "droite", "bottom": "bas", "top": "haut"}
-FLOAT_RANGES = {"obstacle_friction": (0.0, 1.0), "volume_correction": (0.0, 2.0)}
+FLOAT_RANGES = {"obstacle_friction": (0.0, 1.0), "volume_correction": (0.0, 2.0), "Lx": (1e-4, 1e6),
+                "Ly": (1e-4, 1e6), "fluid_nu": (0.0, 1e3), "smagorinsky": (0.0, 20.0)}
 WALL_COLORS = {"inlet": QColor(60, 200, 90), "outlet": QColor(230, 70, 70), "wall": QColor(230, 190, 60)}
 SNAP_PX = 12                                   # distance au bord (px) qui fait passer en mode paroi
 HANDLE_PX = 7
+
+
+def _parse(text: str):
+    """Boundary value typed in a field: number if it parses, else expression string.
+
+    **Inputs**
+
+    - `text` : str
+
+    **Outputs**
+
+    - float | str
+    """
+    text = text.strip() or "0"
+    try:
+        return float(text)
+    except ValueError:
+        return text
+
+
+def _fmt(value) -> str:
+    """Display a boundary value (number or expression).
+
+    **Inputs**
+
+    - `value` : float | str
+
+    **Outputs**
+
+    - str
+    """
+    return f"{value:g}" if isinstance(value, (int, float)) else f"« {value} »"
 
 
 class Viewport(QWidget):
@@ -47,7 +81,9 @@ class Viewport(QWidget):
         """
         super().__init__(parent)
         self.runner = runner
-        self.x0, self.y0, self.scale = 0.0, 0.0, 1.0     # vue = [x0, x0 + 1/scale] × [y0, y0 + 1/scale]
+        # vue = toute la fenêtre : coin bas-gauche (x0, y0) en m, mpp = mètres par pixel écran ; _fit : la vue suit
+        # la fenêtre (boîte entière) tant que l'on n'a ni zoomé ni déplacé
+        self.x0, self.y0, self.mpp, self._fit = 0.0, 0.0, 0.0, True
         self.sel = None
         self.wsel = None
         self.hover_wall = None                            # (side, k) pendant le survol d'un mur
@@ -64,9 +100,19 @@ class Viewport(QWidget):
         self.setAutoFillBackground(True)
 
     @property
-    def n(self) -> int:
-        """Cells per domain unit, max(nx, ny) (int)."""
-        return self.runner.n
+    def n(self) -> float:
+        """Cells per metre, 1 / dx (float) : k / n = cell -> m, x * n = m -> cell."""
+        return 1.0 / self.runner.dx
+
+    @property
+    def Lx(self) -> float:
+        """Box width (m)."""
+        return self.runner.Lx
+
+    @property
+    def Ly(self) -> float:
+        """Box height (m)."""
+        return self.runner.Ly
 
     @property
     def nx(self) -> int:
@@ -92,7 +138,7 @@ class Viewport(QWidget):
         return self.ny if side in ("left", "right") else self.nx
 
     def side_extent(self, side: str) -> float:
-        """Wall length in domain units.
+        """Wall length (m).
 
         **Inputs**
 
@@ -115,7 +161,7 @@ class Viewport(QWidget):
 
         **Inputs**
 
-        - `buf` : np.ndarray u8 (res, res, 3)
+        - `buf` : np.ndarray u8 (res_y, res_x, 3), box aspect ratio
 
         **Outputs**
 
@@ -138,18 +184,40 @@ class Viewport(QWidget):
         return QSize(700, 700)
 
     # ------------------------------------------------------------ transformations
-    def _square(self):
-        """Centered square drawing area of the widget.
+    def _fit_mpp(self) -> float:
+        """Metres per screen pixel that fit the whole box in the widget (small margin).
 
         **Outputs**
 
-        - tuple[int, int, int]   x offset, y offset, side (px)
+        - float
         """
-        side = min(self.width(), self.height())
-        return (self.width() - side) // 2, (self.height() - side) // 2, side
+        W, H = max(self.width(), 1), max(self.height(), 1)
+        return 1.03 * max(self.Lx / W, self.Ly / H)
+
+    def _fit_view(self) -> None:
+        """Center the whole box in the widget.
+
+        **Outputs**
+
+        - self.x0, self.y0, self.mpp set
+        """
+        self.mpp = self._fit_mpp()
+        self.x0 = 0.5 * self.Lx - 0.5 * self.width() * self.mpp
+        self.y0 = 0.5 * self.Ly - 0.5 * self.height() * self.mpp
+
+    def _view(self) -> float:
+        """Current metres per pixel (fits the box first if the view follows the window).
+
+        **Outputs**
+
+        - float
+        """
+        if self._fit or self.mpp <= 0.0:
+            self._fit_view()
+        return self.mpp
 
     def px_to_dom(self, pos) -> tuple[float, float]:
-        """Convert a widget pixel position to domain coordinates.
+        """Convert a widget pixel position to box coordinates (m).
 
         **Inputs**
 
@@ -159,12 +227,11 @@ class Viewport(QWidget):
 
         - tuple[float, float]   (x, y)
         """
-        ox, oy, side = self._square()
-        sx, sy = (pos.x() - ox) / side, (pos.y() - oy) / side
-        return self.x0 + sx / self.scale, self.y0 + (1.0 - sy) / self.scale
+        mpp = self._view()
+        return self.x0 + pos.x() * mpp, self.y0 + (self.height() - pos.y()) * mpp
 
     def dom_to_px(self, x: float, y: float) -> tuple[float, float]:
-        """Convert domain coordinates to widget pixels.
+        """Convert box coordinates (m) to widget pixels.
 
         **Inputs**
 
@@ -174,17 +241,29 @@ class Viewport(QWidget):
 
         - tuple[float, float]   (px, py)
         """
-        ox, oy, side = self._square()
-        return ox + (x - self.x0) * self.scale * side, oy + (1.0 - (y - self.y0) * self.scale) * side
+        mpp = self._view()
+        return (x - self.x0) / mpp, self.height() - (y - self.y0) / mpp
 
     def px_per_unit(self) -> float:
-        """Screen pixels per domain unit at the current zoom.
+        """Screen pixels per metre at the current zoom.
 
         **Outputs**
 
         - float
         """
-        return self._square()[2] * self.scale
+        return 1.0 / self._view()
+
+    def render_view(self) -> tuple[float, float, float, tuple[int, int]]:
+        """Image the solver must render for the current view (window aspect, at most res pixels on the long side).
+
+        **Outputs**
+
+        - tuple : x0, y0 (m, bottom-left), k (m per image pixel), (width, height) px
+        """
+        mpp = self._view()
+        W, H = max(self.width(), 1), max(self.height(), 1)
+        s = min(1.0, self.runner.p["res"] / max(W, H))
+        return self.x0, self.y0, mpp / s, (max(1, int(W * s)), max(1, int(H * s)))
 
     def cell_at(self, pos) -> tuple[int, int]:
         """Cell under a pixel position (clamped to the grid).
@@ -216,7 +295,7 @@ class Viewport(QWidget):
         x, y = self.px_to_dom(pos)
         ppu = self.px_per_unit()
         n, b = self.n, self.bound
-        Lx, Ly = self.nx / n, self.ny / n
+        Lx, Ly = self.Lx, self.Ly
         cands = {"left": abs(x) * ppu, "right": abs(Lx - x) * ppu, "bottom": abs(y) * ppu, "top": abs(Ly - y) * ppu}
         side = min(cands, key=cands.get)
         band = b / n
@@ -231,25 +310,41 @@ class Viewport(QWidget):
         return side, k
 
     def _clamp_view(self) -> None:
-        """Keep the view inside the unit square.
+        """Keep the box in view : centered along an axis where the view is larger than the box, else no
+        scrolling past its edges.
 
         **Outputs**
 
         - self.x0, self.y0 clamped
         """
-        span = 1.0 / self.scale
-        self.x0 = float(np.clip(self.x0, 0.0, 1.0 - span))
-        self.y0 = float(np.clip(self.y0, 0.0, 1.0 - span))
+        for attr, L, npx in (("x0", self.Lx, self.width()), ("y0", self.Ly, self.height())):
+            span = npx * self.mpp
+            v = 0.5 * (L - span) if span >= L else float(np.clip(getattr(self, attr), 0.0, L - span))
+            setattr(self, attr, v)
 
     def reset_view(self) -> None:
-        """Show the whole domain (no zoom).
+        """Show the whole box, fitted to the window.
 
         **Outputs**
 
-        - self.x0, self.y0, self.scale reset, repaint scheduled
+        - view fitted and following the window, repaint scheduled
         """
-        self.x0, self.y0, self.scale = 0.0, 0.0, 1.0
+        self._fit = True
+        self._fit_view()
         self.update()
+
+    def resizeEvent(self, event) -> None:
+        """Keep the view consistent when the widget is resized (refit if not zoomed).
+
+        **Inputs**
+
+        - `event` : QResizeEvent
+        """
+        if self._fit:
+            self._fit_view()
+        elif self.mpp > 0.0:
+            self._clamp_view()
+        super().resizeEvent(event)
 
     # ------------------------------------------------------------ segments de paroi (géométrie écran)
     def _edge_point(self, side: str, along: float, depth_px: float = 0.0) -> QPointF:
@@ -269,12 +364,12 @@ class Viewport(QWidget):
             px, py = self.dom_to_px(0.0, along)
             return QPointF(px + depth_px, py)
         if side == "right":
-            px, py = self.dom_to_px(self.nx / self.n, along)
+            px, py = self.dom_to_px(self.Lx, along)
             return QPointF(px - depth_px, py)
         if side == "bottom":
             px, py = self.dom_to_px(along, 0.0)
             return QPointF(px, py - depth_px)
-        px, py = self.dom_to_px(along, self.ny / self.n)
+        px, py = self.dom_to_px(along, self.Ly)
         return QPointF(px, py + depth_px)
 
     def _segment_rect(self, side: str, a: float, b: float, thick: float, inset: float = 0.0) -> QRectF:
@@ -340,13 +435,19 @@ class Viewport(QWidget):
 
         **Outputs**
 
-        - self.x0, self.y0, self.scale updated
+        - self.x0, self.y0, self.mpp updated
         """
-        xc, yc = self.px_to_dom(event.position())
-        new_scale = float(np.clip(self.scale * 1.25 ** (event.angleDelta().y() / 120.0), 1.0, 64.0))
-        self.x0 = xc - (xc - self.x0) * self.scale / new_scale       # le point sous le curseur reste fixe
-        self.y0 = yc - (yc - self.y0) * self.scale / new_scale
-        self.scale = new_scale
+        pos = event.position()
+        xc, yc = self.px_to_dom(pos)
+        fit = self._fit_mpp()
+        mpp = self._view() / 1.25 ** (event.angleDelta().y() / 120.0)
+        mpp = float(np.clip(mpp, self.runner.dx / 40.0, fit))      # au plus : une cellule = 40 px
+        if mpp >= fit * 0.999:                          # dézoom complet : la vue suit de nouveau la fenêtre
+            self.reset_view()
+            return
+        self._fit, self.mpp = False, mpp
+        self.x0 = xc - pos.x() * mpp                    # le point sous le curseur reste fixe
+        self.y0 = yc - (self.height() - pos.y()) * mpp
         self._clamp_view()
         self.update()
 
@@ -426,11 +527,12 @@ class Viewport(QWidget):
                 self._moved = True
                 self.update()
         elif self._pan is not None:
-            _, _, side = self._square()
             d = pos - self._pan
             self._pan = pos
-            self.x0 -= d.x() / (side * self.scale)
-            self.y0 += d.y() / (side * self.scale)
+            mpp = self._view()
+            self._fit = False
+            self.x0 -= d.x() * mpp
+            self.y0 += d.y() * mpp
             self._clamp_view()
             self.update()
         # survol : mur ou cellule
@@ -442,9 +544,9 @@ class Viewport(QWidget):
         if wall is not None:
             side, k = wall
             axis = "y" if side in ("left", "right") else "x"
-            self.hoverChanged.emit(f"paroi {SIDE_LABELS[side]}  {axis} = {(k + 0.5) / self.n:.3f}  (cellule {k})")
-        elif 0.0 <= x < self.nx / self.n and 0.0 <= y < self.ny / self.n:
-            self.hoverChanged.emit(f"cellule ({int(x * self.n)}, {int(y * self.n)})  x={x:.3f} y={y:.3f}")
+            self.hoverChanged.emit(f"paroi {SIDE_LABELS[side]}  {axis} = {(k + 0.5) / self.n:.4g} m  (cellule {k})")
+        elif 0.0 <= x < self.Lx and 0.0 <= y < self.Ly:
+            self.hoverChanged.emit(f"cellule ({int(x * self.n)}, {int(y * self.n)})  x = {x:.4g} m  y = {y:.4g} m")
 
     def mouseReleaseEvent(self, event) -> None:
         """End drags; a click without motion on a wall selects the whole wall.
@@ -507,11 +609,9 @@ class Viewport(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.fillRect(self.rect(), QColor(16, 16, 24))
-        ox, oy, side = self._square()
-        clip = QRectF(ox, oy, side, side)
+        clip = QRectF(self.rect())
         if self._qimg is not None:
-            painter.drawImage(QRect(ox, oy, side, side), self._qimg)
-        painter.setClipRect(clip)
+            painter.drawImage(self.rect(), self._qimg)  # image rendue aux proportions de la fenêtre
         n, b = self.n, self.bound
         thick = max(4.0, min(10.0, b / n * self.px_per_unit()))
 
@@ -687,12 +787,13 @@ class UI(QMainWindow):
                 item = QTreeWidgetItem(parent, [label])
                 self.tree.setItemWidget(item, 1, self._make_editor(key))
 
-        add_params(folder(None, "Domaine"), ["nx", "ny", "bound", "ppc", "res", "seed", "capacity"])
+        add_params(folder(None, "Domaine"), ["Lx", "Ly", "nx", "bound", "ppc", "res", "seed", "capacity"])
         add_params(folder(None, "Solveur"), ["cfl", "substeps", "gravity", "incompressible", "free_surface",
-                                             "cg_iters", "volume_correction", "density_iters", "obstacle_friction",
+                                             "cg_iters", "multigrid", "volume_correction", "density_iters", "visc_iters",
+                                             "obstacle_friction",
                                              "use_damage", "use_rupture", "color_mode"])
         mats = folder(None, "Matériaux")
-        add_params(folder(mats, "Fluide"), ["fluid_rho", "fluid_E"])
+        add_params(folder(mats, "Fluide"), ["fluid_rho", "fluid_E", "fluid_nu", "smagorinsky"])
         add_params(folder(mats, "Solide"), ["solid_rho", "solid_E", "solid_nu", "eps0", "epsf", "tau_D", "k_res"])
         self.item_ic = folder(None, "État initial")
         self.item_bc = folder(None, "Conditions aux limites (parois)")
@@ -759,18 +860,18 @@ class UI(QMainWindow):
             s = SIDES.index(w["side"])
             axis = "y" if w["side"] in ("left", "right") else "x"
             ln = r.ny if w["side"] in ("left", "right") else r.nx
-            k0, k1 = int(np.floor(w["span"][0] * r.n + 1e-9)), int(np.ceil(w["span"][1] * r.n - 1e-9))
+            k0, k1 = int(np.floor(w["span"][0] / r.dx + 1e-9)), int(np.ceil(w["span"][1] / r.dx - 1e-9))
             k0, k1 = max(k0, p["bound"]), min(k1, ln - p["bound"])
             moved = int((wdepth[s, k0:k1] > p["bound"]).sum()) if k1 > k0 else 0
             kind = {"inlet": "entrée", "outlet": "sortie", "wall": "mur"}[w["type"]]
-            vel = f" v = ({w['velocity'][0]:g}, {w['velocity'][1]:g})," if w["type"] == "inlet" else ""
+            vel = f" v = ({_fmt(w['velocity'][0])}, {_fmt(w['velocity'][1])})," if w["type"] == "inlet" else ""
             if w["type"] == "outlet":
-                vel = f" pression imposée p = {w['pressure']:g}," if w.get("pressure") else " libre (p = 0),"
+                vel = f" pression imposée p = {_fmt(w['pressure'])}," if w.get("pressure") else " libre (p = 0),"
             elif w["type"] == "wall":
                 vel = f" frottement β = {w.get('friction', 0.0):g},"
             note = f", portée par la face d'un obstacle sur {moved} cellules" if moved else ""
             row(self.item_bc, f"{k}. paroi {SIDE_LABELS[w['side']]}",
-                f"{kind},{vel} {axis} ∈ [{w['span'][0]:.3f}, {w['span'][1]:.3f}]{note}")
+                f"{kind},{vel} {axis} ∈ [{w['span'][0]:.4g}, {w['span'][1]:.4g}] m{note}")
 
     def _build_scene_dock(self) -> None:
         """Build the scene dock: cell actions, wall actions, display options."""
@@ -808,20 +909,20 @@ class UI(QMainWindow):
         self.lbl_wall.setWordWrap(True)
         grid.addWidget(self.lbl_wall, base + 1, 0, 1, 2)
         grid.addWidget(QLabel("vx"), base + 2, 0)
-        self.spin_wvx = QDoubleSpinBox()
-        self.spin_wvx.setRange(-100, 100)
-        self.spin_wvx.setValue(1.0)
+        tip = ("Nombre ou expression de x, y, t (unités domaine, s) : + - * / **, min, max, abs, sqrt, exp, log, "
+               "sin, cos, tan, tanh ; constantes rho, g, pi, Lx, Ly, dx et runner.consts")
+        self.spin_wvx = QLineEdit("1.0")               # nombre ou expression, ex. "U*min(t/T, 1)"
+        self.spin_wvx.setToolTip(tip)
         grid.addWidget(self.spin_wvx, base + 2, 1)
         grid.addWidget(QLabel("vy"), base + 3, 0)
-        self.spin_wvy = QDoubleSpinBox()
-        self.spin_wvy.setRange(-100, 100)
+        self.spin_wvy = QLineEdit("0.0")
+        self.spin_wvy.setToolTip(tip)
         grid.addWidget(self.spin_wvy, base + 3, 1)
         grid.addWidget(QLabel("Sortie : pression p"), base + 4, 0)
-        self.spin_wp = QDoubleSpinBox()                 # pression imposée sur une sortie, 0 = libre
-        self.spin_wp.setRange(0.0, 1e9)
-        self.spin_wp.setDecimals(3)
-        self.spin_wp.setSpecialValueText("libre (p = 0)")
-        self.spin_wp.setToolTip("Pression imposée sur la sortie (Dirichlet, mode incompressible) ; 0 = sortie libre")
+        self.spin_wp = QLineEdit("0")                  # pression imposée sur une sortie, 0 = libre
+        self.spin_wp.setPlaceholderText("0 = libre, ou rho*g*(H - y)")
+        self.spin_wp.setToolTip("Pression imposée sur la sortie (Dirichlet, mode incompressible), 0 = sortie libre. "
+                                + tip)
         grid.addWidget(self.spin_wp, base + 4, 1)
         grid.addWidget(QLabel("Mur : frottement β"), base + 5, 0)
         self.spin_wf = QDoubleSpinBox()                 # 0 = glissant (défaut), 1 = adhérent
@@ -852,6 +953,7 @@ class UI(QMainWindow):
         grid.addWidget(QLabel("Couleur du fluide"), base + 3, 0)
         self.combo_color = QComboBox()
         self.combo_color.addItems(FLUID_MODES)
+        self.combo_color.setCurrentIndex(MODE_DENSITY)
         self.combo_color.currentIndexChanged.connect(self._on_color_mode)
         grid.addWidget(self.combo_color, base + 3, 1)
         self.lbl_scale = QLabel("")
@@ -910,7 +1012,9 @@ class UI(QMainWindow):
             self.solver.step()
         vp = self.viewport
         self.solver.fluid_mode = self.combo_color.currentIndex()
-        img = self.solver.render(vp.x0, vp.y0, vp.scale, self.chk_grid.isChecked(), self.chk_tint.isChecked())
+        x0, y0, k, size = vp.render_view()
+        img = self.solver.render(x0, y0, grid=self.chk_grid.isChecked(), tint=self.chk_tint.isChecked(), k=k,
+                                 size=size)
         vp.set_image(img)
         self._frames += 1
         if self._frames % 6 == 0:
@@ -919,7 +1023,13 @@ class UI(QMainWindow):
             if mode == 0:
                 self.lbl_scale.setText("")
             else:
-                rng = f"0 … {st['scalar_max']:.3g}" if mode == 1 else f"−{st['scalar_max']:.3g} … +{st['scalar_max']:.3g}"
+                m = st["scalar_max"]
+                if mode in (1, MODE_NU):
+                    rng = f"0 … {m:.3g}"
+                elif mode == MODE_DENSITY:
+                    rng = f"ρ0 − {m:.3g} … ρ0 + {m:.3g} kg/m³"
+                else:
+                    rng = f"−{m:.3g} … +{m:.3g}"
                 self.lbl_scale.setText(f"échelle : {rng} (auto)")
             self.lbl_time.setText(f"t = {st['t']:.3f} s   dt = {st['dt']:.2e}")
             cap = f" / {st['capacity']}" if st["capacity"] != st["n_fluid"] else ""
@@ -1010,9 +1120,10 @@ class UI(QMainWindow):
         - runner.p updated; structural keys mark dirty, others are applied to the solver live
         """
         if key in SimulationRunner.STRUCTURAL:
-            if key in ("nx", "ny"):
-                nx, ny = (int(value), self.runner.ny) if key == "nx" else (self.runner.nx, int(value))
-                self.runner.resize(nx, ny)
+            if key in ("Lx", "Ly", "nx"):               # boîte ou résolution : matrices rééchantillonnées
+                self.runner.p[key] = value
+                self.runner.regrid()
+                self.viewport.reset_view()
             else:
                 self.runner.p[key] = value
             self._mark_dirty()
@@ -1069,11 +1180,11 @@ class UI(QMainWindow):
             self.lbl_wall.setText("Aucune paroi sélectionnée\n(clic sur un bord : tout le mur ; glisser : un segment)")
         else:
             side, k0, k1 = sel
-            n = self.runner.n
+            n = 1.0 / self.runner.dx                   # cellules par mètre
             axis = "y" if side in ("left", "right") else "x"
             ln = self.viewport.side_len(side)
             whole = " (mur entier)" if (k0, k1) == (self.runner.p["bound"], ln - self.runner.p["bound"] - 1) else ""
-            self.lbl_wall.setText(f"Paroi {SIDE_LABELS[side]}{whole}\n{axis} de {k0 / n:.3f} à {(k1 + 1) / n:.3f}, "
+            self.lbl_wall.setText(f"Paroi {SIDE_LABELS[side]}{whole}\n{axis} de {k0 / n:.4g} à {(k1 + 1) / n:.4g} m, "
                                   f"cellules {k0}..{k1}")
 
     def _apply_cells(self, fn) -> None:
@@ -1109,11 +1220,19 @@ class UI(QMainWindow):
         if self.viewport.wsel is None:
             return
         side, k0, k1 = self.viewport.wsel
-        n = self.runner.n
-        pressure = self.spin_wp.value() if kind == "outlet" and self.spin_wp.value() > 0 else None
+        n = 1.0 / self.runner.dx                       # cellules par mètre
+        vx, vy, p = (_parse(w.text()) for w in (self.spin_wvx, self.spin_wvy, self.spin_wp))
+        pressure = p if kind == "outlet" and p != 0.0 else None
         friction = self.spin_wf.value() if kind == "wall" else None
-        self.runner.set_wall(side, kind, velocity=(self.spin_wvx.value(), self.spin_wvy.value()),
-                             span=(k0 / n, (k1 + 1) / n), pressure=pressure, friction=friction)
+        backup = [dict(w) for w in self.runner.walls]
+        try:
+            self.runner.set_wall(side, kind, velocity=(vx, vy), span=(k0 / n, (k1 + 1) / n), pressure=pressure,
+                                 friction=friction)
+            self.runner.wall_table()                   # vérifie les noms des expressions (constantes connues)
+        except ValueError as exc:
+            self.runner.walls = backup                 # segment refusé : parois inchangées
+            QMessageBox.warning(self, "Condition limite", str(exc))
+            return
         self._mark_dirty()
 
     # ------------------------------------------------------------ fichiers
