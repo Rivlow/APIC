@@ -1,8 +1,9 @@
-# Solver/bc_expr.py -- Conditions aux limites données par une expression de (x, y, t) et de constantes.
+# Solver/bc_expr.py -- Conditions aux limites données par une expression de (x, y, z, t) et de constantes.
 #
-# Une valeur imposée (vitesse d'entrée vx / vy, pression de sortie) est un nombre ou une chaîne, par exemple
-# "rho*g*(H - y)" ou "U*(1 - exp(-t/T))". Variables : x, y (unités domaine, centre de la cellule de mur sur le mur),
-# t (temps simulé, s). Constantes : rho, g, pi, Lx, Ly, dx et celles de SimulationRunner.consts. Fonctions : min,
+# Une valeur imposée (vitesse d'entrée vx / vy / vz, pression de sortie) est un nombre ou une chaîne, par exemple
+# "rho*g*(H - y)" ou "U*(1 - exp(-t/T))". Variables : x, y, z (unités domaine, centre de la cellule de mur sur le
+# mur ; z = 0 en 2D), t (temps simulé, s). Constantes : rho, g, pi, Lx, Ly, Lz, dx et celles de
+# SimulationRunner.consts. Fonctions : min,
 # max, abs, sqrt, exp, log, sin, cos, tan, tanh ; comparaisons < <= > >= valant 1 ou 0 (ex. "U*(y < H)").
 # Rien d'autre n'est accepté (analyse de l'AST, pas d'eval libre).
 #
@@ -18,7 +19,7 @@ import tempfile
 
 import numpy as np
 
-VARS = ("x", "y", "t")
+VARS = ("x", "y", "z", "t")
 FUNCS = {"min": ("np.minimum", "ti.min"), "max": ("np.maximum", "ti.max"), "abs": ("np.abs", "ti.abs"),
          "sqrt": ("np.sqrt", "ti.sqrt"), "exp": ("np.exp", "ti.exp"), "log": ("np.log", "ti.log"),
          "sin": ("np.sin", "ti.sin"), "cos": ("np.cos", "ti.cos"), "tan": ("np.tan", "ti.tan"),
@@ -121,13 +122,13 @@ def _translate(src: str, consts: dict | None, target: int) -> str:
     return tr(tree)
 
 
-def evaluate(src: str, x: np.ndarray, y: np.ndarray, t: float, consts: dict) -> np.ndarray:
+def evaluate(src: str, x: np.ndarray, y: np.ndarray, z: np.ndarray, t: float, consts: dict) -> np.ndarray:
     """Evaluate an expression with numpy at wall-cell positions.
 
     **Inputs**
 
     - `src` : str expression
-    - `x`, `y` : np.ndarray f64 (m,) positions (domain units)
+    - `x`, `y`, `z` : np.ndarray f64 (m,) positions (domain units ; z = 0 in 2D)
     - `t` : float time
     - `consts` : dict[str, float]
 
@@ -136,21 +137,22 @@ def evaluate(src: str, x: np.ndarray, y: np.ndarray, t: float, consts: dict) -> 
     - np.ndarray f64 (m,)
     """
     code = _translate(src, consts, 0)
-    val = eval(code, {"np": np, "__builtins__": {}}, {"x": x, "y": y, "t": t})   # code issu d'un AST filtré
+    val = eval(code, {"np": np, "__builtins__": {}}, {"x": x, "y": y, "z": z, "t": t})   # code issu d'un AST filtré
     return np.broadcast_to(np.asarray(val, dtype=np.float64), np.shape(x)).copy()
 
 
-def build_kernel(sources: list[str], consts: dict):
+def build_kernel(sources: list[str], consts: dict, dim: int = 2):
     """Generate and import a Taichi kernel that re-evaluates time-dependent wall values.
 
     **Inputs**
 
     - `sources` : list[str] expressions (index = expression id stored in the wall table)
     - `consts` : dict[str, float]
+    - `dim` : int 2 or 3
 
     **Outputs**
 
-    - Taichi kernel `eval_bc(wall_e, wall_v, wall_p, wall_d, t, dx, nx, ny)` (see generated docstring)
+    - Taichi kernel `eval_bc(wall_e, wall_v, wall_p, wall_d, t, dx, nx, ny, nz)` (see generated docstring)
 
     **Note** : Taichi reads kernel source with inspect, so the module is written to a cached file and imported.
     """
@@ -158,9 +160,11 @@ def build_kernel(sources: list[str], consts: dict):
     branches = "\n".join(f"    {'if' if i == 0 else 'elif'} e == {i}:\n        r = {c}" for i, c in enumerate(exprs))
     code = f'''import taichi as ti
 
+DIM = {dim}
+
 
 @ti.func
-def _expr(e: int, x: float, y: float, t: float) -> float:
+def _expr(e: int, x: float, y: float, z: float, t: float) -> float:
     r = 0.0
 {branches}
     return r
@@ -168,28 +172,40 @@ def _expr(e: int, x: float, y: float, t: float) -> float:
 
 @ti.kernel
 def eval_bc(wall_e: ti.template(), wall_v: ti.template(), wall_p: ti.template(), wall_d: ti.template(),
-            t: float, dx: float, nx: int, ny: int):
-    """Re-evaluate time-dependent wall values (vx, vy, p) at wall-cell positions."""
-    for s, k in wall_d:
-        ln = ny if s <= 1 else nx
-        if k < ln:
-            d = wall_d[s, k]
-            x, y = (k + 0.5) * dx, (k + 0.5) * dx
-            if s == 0:
-                x = d * dx
-            elif s == 1:
-                x = (nx - d) * dx
-            elif s == 2:
-                y = d * dx
-            else:
-                y = (ny - d) * dx
-            ids = wall_e[s, k]
-            if ids[0] >= 0:
-                wall_v[s, k][0] = _expr(ids[0], x, y, t)
-            if ids[1] >= 0:
-                wall_v[s, k][1] = _expr(ids[1], x, y, t)
-            if ids[2] >= 0:
-                wall_p[s, k] = _expr(ids[2], x, y, t)
+            t: float, dx: float, nx: int, ny: int, nz: int):
+    """Re-evaluate time-dependent wall values (v..., p) at wall-cell positions (side, ka, kb)."""
+    n = ti.Vector([nx, ny, nz])
+    for s, ka, kb in wall_d:
+        a = s // 2
+        ta, tb = 1, 2                                 # axes tangents (ordre croissant)
+        if a == 1:
+            ta = 0
+        elif a == 2:
+            ta, tb = 0, 1
+        if ti.static(DIM == 2):
+            ta = 1 - a
+        la, lb = 1, 1
+        for c in ti.static(range(3)):
+            if c == ta:
+                la = n[c]
+            if c == tb and ti.static(DIM == 3):
+                lb = n[c]
+        if ka < la and kb < lb:
+            d = wall_d[s, ka, kb]
+            p = ti.Vector([0.0, 0.0, 0.0])
+            for c in ti.static(range(3)):
+                if c == a:
+                    p[c] = d * dx if s % 2 == 0 else (n[c] - d) * dx
+                elif c == ta:
+                    p[c] = (ka + 0.5) * dx
+                elif c == tb and ti.static(DIM == 3):
+                    p[c] = (kb + 0.5) * dx
+            ids = wall_e[s, ka, kb]
+            for ch in ti.static(range(DIM)):
+                if ids[ch] >= 0:
+                    wall_v[s, ka, kb][ch] = _expr(ids[ch], p[0], p[1], p[2], t)
+            if ids[DIM] >= 0:
+                wall_p[s, ka, kb] = _expr(ids[DIM], p[0], p[1], p[2], t)
 '''
     tag = hashlib.sha1(code.encode()).hexdigest()[:16]
     folder = os.path.join(tempfile.gettempdir(), "apic_bc_kernels")

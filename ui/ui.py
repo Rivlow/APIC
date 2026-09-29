@@ -7,6 +7,9 @@ vue, F = vue entière, Échap = désélection. Bouton gauche :
     mur = un segment, aimanté aux frontières de cellules ; les segments existants (vert entrée, rouge
     sortie) ont deux poignées à étirer. Les conditions aux limites n'existent que sur les quatre parois.
 Toute modification de la scène ou d'un paramètre structurel demande un Reset (bandeau orange).
+En 3D (dim = 3), la vue est ui/view3d.Viewport3D (caméra orbitale, zones de paroi rectangulaires, primitives) et
+un dock « Primitives » remplace la boîte de cellules. En pause, l'image n'est recalculée que si quelque chose
+change (vue, scène, couleur, pas de simulation) : aucune copie GPU -> CPU inutile.
 """
 from __future__ import annotations
 
@@ -20,14 +23,16 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDockWidget, 
                                QPushButton,
                                QSpinBox, QToolBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
-from ui.kernels import FLUID_MODES, MODE_DENSITY, MODE_NU
+from ui.kernels import MODE_DENSITY, fluid_modes, mode_signed
 from ui.runner import SIDES, SimulationRunner
+from ui.view3d import PrimPanel, Viewport3D
 
 INT_RANGES = {"nx": (8, 8192), "bound": (1, 16), "ppc": (1, 4), "substeps": (1, 1000), "seed": (0, 10**9),
-              "capacity": (0, 5_000_000), "res": (200, 2000), "color_mode": (0, 1)}
-SIDE_LABELS = {"left": "gauche", "right": "droite", "bottom": "bas", "top": "haut"}
+              "capacity": (0, 50_000_000), "res": (200, 2000), "color_mode": (0, 1), "dim": (2, 3)}
+SIDE_LABELS = {"left": "gauche", "right": "droite", "bottom": "bas", "top": "haut", "back": "arrière",
+               "front": "avant"}
 FLOAT_RANGES = {"obstacle_friction": (0.0, 1.0), "volume_correction": (0.0, 2.0), "Lx": (1e-4, 1e6),
-                "Ly": (1e-4, 1e6), "fluid_nu": (0.0, 1e3), "smagorinsky": (0.0, 20.0)}
+                "Ly": (1e-4, 1e6), "Lz": (1e-4, 1e6), "fluid_nu": (0.0, 1e3), "smagorinsky": (0.0, 20.0)}
 WALL_COLORS = {"inlet": QColor(60, 200, 90), "outlet": QColor(230, 70, 70), "wall": QColor(230, 190, 60)}
 SNAP_PX = 12                                   # distance au bord (px) qui fait passer en mode paroi
 HANDLE_PX = 7
@@ -70,6 +75,7 @@ class Viewport(QWidget):
     wallSelectionChanged = Signal(object)      # (side, k0, k1) cellules le long du mur incluses, ou None
     wallEdited = Signal()                      # une poignée de segment a été déplacée (runner.walls modifié)
     hoverChanged = Signal(str)
+    viewChanged = Signal()                     # zoom, déplacement ou redimensionnement : l'image doit être refaite
 
     def __init__(self, runner: SimulationRunner, parent=None):
         """Create the viewport on a runner (full view, no selection).
@@ -331,6 +337,7 @@ class Viewport(QWidget):
         """
         self._fit = True
         self._fit_view()
+        self.viewChanged.emit()
         self.update()
 
     def resizeEvent(self, event) -> None:
@@ -344,6 +351,7 @@ class Viewport(QWidget):
             self._fit_view()
         elif self.mpp > 0.0:
             self._clamp_view()
+        self.viewChanged.emit()
         super().resizeEvent(event)
 
     # ------------------------------------------------------------ segments de paroi (géométrie écran)
@@ -389,6 +397,16 @@ class Viewport(QWidget):
         p0, p1 = self._edge_point(side, a, inset), self._edge_point(side, b, inset + thick)
         return QRectF(p0, p1).normalized()
 
+    def _walls2d(self):
+        """Wall segments drawable in 2D (flat span on one of the 4 sides ; 3D zones of a 3D scene are skipped).
+
+        **Outputs**
+
+        - list of (index in runner.walls, segment dict)
+        """
+        return [(i, w) for i, w in enumerate(self.runner.walls)
+                if w["side"] in SIDES[:4] and np.ndim(w["span"]) == 1]
+
     def _handle_at(self, pos):
         """Segment handle under the cursor.
 
@@ -400,7 +418,7 @@ class Viewport(QWidget):
 
         - tuple[int, int] | None   (segment index, end 0/1)
         """
-        for idx, w in enumerate(self.runner.walls):
+        for idx, w in self._walls2d():
             for end in (0, 1):
                 c = self._edge_point(w["side"], w["span"][end], 5.0)
                 if abs(c.x() - pos.x()) <= HANDLE_PX and abs(c.y() - pos.y()) <= HANDLE_PX:
@@ -449,6 +467,7 @@ class Viewport(QWidget):
         self.x0 = xc - pos.x() * mpp                    # le point sous le curseur reste fixe
         self.y0 = yc - (self.height() - pos.y()) * mpp
         self._clamp_view()
+        self.viewChanged.emit()
         self.update()
 
     def mousePressEvent(self, event) -> None:
@@ -534,6 +553,7 @@ class Viewport(QWidget):
             self.x0 -= d.x() * mpp
             self.y0 += d.y() * mpp
             self._clamp_view()
+            self.viewChanged.emit()
             self.update()
         # survol : mur ou cellule
         wall = self.wall_at(pos) if self._drag is None else None
@@ -616,8 +636,8 @@ class Viewport(QWidget):
         thick = max(4.0, min(10.0, b / n * self.px_per_unit()))
 
         # segments de paroi de la scène (état courant du runner, même avant Reset)
-        wtype = self.runner.wall_table()[0]
-        for s, sname in enumerate(SIDES):
+        wtype = self.runner.wall_table()[0][:, :, 0]         # tables (4, nm, 1) en 2D
+        for s, sname in enumerate(SIDES[:4]):
             k = b
             ln = self.side_len(sname)
             while k < ln - b:
@@ -630,7 +650,7 @@ class Viewport(QWidget):
                     k += 1
                 col = WALL_COLORS["inlet" if t == 1 else "outlet"]
                 painter.fillRect(self._segment_rect(sname, k0 / n, k / n, thick), QColor(col.red(), col.green(), col.blue(), 170))
-        for w in self.runner.walls:                         # contour + poignées du segment tel que défini
+        for _i, w in self._walls2d():                        # contour + poignées du segment tel que défini
             col = WALL_COLORS[w["type"]]
             painter.setPen(QPen(col, 1.2))
             painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -690,7 +710,8 @@ class UI(QMainWindow):
         self._frames = 0
         self._editors: dict[str, QWidget] = {}
 
-        self.viewport = Viewport(runner)
+        self._render_needed = True                        # en pause : image refaite seulement si quelque chose change
+        self.viewport = self._make_viewport(runner)
         self.banner = QLabel("Modifié — Reset (R) pour appliquer")
         self.banner.setStyleSheet("background: #d0781a; color: white; padding: 4px; font-weight: bold;")
         self.banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -701,17 +722,16 @@ class UI(QMainWindow):
         lay.setSpacing(0)
         lay.addWidget(self.banner)
         lay.addWidget(self.viewport, 1)
+        self._central = lay
         self.setCentralWidget(central)
 
         self._build_params_dock()
         self._build_scene_dock()
+        self._build_prim_dock()
         self._build_toolbar()
         self._build_statusbar()
-
-        self.viewport.selectionChanged.connect(self._on_selection)
-        self.viewport.wallSelectionChanged.connect(self._on_wall_selection)
-        self.viewport.wallEdited.connect(self._mark_dirty)
-        self.viewport.hoverChanged.connect(self.lbl_hover.setText)
+        self._connect_viewport()
+        self._setup_mode()
 
         self.solver = None                                # construit après l'affichage de la fenêtre
         self.statusBar().showMessage("Semis et compilation des kernels…")
@@ -729,6 +749,58 @@ class UI(QMainWindow):
             QTimer.singleShot(200, self._autoplay)
 
     # ------------------------------------------------------------ construction
+    def _make_viewport(self, runner: SimulationRunner):
+        """2D or 3D viewport depending on runner.dim."""
+        return Viewport3D(runner) if runner.dim == 3 else Viewport(runner)
+
+    def _connect_viewport(self) -> None:
+        """Connect the current viewport signals."""
+        vp = self.viewport
+        vp.wallSelectionChanged.connect(self._on_wall_selection)
+        vp.hoverChanged.connect(self.lbl_hover.setText)
+        vp.viewChanged.connect(self._need_render)
+        if isinstance(vp, Viewport3D):
+            vp.primSelected.connect(self._on_prim_pick)
+        else:
+            vp.selectionChanged.connect(self._on_selection)
+            vp.wallEdited.connect(self._mark_dirty)
+
+    def _setup_mode(self) -> None:
+        """Adapt the window to the runner dimension (viewport, docks, color modes, fields)."""
+        three = self.runner.dim == 3
+        want = Viewport3D if three else Viewport
+        if not isinstance(self.viewport, want):
+            old = self.viewport
+            self.viewport = self._make_viewport(self.runner)
+            self._central.replaceWidget(old, self.viewport)
+            old.hide()
+            old.deleteLater()
+            self._connect_viewport()
+        self.viewport.runner = self.runner
+        self.prim_dock.setVisible(three)
+        self.prim_panel.set_runner(self.runner)
+        for wdg in self._cells_widgets:
+            wdg.setVisible(not three)
+        for wdg in self._3d_widgets:
+            wdg.setVisible(three)
+        for wdg in (self.chk_grid, self.chk_tint):
+            wdg.setVisible(not three)
+        self.combo_color.blockSignals(True)
+        cur = self.combo_color.currentData()
+        self.combo_color.clear()
+        for mode, label in fluid_modes(self.runner.dim):
+            self.combo_color.addItem(label, mode)
+        idx = self.combo_color.findData(cur if cur is not None else MODE_DENSITY)
+        self.combo_color.setCurrentIndex(max(idx, 0))
+        self.combo_color.blockSignals(False)
+        for key in ("Lz",):
+            self._param_items[key].setHidden(not three)
+        self._need_render()
+
+    def _need_render(self) -> None:
+        """Ask for a new image at the next tick (view, scene or colors changed)."""
+        self._render_needed = True
+
     def _make_editor(self, key: str):
         """Create the editor widget of a parameter (check box, int or float spin box).
 
@@ -781,13 +853,17 @@ class UI(QMainWindow):
             item.setFirstColumnSpanned(True) if parent is None else None
             return item
 
+        self._param_items = {}
+
         def add_params(parent, keys):
             for key in keys:
                 label = SimulationRunner.LABELS.get(key, key) + (" *" if key in SimulationRunner.STRUCTURAL else "")
                 item = QTreeWidgetItem(parent, [label])
                 self.tree.setItemWidget(item, 1, self._make_editor(key))
+                self._param_items[key] = item
 
-        add_params(folder(None, "Domaine"), ["Lx", "Ly", "nx", "bound", "ppc", "res", "seed", "capacity"])
+        add_params(folder(None, "Domaine"), ["dim", "Lx", "Ly", "Lz", "nx", "bound", "ppc", "res", "seed",
+                                             "capacity"])
         add_params(folder(None, "Solveur"), ["cfl", "substeps", "gravity", "incompressible", "free_surface",
                                              "cg_iters", "multigrid", "volume_correction", "density_iters", "visc_iters",
                                              "obstacle_friction",
@@ -813,65 +889,72 @@ class UI(QMainWindow):
 
         - self.item_ic, self.item_bc children replaced
         """
-        m, p, r = self.runner.m, self.runner.p, self.runner
+        p, r = self.runner.p, self.runner
+        try:
+            m = r.masks()                               # matrices + primitives
+        except Exception as exc:                        # maillage illisible : on résume les matrices seules
+            m = r.m
+            self.statusBar().showMessage(f"Primitive ignorée : {exc}", 5000)
+        dim = r.dim
+        vk = ("vx0", "vy0", "vz0")[:dim]
         for item in (self.item_ic, self.item_bc):
             item.takeChildren()
 
         def row(parent, name, text):
             QTreeWidgetItem(parent, [name, text])
 
-        def vel_groups(mask, vx, vy):
-            """Group mask cells by identical velocity.
-
-            **Inputs**
-
-            - `mask` : np.ndarray bool (nx, ny)
-            - `vx`, `vy` : np.ndarray f32 (nx, ny)
-
-            **Outputs**
-
-            - list[tuple[tuple[float, float], int]]   ((vx, vy), cell count)
-            """
+        def vel_groups(mask):
+            """Group mask cells by identical initial velocity: list of ((v...), cell count)."""
             if not mask.any():
                 return []
-            pairs = np.stack([vx[mask], vy[mask]], axis=1)
-            uniq, counts = np.unique(pairs, axis=0, return_counts=True)
-            return [((float(a), float(b)), int(c)) for (a, b), c in zip(uniq, counts)]
+            vals = np.stack([m[k][mask] for k in vk], axis=1)
+            uniq, counts = np.unique(vals, axis=0, return_counts=True)
+            return [(tuple(float(a) for a in u), int(c)) for u, c in zip(uniq, counts)]
 
-        n_f, n_s = int(m["fluid"].sum()), int(m["solid"].sum())
-        row(self.item_ic, "Fluide", f"{n_f} cellules" if n_f else "aucune")
-        for (vx, vy), c in vel_groups(m["fluid"], m["vx0"], m["vy0"]):
-            if vx or vy:
-                row(self.item_ic, "   vitesse", f"({vx:g}, {vy:g}) sur {c} cellules")
-        row(self.item_ic, "Solide", f"{n_s} cellules" if n_s else "aucune")
-        for (vx, vy), c in vel_groups(m["solid"], m["vx0"], m["vy0"]):
-            if vx or vy:
-                row(self.item_ic, "   vitesse", f"({vx:g}, {vy:g}) sur {c} cellules")
+        for name, key in (("Fluide", "fluid"), ("Solide", "solid")):
+            n_c = int(m[key].sum())
+            row(self.item_ic, name, f"{n_c} cellules" if n_c else "aucune")
+            for vel, c in vel_groups(m[key]):
+                if any(vel):
+                    row(self.item_ic, "   vitesse", f"({', '.join(f'{v:g}' for v in vel)}) sur {c} cellules")
         n_o = int(m["obstacle"].sum())
         row(self.item_ic, "Obstacles", f"{n_o} cellules" if n_o else "aucun")
+        if r.prims:
+            row(self.item_ic, "Primitives", f"{len(r.prims)} (dock « Primitives »)")
 
         row(self.item_bc, "Par défaut", f"mur glissant, bande de {p['bound']} cellules ; "
                                         f"obstacles : frottement β = {p['obstacle_friction']:g}")
-        tab = r.wall_table()
-        wdepth = tab.depth
+        try:
+            wdepth = r.wall_table().depth
+        except Exception:
+            wdepth = None
         if not r.walls:
-            row(self.item_bc, "Segments", "aucun (clic sur un bord du domaine)")
+            row(self.item_bc, "Zones", "aucune (clic sur une face du domaine)")
+        from Solver.walls import frame, span_box
         for k, w in enumerate(r.walls, start=1):
             s = SIDES.index(w["side"])
-            axis = "y" if w["side"] in ("left", "right") else "x"
-            ln = r.ny if w["side"] in ("left", "right") else r.nx
-            k0, k1 = int(np.floor(w["span"][0] / r.dx + 1e-9)), int(np.ceil(w["span"][1] / r.dx - 1e-9))
-            k0, k1 = max(k0, p["bound"]), min(k1, ln - p["bound"])
-            moved = int((wdepth[s, k0:k1] > p["bound"]).sum()) if k1 > k0 else 0
+            if s >= 2 * dim:
+                continue
+            ts = frame(s, dim)[2]
+            box = span_box(w["span"])
+            if len(box) != len(ts):
+                continue
+            ext = " × ".join(f"{'xyz'[t]} ∈ [{iv[0]:.4g}, {iv[1]:.4g}]" for t, iv in zip(ts, box))
+            moved = 0
+            if wdepth is not None:
+                ks = [(max(int(np.floor(iv[0] / r.dx + 1e-9)), p["bound"]),
+                       min(int(np.ceil(iv[1] / r.dx - 1e-9)), r.shape[t] - p["bound"])) for iv, t in zip(box, ts)]
+                if all(b1 > b0 for b0, b1 in ks):
+                    kb = slice(*ks[1]) if dim == 3 else slice(0, 1)
+                    moved = int((wdepth[s, slice(*ks[0]), kb] > p["bound"]).sum())
             kind = {"inlet": "entrée", "outlet": "sortie", "wall": "mur"}[w["type"]]
-            vel = f" v = ({_fmt(w['velocity'][0])}, {_fmt(w['velocity'][1])})," if w["type"] == "inlet" else ""
+            vel = f" v = ({', '.join(_fmt(c) for c in w['velocity'])})," if w["type"] == "inlet" else ""
             if w["type"] == "outlet":
                 vel = f" pression imposée p = {_fmt(w['pressure'])}," if w.get("pressure") else " libre (p = 0),"
             elif w["type"] == "wall":
                 vel = f" frottement β = {w.get('friction', 0.0):g},"
             note = f", portée par la face d'un obstacle sur {moved} cellules" if moved else ""
-            row(self.item_bc, f"{k}. paroi {SIDE_LABELS[w['side']]}",
-                f"{kind},{vel} {axis} ∈ [{w['span'][0]:.4g}, {w['span'][1]:.4g}] m{note}")
+            row(self.item_bc, f"{k}. paroi {SIDE_LABELS[w['side']]}", f"{kind},{vel} {ext} m{note}")
 
     def _build_scene_dock(self) -> None:
         """Build the scene dock: cell actions, wall actions, display options."""
@@ -890,9 +973,9 @@ class UI(QMainWindow):
         grid.addWidget(self.spin_vy, 2, 1)
         actions = [("Eau", lambda m: self.runner.set_fluid(m, self._vel())),
                    ("Solide", lambda m: self.runner.set_solid(m, self._vel())),
-                   ("Obstacle", self.runner.set_obstacle),
+                   ("Obstacle", lambda m: self.runner.set_obstacle(m)),
                    ("Vitesse initiale (vx, vy)", lambda m: self.runner.set_velocity(m, self._vel())),
-                   ("Effacer", self.runner.clear)]
+                   ("Effacer", lambda m: self.runner.clear(m))]
         self._cell_buttons = []
         for row, (text, fn) in enumerate(actions, start=3):
             b = QPushButton(text)
@@ -901,11 +984,14 @@ class UI(QMainWindow):
             grid.addWidget(b, row, 0, 1, 2)
             self._cell_buttons.append(b)
         base = 3 + len(actions)
+        self._cells_widgets = [self.lbl_sel, self.spin_vx, self.spin_vy] + self._cell_buttons + [
+            grid.itemAtPosition(1, 0).widget(), grid.itemAtPosition(2, 0).widget()]
         # ---- parois (conditions aux limites)
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
         grid.addWidget(sep, base, 0, 1, 2)
-        self.lbl_wall = QLabel("Aucune paroi sélectionnée\n(clic sur un bord : tout le mur ; glisser : un segment)")
+        self.lbl_wall = QLabel("Aucune paroi sélectionnée\n(clic sur un bord : tout le mur ; glisser : un segment ; "
+                               "3D : clic sur une face, Maj + glisser : un rectangle)")
         self.lbl_wall.setWordWrap(True)
         grid.addWidget(self.lbl_wall, base + 1, 0, 1, 2)
         grid.addWidget(QLabel("vx"), base + 2, 0)
@@ -918,6 +1004,11 @@ class UI(QMainWindow):
         self.spin_wvy = QLineEdit("0.0")
         self.spin_wvy.setToolTip(tip)
         grid.addWidget(self.spin_wvy, base + 3, 1)
+        self.lbl_wvz = QLabel("vz")
+        self.spin_wvz = QLineEdit("0.0")
+        self.spin_wvz.setToolTip(tip)
+        grid.addWidget(self.lbl_wvz, base + 10, 0)
+        grid.addWidget(self.spin_wvz, base + 10, 1)
         grid.addWidget(QLabel("Sortie : pression p"), base + 4, 0)
         self.spin_wp = QLineEdit("0")                  # pression imposée sur une sortie, 0 = libre
         self.spin_wp.setPlaceholderText("0 = libre, ou rho*g*(H - y)")
@@ -939,7 +1030,7 @@ class UI(QMainWindow):
             b.setEnabled(False)
             grid.addWidget(b, row, 0, 1, 2)
             self._wall_buttons.append(b)
-        base = base + 9
+        base = base + 11
         # ---- affichage
         sep2 = QFrame()
         sep2.setFrameShape(QFrame.Shape.HLine)
@@ -952,16 +1043,58 @@ class UI(QMainWindow):
         grid.addWidget(self.chk_tint, base + 2, 0, 1, 2)
         grid.addWidget(QLabel("Couleur du fluide"), base + 3, 0)
         self.combo_color = QComboBox()
-        self.combo_color.addItems(FLUID_MODES)
-        self.combo_color.setCurrentIndex(MODE_DENSITY)
+        for mode, label in fluid_modes(self.runner.dim):
+            self.combo_color.addItem(label, mode)
+        self.combo_color.setCurrentIndex(max(self.combo_color.findData(MODE_DENSITY), 0))
         self.combo_color.currentIndexChanged.connect(self._on_color_mode)
         grid.addWidget(self.combo_color, base + 3, 1)
         self.lbl_scale = QLabel("")
         grid.addWidget(self.lbl_scale, base + 4, 0, 1, 2)
-        grid.setRowStretch(base + 5, 1)
+        # ---- 3D : plan de coupe des particules (voir l'intérieur)
+        self.chk_clip = QCheckBox("Coupe (masque les particules au-delà)")
+        self.chk_clip.toggled.connect(self._need_render)
+        self.combo_clip = QComboBox()
+        self.combo_clip.addItems(["x", "y", "z"])
+        self.combo_clip.setCurrentIndex(2)
+        self.combo_clip.currentIndexChanged.connect(self._need_render)
+        self.spin_clip = QDoubleSpinBox()
+        self.spin_clip.setRange(-1e6, 1e6)
+        self.spin_clip.setDecimals(3)
+        self.spin_clip.setSingleStep(0.02)
+        self.spin_clip.setValue(0.5 * float(self.runner.p.get("Lz", 1.0)))
+        self.spin_clip.valueChanged.connect(self._need_render)
+        grid.addWidget(self.chk_clip, base + 5, 0, 1, 2)
+        grid.addWidget(self.combo_clip, base + 6, 0)
+        grid.addWidget(self.spin_clip, base + 6, 1)
+        grid.setRowStretch(base + 7, 1)
+        self._3d_widgets = [self.chk_clip, self.combo_clip, self.spin_clip, self.lbl_wvz, self.spin_wvz]
         dock = QDockWidget("Scène", self)
         dock.setWidget(w)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+
+    def _build_prim_dock(self) -> None:
+        """Build the primitives dock (3D scenes)."""
+        self.prim_panel = PrimPanel(self.runner)
+        self.prim_panel.changed.connect(self._on_prims_changed)
+        self.prim_panel.selected.connect(self._on_prim_list)
+        self.prim_dock = QDockWidget("Primitives (3D)", self)
+        self.prim_dock.setWidget(self.prim_panel)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.prim_dock)
+
+    def _on_prims_changed(self) -> None:
+        """Primitive edited in the panel: scene dirty, overlay refreshed."""
+        self._mark_dirty()
+        self.viewport.update()
+
+    def _on_prim_list(self, idx) -> None:
+        """Primitive selected in the list: highlight it in the view."""
+        if isinstance(self.viewport, Viewport3D):
+            self.viewport.prim_sel = idx
+            self.viewport.update()
+
+    def _on_prim_pick(self, idx) -> None:
+        """Primitive clicked in the view: select it in the list."""
+        self.prim_panel.select(idx)
 
     def _build_toolbar(self) -> None:
         """Build the toolbar actions (play, step, reset, view, open, save) with shortcuts."""
@@ -982,7 +1115,7 @@ class UI(QMainWindow):
         self.act_play = act("▶ Play", self._set_playing, "Space", checkable=True)
         act("Step", self._step, "S")
         act("Reset", self._reset, "R")
-        act("Vue entière", self.viewport.reset_view, "F")
+        act("Vue entière", lambda: self.viewport.reset_view(), "F")
         tb.addSeparator()
         act("Ouvrir…", self._open, "Ctrl+O")
         act("Enregistrer", self._save, "Ctrl+S")
@@ -1006,25 +1139,35 @@ class UI(QMainWindow):
 
         - viewport image and status labels updated
         """
-        if self.solver is None:
+        if self.solver is None or self.solver.dim != self.runner.dim:   # dimension changée : attendre le Reset
             return
         if self.playing:
             self.solver.step()
+        elif not self._render_needed:                     # pause, rien n'a changé : pas de rendu ni de copie
+            return
+        self._render_needed = False
         vp = self.viewport
-        self.solver.fluid_mode = self.combo_color.currentIndex()
-        x0, y0, k, size = vp.render_view()
-        img = self.solver.render(x0, y0, grid=self.chk_grid.isChecked(), tint=self.chk_tint.isChecked(), k=k,
-                                 size=size)
+        self.solver.fluid_mode = self.combo_color.currentData() or 0
+        if self.solver.dim == 3:
+            cam, size = vp.render_view()
+            clip = (self.combo_clip.currentIndex(), self.spin_clip.value(), True) if self.chk_clip.isChecked() else None
+            img = self.solver.render3d(cam, size=size, clip=clip)
+        else:
+            x0, y0, k, size = vp.render_view()
+            img = self.solver.render(x0, y0, grid=self.chk_grid.isChecked(), tint=self.chk_tint.isChecked(), k=k,
+                                     size=size)
         vp.set_image(img)
         self._frames += 1
-        if self._frames % 6 == 0:
+        if self._frames % 6 == 0 or not self.playing:
             st = self.solver.stats()
+            if not self.playing and self._frames < 3:
+                self._render_needed = True                # échelle de couleur initiale : un second rendu
             mode = self.solver.fluid_mode
             if mode == 0:
                 self.lbl_scale.setText("")
             else:
                 m = st["scalar_max"]
-                if mode in (1, MODE_NU):
+                if not mode_signed(mode, self.solver.dim):
                     rng = f"0 … {m:.3g}"
                 elif mode == MODE_DENSITY:
                     rng = f"ρ0 − {m:.3g} … ρ0 + {m:.3g} kg/m³"
@@ -1050,11 +1193,17 @@ class UI(QMainWindow):
         if self.solver is not None:
             self.solver.release()
             self.solver = None
-        solver = self.runner.solver()
+        try:
+            solver = self.runner.solver()
+        except Exception as exc:                          # maillage illisible, mémoire GPU insuffisante...
+            self.statusBar().clearMessage()
+            QMessageBox.critical(self, "Construction du solveur impossible", str(exc))
+            return
         solver.step(1)                                    # compile les kernels de simulation maintenant,
         solver.reset()                                    # pas au premier clic sur Play
         self.solver = solver
         self.dirty = False
+        self._need_render()
         self.banner.hide()
         self.statusBar().clearMessage()
 
@@ -1070,6 +1219,7 @@ class UI(QMainWindow):
         self._refresh_summaries()
         self._update_title(modified=True)
         self.viewport.update()
+        self._need_render()
 
     # ------------------------------------------------------------ actions
     def _set_playing(self, on: bool) -> None:
@@ -1099,6 +1249,7 @@ class UI(QMainWindow):
             self._rebuild()
         if self.solver is not None:
             self.solver.step()
+        self._need_render()
 
     def _reset(self) -> None:
         """Reset the solver, rebuilding it if the scene is dirty."""
@@ -1106,6 +1257,7 @@ class UI(QMainWindow):
             self._rebuild()
         else:
             self.solver.reset()
+        self._need_render()
 
     def _on_param(self, key: str, value) -> None:
         """Apply a parameter edit.
@@ -1120,9 +1272,11 @@ class UI(QMainWindow):
         - runner.p updated; structural keys mark dirty, others are applied to the solver live
         """
         if key in SimulationRunner.STRUCTURAL:
-            if key in ("Lx", "Ly", "nx"):               # boîte ou résolution : matrices rééchantillonnées
+            if key in ("Lx", "Ly", "Lz", "nx", "dim"):  # boîte, résolution, dimension : matrices rééchantillonnées
                 self.runner.p[key] = value
                 self.runner.regrid()
+                if key == "dim":
+                    self._setup_mode()
                 self.viewport.reset_view()
             else:
                 self.runner.p[key] = value
@@ -1142,6 +1296,7 @@ class UI(QMainWindow):
         """
         if self.solver is not None:
             self.solver.scalar_max = 0.0             # l'échelle se recalcule sur la nouvelle quantité
+        self._need_render()
 
     def _vel(self) -> tuple[float, float]:
         """Initial velocity from the cell spin boxes.
@@ -1177,7 +1332,15 @@ class UI(QMainWindow):
         for b in self._wall_buttons:
             b.setEnabled(sel is not None)
         if sel is None:
-            self.lbl_wall.setText("Aucune paroi sélectionnée\n(clic sur un bord : tout le mur ; glisser : un segment)")
+            self.lbl_wall.setText("Aucune paroi sélectionnée\n(clic sur un bord : tout le mur ; glisser : un segment ; "
+                                  "3D : clic sur une face, Maj + glisser : un rectangle)")
+        elif self.runner.dim == 3:
+            from Solver.walls import frame
+            side, (a0, a1), (b0, b1) = sel
+            ts = frame(SIDES.index(side), 3)[2]
+            dx = self.runner.dx
+            self.lbl_wall.setText(f"Paroi {SIDE_LABELS[side]}\n{'xyz'[ts[0]]} de {a0 * dx:.4g} à {(a1 + 1) * dx:.4g} m, "
+                                  f"{'xyz'[ts[1]]} de {b0 * dx:.4g} à {(b1 + 1) * dx:.4g} m")
         else:
             side, k0, k1 = sel
             n = 1.0 / self.runner.dx                   # cellules par mètre
@@ -1219,15 +1382,19 @@ class UI(QMainWindow):
         """
         if self.viewport.wsel is None:
             return
-        side, k0, k1 = self.viewport.wsel
-        n = 1.0 / self.runner.dx                       # cellules par mètre
-        vx, vy, p = (_parse(w.text()) for w in (self.spin_wvx, self.spin_wvy, self.spin_wp))
+        dx = self.runner.dx
+        vx, vy, vz, p = (_parse(w.text()) for w in (self.spin_wvx, self.spin_wvy, self.spin_wvz, self.spin_wp))
+        if self.runner.dim == 3:
+            side, (a0, a1), (b0, b1) = self.viewport.wsel
+            span, vel = ((a0 * dx, (a1 + 1) * dx), (b0 * dx, (b1 + 1) * dx)), (vx, vy, vz)
+        else:
+            side, k0, k1 = self.viewport.wsel
+            span, vel = (k0 * dx, (k1 + 1) * dx), (vx, vy)
         pressure = p if kind == "outlet" and p != 0.0 else None
         friction = self.spin_wf.value() if kind == "wall" else None
         backup = [dict(w) for w in self.runner.walls]
         try:
-            self.runner.set_wall(side, kind, velocity=(vx, vy), span=(k0 / n, (k1 + 1) / n), pressure=pressure,
-                                 friction=friction)
+            self.runner.set_wall(side, kind, velocity=vel, span=span, pressure=pressure, friction=friction)
             self.runner.wall_table()                   # vérifie les noms des expressions (constantes connues)
         except ValueError as exc:
             self.runner.walls = backup                 # segment refusé : parois inchangées
@@ -1253,6 +1420,7 @@ class UI(QMainWindow):
             v = runner.p[key]
             w.setChecked(bool(v)) if isinstance(w, QCheckBox) else w.setValue(v)
             w.blockSignals(False)
+        self._setup_mode()
         self.viewport.sel = None
         self.viewport.wsel = None
         self.viewport.reset_view()
@@ -1315,7 +1483,7 @@ class UI(QMainWindow):
     def _autoquit(self) -> None:
         """Print diagnostics and close the window (diagnostic mode)."""
         st = self.solver.stats() if self.solver is not None else {}
-        print(f"[diag] frames={self._frames} stats={st} view={self.viewport.scale}", flush=True)
+        print(f"[diag] dim={self.runner.dim} frames={self._frames} stats={st}", flush=True)
         self.close()
 
     def closeEvent(self, event) -> None:

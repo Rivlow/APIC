@@ -1,12 +1,18 @@
-# `ui/` — solveur APIC / MPM 2D en trois classes
+# `ui/` — solveur APIC / MPM 2D ou 3D en trois classes
 
 ```
-SimulationRunner  (runner.py)  définit la simulation : paramètres plats + matrices n × n ; JSON ; lance
+SimulationRunner  (runner.py)  définit la simulation : paramètres plats + matrices (nx, ny[, nz]) + primitives ;
+                               JSON ; lance
 Solver            (solver.py)  reçoit paramètres + matrices, alloue les champs Taichi, calcule, rend l'image
-UI                (ui.py)      fenêtre Qt : viewport zoomable, sélection de cellules, paramètres, fichiers
-kernels.py                     les kernels Taichi (fluide avec réservoir, grille, émission, rendu)
-kernels_inc.py                 mode incompressible : grille MAC + gradient conjugué sur GPU
+UI                (ui.py)      fenêtre Qt : viewport 2D zoomable ou vue 3D orbitale, paramètres, fichiers
+kernels.py                     les kernels Taichi (fluide avec réservoir, émission, couleurs, rendu 2D)
+kernels_inc.py                 mode incompressible : classe MAC (grille décalée, projection, densité, viscosité)
+mgpcg.py                       gradient conjugué préconditionné multigrille
+render3d.py, view3d.py         vue 3D : rendu GPU (sphères, obstacles, parois) ; widget Qt, primitives
 ```
+
+Tout le code est générique en dimension (`dim = 2` ou `3`, lu à la compilation sur les champs Taichi) : le
+2D est le même code que le 3D.
 
 Les kernels solides (MLS-MPM corotationnel, endommagement, rupture) viennent de `Code_tuto/mpm_solid.py`,
 inchangé. Rien d'autre dans le dépôt n'est touché.
@@ -17,6 +23,7 @@ inchangé. Rien d'autre dans le dépôt n'est touché.
 python -m ui                     # scène de main_fsi.py (eau + pont)
 python -m ui canal.json          # une simulation enregistrée
 python -m ui.smoke               # test sans fenêtre (Vulkan puis APIC_UI_ARCH=cuda)
+python -m ui.smoke3d             # test 3D sans fenêtre (barrage, entrée/sortie, maillages, solide, rendu)
 python ui/examples/channel_flow.py [--show] [--save]
 ```
 
@@ -93,6 +100,37 @@ vivent les conditions aux limites. Sans cette bande le stencil 3 × 3 de P2G sor
 - Toolbar : Play/Pause (Espace), Step (S), Reset (R), Vue entière (F), Ouvrir / Enregistrer (JSON).
 - `APIC_UI_AUTOQUIT=<s>` : lance la lecture et ferme après s secondes en imprimant les stats (tests).
 
+## 3D (`dim=3`)
+
+```python
+r = SimulationRunner(dim=3, Lx=2.0, Ly=1.0, Lz=0.5, nx=128, incompressible=True)   # y vertical, z profondeur
+X, Y, Z = r.centers()
+r.set_fluid(r.box((0.1, 0.05, 0.05), (0.8, 0.6, 0.45)), velocity=(0, 0, 0))
+r.add_prim("sphere", "obstacle", center=(1.4, 0.3, 0.25), radius=0.12)      # primitive éditable dans l'UI
+r.add_prim("mesh", "obstacle", path="piece.stl", scale=0.001, translate=(1.0, 0.4, 0.25))
+r.set_wall("left", "inlet", velocity=(1.0, 0, 0), span=((0.1, 0.4), (0.1, 0.4)))   # rectangle (y, z)
+r.set_wall("front", "wall", friction=1.0)                                    # faces back / front en plus
+```
+
+- `rect` / `circle` deviennent des extrusions sur toute la profondeur (porter un cas 2D en tranche 3D) ;
+  `box`, `sphere`, `cylinder` sont 3D. Zones de paroi : un rectangle `((a0, a1), (b0, b1))` sur les deux axes
+  tangents, dans l'ordre croissant ((y, z) pour left / right, (x, z) pour bottom / top, (x, y) pour back / front).
+- **Primitives** (`r.prims`) : boîte, sphère, cylindre, maillage STL (binaire ou ASCII) / OBJ ; matériau eau,
+  solide, obstacle ou effacer ; appliquées dans l'ordre par-dessus les matrices (`r.masks()`). Un maillage
+  est voxelisé au centre des cellules (parité des croisements, restreinte à la coque remplie : tolère de
+  petits trous). Plusieurs fichiers importés ensemble gardent un pivot commun (assemblage aligné).
+- **Vue 3D** : bouton gauche glissé = rotation, droit ou milieu = déplacement, molette = zoom, `F` = vue
+  entière. Clic sur une primitive = sélection ; clic sur une face du fond = tout le mur ; Maj + glisser sur
+  une face = un rectangle aimanté aux cellules, puis Entrée (vx, vy, vz) / Sortie / Mur. Dock « Primitives » :
+  ajouter, supprimer, réordonner, éditer (matériau, positions, rayon, échelle, rotation, vitesse). Coupe :
+  masque les particules au-delà d'un plan x, y ou z = cte. Couleurs : vz et |ω| en plus.
+- **Rendu** (`render3d.py`) : un rayon par pixel pour les obstacles (sphere tracing sur la distance signée)
+  et les faces du fond (couleur du type de paroi), puis les particules en sphères ombrées avec tampon de
+  profondeur (`atomic_min`). Seule l'image finale est copiée vers le CPU ; en pause, l'image n'est refaite
+  que si la vue, la scène ou la couleur change.
+- **Compilation** : ~30 à 50 s la première fois pour une taille de grille donnée (solide compris), puis
+  cache hors ligne de Taichi.
+
 ## Trafic GPU ↔ CPU
 
 Semis : numpy → GPU une fois au build / reset. Simulation : 7 lancements de kernels par sous-pas, rien ne
@@ -141,18 +179,23 @@ grâce au démarrage à chaud.
 ## JSON
 
 ```json
-{"version": 3,
- "params": {"n": 128, "gravity": 9.81, ...},
- "matrices": {"fluid": {"dtype": "bool", "shape": [128, 128], "data": "<base64 packbits>"},
-              "vx0": {"dtype": "float32", "shape": [128, 128], "data": "<base64>"}},
- "walls": [{"side": "left", "span": [0.25, 0.45], "type": "inlet", "velocity": [3.0, 0.0]},
-           {"side": "right", "span": [0.0, 1.0], "type": "outlet", "velocity": [0.0, 0.0]}]}
+{"version": 5,
+ "params": {"dim": 3, "Lx": 1.0, "Ly": 1.0, "Lz": 0.5, "nx": 128, "gravity": 9.81, ...},
+ "matrices": {"fluid": {"dtype": "bool", "shape": [128, 128, 64], "data": "<base64 packbits>"},
+              "vx0": {"dtype": "float32", "shape": [128, 128, 64], "data": "<base64>"}},
+ "walls": [{"side": "left", "span": [[0.25, 0.45], [0.1, 0.4]], "type": "inlet", "velocity": [3.0, 0.0, 0.0]}],
+ "prims": [{"kind": "sphere", "material": "obstacle", "center": [0.7, 0.3, 0.25], "radius": 0.1,
+            "velocity": [0.0, 0.0, 0.0]}],
+ "consts": {}}
 ```
+En 2D, `span` reste un intervalle `[a, b]` et les vitesses ont 2 composantes (fichiers v4 lus tels quels).
 Un seul fichier auto-suffisant ; les matrices entièrement nulles sont omises. Les fichiers v2 (bandes de
 cellules `inlet` / `outlet`) sont convertis à la lecture : chaque bande collée à un mur devient un segment.
 
 ## Limites
 
-- 2D, domaine unitaire `[0, 1]²`, un fluide et un solide.
+- Un fluide et un solide ; le mode faiblement compressible est prévu pour le 2D (le code est générique mais
+  non validé en 3D).
+- Couplage fluide-structure explicite : un solide plus léger que le fluide peut basculer (masse ajoutée).
 - Entrées / sorties : fluide uniquement, et seulement sur les parois du domaine.
 - Changer `n` dans l'interface rééchantillonne les matrices au plus proche voisin.

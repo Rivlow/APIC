@@ -18,10 +18,24 @@ arrondi (r.Ly est la hauteur réelle de la grille), matrices indexées [i, j] = 
 (cells[:, 0] est la rangée du bas). Anciens paramètres sans dimensions (n, ou nx + ny) : domaine normalisé
 Lx = nx / max(nx, ny), Ly = ny / max(nx, ny), comme avant. Un seul matériau fluide et un seul solide (paramètres plats).
 
-Les conditions aux limites n'existent que sur les quatre parois du domaine : un segment de mur
-(côté, étendue le long du mur en mètres, type entrée ou sortie, vitesse) ; la paroi par
-défaut est un mur glissant. Un obstacle collé à une entrée / sortie en devient la surface : sa face de
-même normale que le mur porte la condition (voir Solver/walls.py).
+Les conditions aux limites n'existent que sur les parois du domaine : une zone de mur (côté, étendue le long du
+mur en mètres, type entrée ou sortie, vitesse) ; la paroi par défaut est un mur glissant. Un obstacle collé à
+une entrée / sortie en devient la surface : sa face de même normale que le mur porte la condition (voir
+Solver/walls.py).
+
+3D (dim=3) : boîte Lx × Ly × Lz, y vertical (gravité), z profondeur ; matrices (nx, ny, nz), vitesses à 3
+composantes ; rect / circle deviennent des extrusions sur toute la profondeur, box / sphere / cylinder sont 3D ;
+zones de mur rectangulaires, span=((a0, a1), (b0, b1)) sur les deux axes tangents (ordre croissant : (y, z) pour
+left / right, (x, z) pour bottom / top, (x, y) pour back / front).
+
+    r = SimulationRunner(dim=3, Lx=2.0, Ly=1.0, Lz=0.5, nx=128, incompressible=True)
+    r.set_fluid(r.box((0.1, 0.05, 0.05), (0.8, 0.6, 0.45)))
+    r.add_prim("sphere", "obstacle", center=(1.4, 0.3, 0.25), radius=0.12)     # primitive éditable dans l'UI
+    r.add_prim("mesh", "obstacle", path="piece.stl", scale=0.001, translate=(1.0, 0.4, 0.25))
+    r.set_wall("left", "inlet", velocity=(1.0, 0, 0), span=((0.1, 0.4), (0.1, 0.4)))
+
+Primitives (self.prims) : boîtes, sphères, cylindres, maillages, appliqués dans l'ordre PAR-DESSUS les matrices
+(la dernière l'emporte) ; c'est la scène que l'UI 3D édite. masks() rend les matrices effectives.
 """
 from __future__ import annotations
 
@@ -30,12 +44,15 @@ import json
 
 import numpy as np
 
-from Solver.walls import SIDES, WallTable, Walls  # noqa: F401  (SIDES réexporté pour ui.ui ; numpy seul, sans Taichi)
+from Solver.walls import SIDES, WallTable, Walls, frame, span_box  # noqa: F401  (SIDES réexporté pour ui.ui ; numpy seul)
+
+MATERIALS = ("fluid", "solid", "obstacle", "clear")
+PRIM_KINDS = ("box", "sphere", "cylinder", "mesh")
 
 
 class SimulationRunner:
     PARAMS = {
-        "Lx": 1.0, "Ly": 1.0, "nx": 128, "bound": 3, "ppc": 2, "cfl": 0.4, "gravity": 9.81, "substeps": 20, "seed": 0,
+        "dim": 2, "Lx": 1.0, "Ly": 1.0, "Lz": 1.0, "nx": 128, "bound": 3, "ppc": 2, "cfl": 0.4, "gravity": 9.81, "substeps": 20, "seed": 0,
         "capacity": 0, "res": 700,
         "fluid_rho": 1.0, "fluid_E": 400.0, "fluid_nu": 0.0, "smagorinsky": 0.0, "visc_iters": 20,
         "solid_rho": 2.0, "solid_E": 3000.0, "solid_nu": 0.3,
@@ -45,6 +62,7 @@ class SimulationRunner:
         "density_iters": 20, "obstacle_friction": 1.0,
     }
     LABELS = {
+        "dim": "Dimension (2 ou 3)", "Lz": "Boîte : Lz (m, 3D)",
         "Lx": "Boîte : Lx (m)", "Ly": "Boîte : Ly (m)", "nx": "Grille : nx (cellules en x ; ny déduit)", "bound": "Cellules de bord", "ppc": "Particules / côté de cellule",
         "cfl": "CFL", "gravity": "Gravité g", "substeps": "Sous-pas par image", "seed": "Graine",
         "capacity": "Capacité fluide (0 = auto)", "res": "Résolution du rendu",
@@ -61,9 +79,9 @@ class SimulationRunner:
         "density_iters": "Correction de densité : itérations CG",
         "obstacle_friction": "Obstacles : frottement β (0 glissant, 1 adhérent)",
     }
-    STRUCTURAL = ("Lx", "Ly", "nx", "bound", "ppc", "capacity", "seed", "res", "incompressible")
+    STRUCTURAL = ("dim", "Lx", "Ly", "Lz", "nx", "bound", "ppc", "capacity", "seed", "res", "incompressible")
     BOOL = ("fluid", "solid", "obstacle")
-    FLOAT = ("vx0", "vy0")
+    FLOAT = ("vx0", "vy0", "vz0")
 
     def __init__(self, **params):
         """Create a simulation with default parameters overridden by `params`, empty matrices and walls.
@@ -88,11 +106,15 @@ class SimulationRunner:
         if unknown:
             raise KeyError(f"paramètres inconnus : {sorted(unknown)} (connus : {sorted(self.PARAMS)})")
         self.p = {**self.PARAMS, **params}
-        shape = (self.nx, self.ny)
+        if int(self.p["dim"]) not in (2, 3):
+            raise ValueError(f"dim doit valoir 2 ou 3 (reçu {self.p['dim']})")
+        shape = self.shape
         self.m = {k: np.zeros(shape, bool) for k in self.BOOL}
         self.m.update({k: np.zeros(shape, np.float32) for k in self.FLOAT})
-        self._walls = Walls()                       # segments de paroi, le dernier l'emporte
+        self._walls = Walls()                       # zones de paroi, la dernière l'emporte
         self.consts: dict[str, float] = {}          # constantes des conditions limites données par expression
+        self.prims: list[dict] = []                 # primitives (appliquées par-dessus self.m, voir masks())
+        self._mesh_cache: dict = {}                 # voxelisations de maillages (clé : paramètres + grille)
 
     @property
     def walls(self) -> list[dict]:
@@ -126,9 +148,24 @@ class SimulationRunner:
         return max(1, int(round(float(self.p["Ly"]) / self.dx)))
 
     @property
+    def dim(self) -> int:
+        """Dimension, 2 or 3 (int)."""
+        return int(self.p["dim"])
+
+    @property
+    def nz(self) -> int:
+        """Number of cells in z, round(Lz / dx) in 3D, 1 in 2D (int)."""
+        return max(1, int(round(float(self.p["Lz"]) / self.dx))) if self.dim == 3 else 1
+
+    @property
+    def shape(self) -> tuple:
+        """Grid shape (nx, ny) or (nx, ny, nz) (tuple)."""
+        return (self.nx, self.ny) if self.dim == 2 else (self.nx, self.ny, self.nz)
+
+    @property
     def n(self) -> int:
-        """Longest side in cells, max(nx, ny) (int)."""
-        return max(self.nx, self.ny)
+        """Longest side in cells (int)."""
+        return max(self.shape)
 
     @property
     def dx(self) -> float:
@@ -146,6 +183,16 @@ class SimulationRunner:
         return self.ny * self.dx
 
     @property
+    def Lz(self) -> float:
+        """Box depth nz dx, m (float, 3D) ; may differ slightly from p["Lz"] (rounded to whole cells)."""
+        return self.nz * self.dx
+
+    @property
+    def extent(self) -> tuple:
+        """Box size per axis, m (tuple of dim floats)."""
+        return tuple(n * self.dx for n in self.shape)
+
+    @property
     def band(self) -> float:
         """Wall band thickness.
 
@@ -157,19 +204,18 @@ class SimulationRunner:
         """
         return self.p["bound"] * self.dx
 
-    def centers(self) -> tuple[np.ndarray, np.ndarray]:
+    def centers(self) -> tuple:
         """Cell center coordinates.
 
         **Outputs**
 
-        - `X`, `Y` : np.ndarray f64 (nx, ny)   X[i, j] = (i + 0.5) dx
+        - `X`, `Y`[, `Z`] : np.ndarray f64 (shape)   X[i, j(, k)] = (i + 0.5) dx
         """
-        cx = (np.arange(self.nx) + 0.5) * self.dx
-        cy = (np.arange(self.ny) + 0.5) * self.dx
-        return np.meshgrid(cx, cy, indexing="ij")
+        axes = [(np.arange(n) + 0.5) * self.dx for n in self.shape]
+        return tuple(np.meshgrid(*axes, indexing="ij"))
 
     def rect(self, x0: float, y0: float, x1: float, y1: float) -> np.ndarray:
-        """Mask of cells whose center lies in a rectangle.
+        """Mask of cells whose center lies in a rectangle (3D: extruded over the whole depth).
 
         **Inputs**
 
@@ -177,13 +223,14 @@ class SimulationRunner:
 
         **Outputs**
 
-        - np.ndarray bool (nx, ny)
+        - np.ndarray bool (shape)
         """
-        X, Y = self.centers()
+        C = self.centers()
+        X, Y = C[0], C[1]
         return (X >= min(x0, x1)) & (X <= max(x0, x1)) & (Y >= min(y0, y1)) & (Y <= max(y0, y1))
 
     def circle(self, cx: float, cy: float, r: float) -> np.ndarray:
-        """Mask of cells whose center lies in a disc.
+        """Mask of cells whose center lies in a disc (3D: cylinder along z over the whole depth).
 
         **Inputs**
 
@@ -191,10 +238,60 @@ class SimulationRunner:
 
         **Outputs**
 
-        - np.ndarray bool (nx, ny)
+        - np.ndarray bool (shape)
         """
-        X, Y = self.centers()
-        return (X - cx) ** 2 + (Y - cy) ** 2 <= r * r
+        C = self.centers()
+        return (C[0] - cx) ** 2 + (C[1] - cy) ** 2 <= r * r
+
+    def box(self, lo, hi) -> np.ndarray:
+        """Mask of cells whose center lies in an axis-aligned box.
+
+        **Inputs**
+
+        - `lo`, `hi` : (dim,) float   corners in m (any order)
+
+        **Outputs**
+
+        - np.ndarray bool (shape)
+        """
+        C = self.centers()
+        m = np.ones(self.shape, bool)
+        for a in range(self.dim):
+            m &= (C[a] >= min(lo[a], hi[a])) & (C[a] <= max(lo[a], hi[a]))
+        return m
+
+    def sphere(self, center, radius: float) -> np.ndarray:
+        """Mask of cells whose center lies in a ball (disc in 2D).
+
+        **Inputs**
+
+        - `center` : (dim,) float m ; `radius` : float m
+
+        **Outputs**
+
+        - np.ndarray bool (shape)
+        """
+        C = self.centers()
+        return sum((C[a] - center[a]) ** 2 for a in range(self.dim)) <= radius * radius
+
+    def cylinder(self, p0, p1, radius: float) -> np.ndarray:
+        """Mask of cells whose center lies in a finite cylinder of axis p0 -> p1 (3D).
+
+        **Inputs**
+
+        - `p0`, `p1` : (3,) float axis end points, m ; `radius` : float m
+
+        **Outputs**
+
+        - np.ndarray bool (shape)
+        """
+        C = np.stack(self.centers(), axis=-1)
+        p0, p1 = np.asarray(p0, np.float64), np.asarray(p1, np.float64)
+        ax = p1 - p0
+        L2 = max(float(ax @ ax), 1e-30)
+        t = ((C - p0) @ ax) / L2
+        d = C - p0 - t[..., None] * ax
+        return (t >= 0) & (t <= 1) & (np.einsum("...i,...i", d, d) <= radius * radius)
 
     def _mask(self, mask) -> np.ndarray:
         """Validate a cell mask.
@@ -208,9 +305,14 @@ class SimulationRunner:
         - np.ndarray bool (nx, ny)   (ValueError on wrong shape)
         """
         mask = np.asarray(mask, dtype=bool)
-        if mask.shape != (self.nx, self.ny):
-            raise ValueError(f"masque {mask.shape} attendu ({self.nx}, {self.ny})")
+        if mask.shape != self.shape:
+            raise ValueError(f"masque {mask.shape} attendu {self.shape}")
         return mask
+
+    def _set_vel(self, m: dict, mask: np.ndarray, velocity) -> None:
+        """Write an initial velocity (2 or 3 components) into vx0 / vy0 / vz0 of matrices m."""
+        for k, v in zip(self.FLOAT[:self.dim], list(velocity) + [0.0] * 3):
+            m[k][mask] = v
 
     # ------------------------------------------------------------ définition (intérieur)
     def set_fluid(self, mask, velocity=(0.0, 0.0)) -> None:
@@ -227,7 +329,7 @@ class SimulationRunner:
         """
         mask = self._mask(mask)
         self.m["fluid"][mask], self.m["solid"][mask], self.m["obstacle"][mask] = True, False, False
-        self.m["vx0"][mask], self.m["vy0"][mask] = velocity
+        self._set_vel(self.m, mask, velocity)
 
     def set_solid(self, mask, velocity=(0.0, 0.0)) -> None:
         """Mark cells as solid (clears fluid/obstacle there).
@@ -243,7 +345,7 @@ class SimulationRunner:
         """
         mask = self._mask(mask)
         self.m["solid"][mask], self.m["fluid"][mask], self.m["obstacle"][mask] = True, False, False
-        self.m["vx0"][mask], self.m["vy0"][mask] = velocity
+        self._set_vel(self.m, mask, velocity)
 
     def set_obstacle(self, mask) -> None:
         """Mark cells as obstacle (clears fluid/solid there).
@@ -272,7 +374,7 @@ class SimulationRunner:
         - self.m["vx0"], self.m["vy0"] updated
         """
         mask = self._mask(mask)
-        self.m["vx0"][mask], self.m["vy0"][mask] = velocity
+        self._set_vel(self.m, mask, velocity)
 
     def clear(self, mask) -> None:
         """Clear all materials and initial velocity in these cells.
@@ -298,10 +400,11 @@ class SimulationRunner:
 
         **Inputs**
 
-        - `side` : str                   left / right / bottom / top
+        - `side` : str                   left / right / bottom / top (/ back / front in 3D)
         - `kind` : str                   wall / inlet / outlet
-        - `velocity` : tuple[float | str, float | str]   inlet velocity ; str = expression of x, y, t
-        - `span` : tuple[float, float] | None   extent along the wall, m (None : whole wall)
+        - `velocity` : tuple of dim float | str   inlet velocity ; str = expression of x, y, z, t
+        - `span` : (a, b) in 2D, ((a0, a1), (b0, b1)) in 3D (tangent axes in increasing order), m ;
+          None : whole wall
         - `pressure` : float | str | None    outlet pressure (incompressible only; None = 0, free outlet) ;
           str = expression of x, y, t, e.g. "rho*g*(H - y)" (constants: rho, g, pi, Lx, Ly, dx, self.consts)
         - `friction` : float | None          wall beta in [0, 1] (0 slip, 1 no-slip)
@@ -310,27 +413,43 @@ class SimulationRunner:
 
         - self._walls updated (new segment overrides overlapped ones)
 
-        **Note** : span clipped to wall length (Ly for left/right, Lx for bottom/top).
+        **Note** : span clipped to the wall size.
         """
-        ext = self.Ly if side in ("left", "right") else self.Lx
-        span = (0.0, ext) if span is None else span              # défaut : tout le mur
-        span = (min(max(float(span[0]), 0.0), ext), min(max(float(span[1]), 0.0), ext))
-        self._walls.set(side, kind, velocity, span, pressure, friction)
+        self._walls.set(side, kind, velocity, self._span(side, span), pressure, friction)
+
+    def _span(self, side: str, span):
+        """Zone extent clipped to the wall size (None : whole wall).
+
+        **Inputs**
+
+        - `side` : str ; `span` : (a, b) | ((a0, a1), (b0, b1)) | None
+
+        **Outputs**
+
+        - (a, b) in 2D, ((a0, a1), (b0, b1)) in 3D
+        """
+        if side not in SIDES[:2 * self.dim]:
+            raise ValueError(f"côté {side!r} inconnu en {self.dim}D (attendu : {SIDES[:2 * self.dim]})")
+        ext = [self.extent[t] for t in frame(SIDES.index(side), self.dim)[2]]
+        box = [[0.0, e] for e in ext] if span is None else span_box(span)
+        if len(box) != len(ext):
+            raise ValueError(f"span {span!r} : {len(ext)} intervalle(s) attendu(s) en {self.dim}D")
+        box = [(min(max(iv[0], 0.0), e), min(max(iv[1], 0.0), e)) for iv, e in zip(box, ext)]
+        return box[0] if self.dim == 2 else tuple(box)
 
     def clear_wall(self, side: str, span=None) -> None:
         """Reset part of a wall to the default slip wall.
 
         **Inputs**
 
-        - `side` : str                   left / right / bottom / top
-        - `span` : tuple[float, float] | None   extent along the wall, m (None : whole wall)
+        - `side` : str                   left / right / bottom / top (/ back / front)
+        - `span` : zone extent (see set_wall) | None (whole wall)
 
         **Outputs**
 
         - self._walls updated
         """
-        ext = self.Ly if side in ("left", "right") else self.Lx
-        self._walls.clear(side, (0.0, ext) if span is None else span)
+        self._walls.clear(side, self._span(side, span))
 
     def set_constants(self, **consts) -> None:
         """Define constants usable in boundary expressions (e.g. set_constants(H=0.333, U=1.2)).
@@ -355,18 +474,18 @@ class SimulationRunner:
         **Note** : rho and g are taken when the solver is built (Reset), not updated live.
         """
         return {"rho": float(self.p["fluid_rho"]), "g": float(self.p["gravity"]), "pi": float(np.pi),
-                "Lx": self.Lx, "Ly": self.Ly, "dx": self.dx, **self.consts}
+                "Lx": self.Lx, "Ly": self.Ly, "Lz": self.Lz if self.dim == 3 else 0.0, "dx": self.dx, **self.consts}
 
     def wall_table(self) -> WallTable:
         """Rasterize wall segments (expressions without t evaluated here).
 
         **Outputs**
 
-        - `WallTable` : type, v, depth, pressure, friction, expr per wall cell (4, max(nx, ny)[, 2 | 3]), sources
+        - `WallTable` : type, v, depth, pressure, friction, expr per wall cell (2 dim, na, nb[, …]), sources
 
-        **Note** : an obstacle glued to an inlet/outlet carries it on its inward face.
+        **Note** : an obstacle glued to an inlet/outlet carries it on its inward face (primitives included).
         """
-        return self._walls.table(self.nx, self.ny, self.p["bound"], self.m["obstacle"], self.all_constants(),
+        return self._walls.table(self.shape, self.p["bound"], self.masks()["obstacle"], self.all_constants(),
                                  self.dx)
 
     def resize(self, nx: int, ny: int | None = None) -> None:
@@ -395,13 +514,15 @@ class SimulationRunner:
 
         **Note** : walls are in metres and unchanged ; matrices keep their physical position when the box grows.
         """
-        ox, oy = self.m["fluid"].shape                 # taille réelle des matrices (p peut déjà avoir changé)
-        nx, ny = self.nx, self.ny
-        if (ox, oy) == (nx, ny):
+        old = self.m["fluid"].shape                    # taille réelle des matrices (p peut déjà avoir changé)
+        new = self.shape
+        if old == new:
             return
-        ix = np.minimum((np.arange(nx) * ox / nx).astype(int), ox - 1)
-        iy = np.minimum((np.arange(ny) * oy / ny).astype(int), oy - 1)
-        self.m = {k: np.ascontiguousarray(v[ix][:, iy]) for k, v in self.m.items()}
+        if len(old) != len(new):                       # changement de dimension : on repart de matrices vides
+            self.m = {k: np.zeros(new, v.dtype) for k, v in self.m.items()}
+            return
+        idx = [np.minimum((np.arange(n) * o / n).astype(int), o - 1) for o, n in zip(old, new)]
+        self.m = {k: np.ascontiguousarray(v[np.ix_(*idx)]) for k, v in self.m.items()}
 
     # ------------------------------------------------------------ fichiers
     def to_dict(self) -> dict:
@@ -418,8 +539,9 @@ class SimulationRunner:
             raw = np.packbits(a.ravel()) if a.dtype == bool else a.astype(np.float32).ravel()
             mats[k] = {"dtype": str(a.dtype), "shape": list(a.shape),
                        "data": base64.b64encode(np.ascontiguousarray(raw).tobytes()).decode("ascii")}
-        return {"version": 4, "params": dict(self.p), "matrices": mats,
-                "walls": [dict(w) for w in self.walls], "consts": dict(self.consts)}
+        return {"version": 5, "params": dict(self.p), "matrices": mats,
+                "walls": [dict(w) for w in self.walls], "consts": dict(self.consts),
+                "prims": [dict(q) for q in self.prims]}
 
     @classmethod
     def from_dict(cls, d: dict) -> "SimulationRunner":
@@ -435,21 +557,23 @@ class SimulationRunner:
         """
         params = {k: v for k, v in d.get("params", {}).items() if k in cls.PARAMS or k in ("n", "ny")}
         r = cls(**params)
-        nx, ny = r.nx, r.ny
+        shape = r.shape
+        size = int(np.prod(shape))
         legacy = {}
         for k, spec in d.get("matrices", {}).items():
             buf = base64.b64decode(spec["data"])
             if spec["dtype"] == "bool":
-                a = np.unpackbits(np.frombuffer(buf, np.uint8))[:nx * ny].astype(bool)
+                a = np.unpackbits(np.frombuffer(buf, np.uint8))[:size].astype(bool)
             else:
                 a = np.frombuffer(buf, np.float32)
-            a = a.reshape(nx, ny)
+            a = a.reshape(shape)
             if k in r.m:
                 r.m[k] = np.ascontiguousarray(a.astype(r.m[k].dtype))
             elif k in ("inlet", "outlet", "inlet_vx", "inlet_vy"):
                 legacy[k] = a
         r.walls = [dict(w) for w in d.get("walls", [])]
         r.consts = {k: float(v) for k, v in d.get("consts", {}).items()}
+        r.prims = [dict(q) for q in d.get("prims", [])]
         if legacy:
             r._migrate_legacy(legacy)
         return r
@@ -536,7 +660,7 @@ class SimulationRunner:
         - bool
         """
         return (self.p == other.p and all(np.array_equal(self.m[k], other.m[k]) for k in self.m)
-                and self.walls == other.walls and self.consts == other.consts)
+                and self.walls == other.walls and self.consts == other.consts and self.prims == other.prims)
 
     # ------------------------------------------------------------ exécution
     def solver(self):
@@ -547,7 +671,122 @@ class SimulationRunner:
         - `Solver` : (allocates Taichi fields)
         """
         from ui.solver import Solver
-        return Solver({**self.p, "ny": self.ny}, self.m, self.wall_table(), self.all_constants())
+        return Solver({**self.p, "ny": self.ny, "nz": self.nz}, self.masks(), self.wall_table(),
+                      self.all_constants())
+
+    # ------------------------------------------------------------ primitives (scène éditable, 3D surtout)
+    def add_prim(self, kind: str, material: str, velocity=(0.0, 0.0, 0.0), **params) -> dict:
+        """Append a primitive applied on top of the matrices (the last one wins).
+
+        **Inputs**
+
+        - `kind` : str in box / sphere / cylinder / mesh
+        - `material` : str in fluid / solid / obstacle / clear
+        - `velocity` : (dim,) float initial velocity (fluid / solid)
+        - **params : box lo, hi ; sphere center, radius ; cylinder p0, p1, radius ; mesh path, scale, rotate (deg),
+          translate (m, where the pivot lands), pivot (file units, None = mesh center), fill (bool)
+
+        **Outputs**
+
+        - dict the stored primitive (editable in place)
+        """
+        if kind not in PRIM_KINDS:
+            raise ValueError(f"primitive {kind!r} inconnue (attendu : {PRIM_KINDS})")
+        if material not in MATERIALS:
+            raise ValueError(f"matériau {material!r} inconnu (attendu : {MATERIALS})")
+        prim = {"kind": kind, "material": material, "velocity": [float(v) for v in velocity],
+                **{k: (list(v) if isinstance(v, (tuple, list, np.ndarray)) else v) for k, v in params.items()}}
+        self.prims.append(prim)
+        return prim
+
+    def prim_mask(self, prim: dict) -> np.ndarray:
+        """Cells covered by a primitive.
+
+        **Inputs**
+
+        - `prim` : dict (see add_prim)
+
+        **Outputs**
+
+        - np.ndarray bool (shape)
+        """
+        k = prim["kind"]
+        if k == "box":
+            return self.box(prim["lo"], prim["hi"])
+        if k == "sphere":
+            return self.sphere(prim["center"], prim["radius"])
+        if k == "cylinder":
+            if self.dim == 2:
+                return self.sphere(prim["p0"][:2], prim["radius"])
+            return self.cylinder(prim["p0"], prim["p1"], prim["radius"])
+        if k == "mesh":
+            return self._mesh_mask(prim)
+        raise ValueError(f"primitive {k!r} inconnue")
+
+    def mesh_triangles(self, prim: dict) -> np.ndarray:
+        """Triangles of a mesh primitive after its transform (m).
+
+        **Inputs**
+
+        - `prim` : dict mesh primitive
+
+        **Outputs**
+
+        - np.ndarray (T, 3, 3)
+        """
+        from Solver import mesh
+        key = ("tri", prim["path"], repr(prim.get("scale", 1.0)), repr(prim.get("rotate", [0, 0, 0])),
+               repr(prim.get("translate", [0, 0, 0])), repr(prim.get("pivot")))
+        if key not in self._mesh_cache:
+            raw = self._mesh_cache.setdefault(("raw", prim["path"]), None)
+            if raw is None:
+                raw = self._mesh_cache[("raw", prim["path"])] = mesh.load_mesh(prim["path"])
+            self._mesh_cache[key] = mesh.transform(raw, prim.get("scale", 1.0), prim.get("rotate", (0, 0, 0)),
+                                                   prim.get("translate", (0, 0, 0)), prim.get("pivot"))
+        return self._mesh_cache[key]
+
+    def _mesh_mask(self, prim: dict) -> np.ndarray:
+        """Voxelized mesh primitive (cached per parameters and grid).
+
+        **Inputs**
+
+        - `prim` : dict mesh primitive
+
+        **Outputs**
+
+        - np.ndarray bool (shape)
+        """
+        from Solver import mesh
+        if self.dim != 3:
+            raise ValueError("un maillage n'a de sens qu'en 3D (dim=3)")
+        key = ("vox", prim["path"], repr(prim.get("scale", 1.0)), repr(prim.get("rotate", [0, 0, 0])),
+               repr(prim.get("translate", [0, 0, 0])), repr(prim.get("pivot")), bool(prim.get("fill", True)),
+               self.shape, self.dx)
+        if key not in self._mesh_cache:
+            self._mesh_cache[key] = mesh.voxelize(self.mesh_triangles(prim), self.shape, self.dx,
+                                                  fill=bool(prim.get("fill", True)))
+        return self._mesh_cache[key]
+
+    def masks(self) -> dict:
+        """Effective matrices: self.m with the primitives applied in order.
+
+        **Outputs**
+
+        - dict of np.ndarray (shape) : fluid, solid, obstacle (bool), vx0, vy0, vz0 (f32)
+        """
+        if not self.prims:
+            return self.m
+        m = {k: v.copy() for k, v in self.m.items()}
+        for prim in self.prims:
+            mask = self.prim_mask(prim)
+            mat = prim["material"]
+            for k in self.BOOL:
+                m[k][mask] = k == mat
+            for k in self.FLOAT:
+                m[k][mask] = 0.0
+            if mat in ("fluid", "solid"):
+                self._set_vel(m, mask, prim.get("velocity", ()))
+        return m
 
     def run(self, frames: int, substeps: int | None = None, callback=None):
         """Run headless for a number of frames.

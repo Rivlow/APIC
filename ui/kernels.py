@@ -1,41 +1,44 @@
-"""Kernels Taichi du solveur : fluide APIC avec réservoir de particules, grille, parois, rendu.
+"""Kernels Taichi du solveur : fluide APIC avec réservoir de particules, parois, couleurs, rendu 2D.
 
-Tous les arguments sont explicites (aucune globale). Les kernels solides (MLS-MPM, endommagement)
-sont dans ui/kernels_solid.py (ancien Solver/MpM/mpm_solid.py, inchangé).
+Tous les arguments sont explicites (aucune globale). Génériques en dimension (2D ou 3D) : la dimension est lue
+à la compilation sur les champs (`x.n` pour un champ de vecteurs, `len(field.shape)` pour une grille). Les kernels
+solides (MLS-MPM, endommagement) sont dans ui/kernels_solid.py, la grille décalée incompressible dans
+ui/kernels_inc.py (classe MAC), le rendu 3D dans ui/render3d.py.
 
-Grille `cells` (i32, nx × ny, cellules carrées dx = 1 / max(nx, ny), indexée [i, j] = (x, y)) : bits  FLUID0 = 1 (eau initiale), SOLID0 = 2,
-OBSTACLE = 4.  Les conditions aux limites (parois, `wall_type` / `wall_v`, mise à jour de la grille) sont
-dans Solver/boundary.py et Solver/physics.py ; ici, seulement ce qui dépend du réservoir de particules :
-une sortie (OUTLET) détruit les particules qui franchissent le mur, une entrée (INLET) en émet par flux.
+Grille `cells` (i32, forme n = (nx, ny[, nz]), cellules carrées, indexée [i, j(, k)] = (x, y(, z))) : bits
+FLUID0 = 1 (eau initiale), SOLID0 = 2, OBSTACLE = 4.  Les conditions aux limites (parois, `wall_type` /
+`wall_v`, mise à jour de la grille) sont dans Solver/boundary.py et Solver/physics.py ; ici, seulement ce qui
+dépend du réservoir de particules : une sortie (OUTLET, ou entrée à vitesse sortante) détruit les particules qui
+franchissent le mur, une entrée (INLET) en émet par flux.
 
-Réservoir fluide : capacité fixe, drapeau `alive`, particules mortes garées en (-1, -1) et ignorées
-partout ; pile de slots libres (`free_stack`, `free_top[0]`) sur le GPU : une sortie y pousse les
-particules détruites, une entrée y prend les slots des particules émises. Rien ne redescend au CPU.
+Réservoir fluide : capacité fixe, drapeau `alive`, particules mortes garées en (-1, …) et ignorées partout ; pile
+de slots libres (`free_stack`, `free_top[0]`) sur le GPU : une sortie y pousse les particules détruites, une
+entrée y prend les slots des particules émises. Rien ne redescend au CPU.
 """
 import taichi as ti
 
-from Solver.boundary import (BOTTOM, INLET, LEFT, OBSTACLE, OUTLET, RIGHT, TOP, WALL,  # noqa: F401
-                             band_bc, band_cell, exit_at, outlet_at)
+from Solver.boundary import (FRAMES, INLET, OBSTACLE, OUTLET, WALL,  # noqa: F401
+                             band_cell, exit_at)
 
 FLUID0, SOLID0 = 1, 2
 
 
 @ti.func
-def cell_of(xp, inv_dx: float, nx: int, ny: int):
+def cell_of(xp, inv_dx: float, n: ti.template()):
     """Cell containing a position, clamped to the grid.
 
     **Inputs**
 
-    - `xp` : vec2 f32 position
+    - `xp` : vec dim f32 position
     - `inv_dx` : float
-    - `nx`, `ny` : int
+    - `n` : static grid shape
 
     **Outputs**
 
-    - ivec2 cell index (i, j)
+    - ivec dim cell index
     """
     c = (xp * inv_dx).cast(int)
-    return ti.Vector([ti.math.clamp(c.x, 0, nx - 1), ti.math.clamp(c.y, 0, ny - 1)])
+    return ti.math.clamp(c, 0, ti.Vector(n) - 1)
 
 
 @ti.func
@@ -44,13 +47,46 @@ def weights(fx):
 
     **Inputs**
 
-    - `fx` : vec2 f32 offset from the base node (in cells)
+    - `fx` : vec dim f32 offset from the base node (in cells)
 
     **Outputs**
 
-    - list of 3 vec2 weights
+    - list of 3 vec dim weights
     """
     return [0.5 * (1.5 - fx) ** 2, 0.75 - (fx - 1.0) ** 2, 0.5 * (fx - 0.5) ** 2]
+
+
+@ti.func
+def wprod(w, o: ti.template()):
+    """Tensor-product weight of stencil offset o.
+
+    **Inputs**
+
+    - `w` : list of 3 vec dim weights (see weights)
+    - `o` : static ivec dim offset in {0, 1, 2}^dim
+
+    **Outputs**
+
+    - float
+    """
+    r = 1.0
+    for c in ti.static(range(o.n)):
+        r *= w[o[c]][c]
+    return r
+
+
+def stencil3(dim: int):
+    """Static 3^dim stencil offsets (use inside ti.static).
+
+    **Inputs**
+
+    - `dim` : int
+
+    **Outputs**
+
+    - iterable of ivec dim
+    """
+    return ti.grouped(ti.ndrange(*([3] * dim)))
 
 
 # ---------------------------------------------------------------- initialisation
@@ -62,8 +98,8 @@ def init_pool(alive: ti.template(), x: ti.template(), C: ti.template(), J: ti.te
     **Inputs**
 
     - `alive` : i32 field (cap,) 1 = live particle
-    - `x` : vec2 f32 field (cap,) positions
-    - `C` : mat2 f32 field (cap,) affine matrices
+    - `x` : vec dim f32 field (cap,) positions
+    - `C` : mat dim f32 field (cap,) affine matrices
     - `J` : f32 field (cap,) volume ratios
     - `n_init` : int
     - `free_stack` : i32 field (cap,) free slot stack
@@ -73,16 +109,17 @@ def init_pool(alive: ti.template(), x: ti.template(), C: ti.template(), J: ti.te
 
     - all fields written in place
 
-    **Note** : dead particles parked at (-1, -1).
+    **Note** : dead particles parked at (-1, …).
     """
+    dim = ti.static(x.n)
     for p in alive:
-        C[p] = ti.Matrix.zero(ti.f32, 2, 2)
+        C[p] = ti.Matrix.zero(ti.f32, dim, dim)
         J[p] = 1.0
         if p < n_init:
             alive[p] = 1
         else:
             alive[p] = 0
-            x[p] = [-1.0, -1.0]
+            x[p] = ti.Vector.zero(ti.f32, dim) - 1.0
             free_stack[p - n_init] = p
     free_top[0] = alive.shape[0] - n_init
 
@@ -93,7 +130,7 @@ def init_solid_state(C: ti.template(), F: ti.template(), D: ti.template(), broke
 
     **Inputs**
 
-    - `C`, `F` : mat2 f32 fields (Ns,)
+    - `C`, `F` : mat dim f32 fields (Ns,)
     - `D` : f32 field (Ns,) damage
     - `broken` : i32 field (Ns,)
 
@@ -101,9 +138,10 @@ def init_solid_state(C: ti.template(), F: ti.template(), D: ti.template(), broke
 
     - all fields written in place
     """
+    dim = ti.static(C.n)
     for p in D:
-        C[p] = ti.Matrix.zero(ti.f32, 2, 2)
-        F[p] = ti.Matrix.identity(ti.f32, 2)
+        C[p] = ti.Matrix.zero(ti.f32, dim, dim)
+        F[p] = ti.Matrix.identity(ti.f32, dim)
         D[p] = 0.0
         broken[p] = 0
 
@@ -126,7 +164,7 @@ def count_alive(alive: ti.template()) -> ti.i32:
     return n
 
 
-# ---------------------------------------------------------------- 1. particules -> grille (fluide)
+# ---------------------------------------------------------------- 1. particules -> grille (fluide faiblement compressible)
 @ti.kernel
 def P2G_fluid(grid_m: ti.template(), grid_v: ti.template(),
               x: ti.template(), v: ti.template(), C: ti.template(), J: ti.template(), alive: ti.template(),
@@ -135,10 +173,10 @@ def P2G_fluid(grid_m: ti.template(), grid_v: ti.template(),
 
     **Inputs**
 
-    - `grid_m` : f32 field (nx, ny) node masses
-    - `grid_v` : vec2 f32 field (nx, ny) node momenta
-    - `x`, `v` : vec2 f32 field (cap,) positions / velocities
-    - `C` : mat2 f32 field (cap,) affine matrices
+    - `grid_m` : f32 field (n) node masses
+    - `grid_v` : vec dim f32 field (n) node momenta
+    - `x`, `v` : vec dim f32 field (cap,) positions / velocities
+    - `C` : mat dim f32 field (cap,) affine matrices
     - `J` : f32 field (cap,) volume ratios
     - `alive` : i32 field (cap,) 1 = live particle
     - `inv_dx`, `dt`, `dx`, `E`, `p_mass`, `p_vol` : float
@@ -149,27 +187,27 @@ def P2G_fluid(grid_m: ti.template(), grid_v: ti.template(),
 
     **Note** : clears the grid first.
     """
-    for i, j in grid_m:
-        grid_v[i, j] = [0.0, 0.0]
-        grid_m[i, j] = 0.0
+    dim = ti.static(x.n)
+    for I in ti.grouped(grid_m):
+        grid_v[I] = ti.Vector.zero(ti.f32, dim)
+        grid_m[I] = 0.0
     for p in x:
         if alive[p] == 1:
             base = (x[p] * inv_dx - 0.5).cast(int)
             fx = x[p] * inv_dx - base
             w = weights(fx)
             stress = -dt * E * p_vol * (J[p] - 1) * 4.0 * inv_dx * inv_dx
-            for i, j in ti.static(ti.ndrange(3, 3)):
-                offset = ti.Vector([i, j])
-                d_pos = (offset - fx) * dx
-                weight = w[i].x * w[j].y
-                grid_v[base + offset] += weight * (p_mass * (v[p] + C[p] @ d_pos) + stress * d_pos)
-                grid_m[base + offset] += weight * p_mass
+            for o in ti.static(stencil3(dim)):
+                d_pos = (o - fx) * dx
+                weight = wprod(w, o)
+                grid_v[base + o] += weight * (p_mass * (v[p] + C[p] @ d_pos) + stress * d_pos)
+                grid_m[base + o] += weight * p_mass
 
 
 # ---------------------------------------------------------------- 2. grille : Solver/physics.py (grid_step)
 
 
-# ---------------------------------------------------------------- 3. grille -> particules (fluide)
+# ---------------------------------------------------------------- 3. grille -> particules (fluide faiblement compressible)
 @ti.kernel
 def G2P_fluid(grid_v: ti.template(),
               x: ti.template(), v: ti.template(), C: ti.template(), J: ti.template(), alive: ti.template(),
@@ -178,9 +216,9 @@ def G2P_fluid(grid_v: ti.template(),
 
     **Inputs**
 
-    - `grid_v` : vec2 f32 field (nx, ny) node velocities
-    - `x`, `v` : vec2 f32 field (cap,) positions / velocities
-    - `C` : mat2 f32 field (cap,) affine matrices
+    - `grid_v` : vec dim f32 field (n) node velocities
+    - `x`, `v` : vec dim f32 field (cap,) positions / velocities
+    - `C` : mat dim f32 field (cap,) affine matrices
     - `J` : f32 field (cap,) volume ratios
     - `alive` : i32 field (cap,) 1 = live particle
     - `inv_dx`, `dt`, `dx` : float
@@ -189,19 +227,19 @@ def G2P_fluid(grid_v: ti.template(),
 
     - v, C, J written in place
     """
+    dim = ti.static(x.n)
     for p in x:
         if alive[p] == 1:
             base = (x[p] * inv_dx - 0.5).cast(int)
             fx = x[p] * inv_dx - base
             w = weights(fx)
-            v_new = ti.Vector.zero(ti.f32, 2)
-            C_new = ti.Matrix.zero(ti.f32, 2, 2)
-            for i, j in ti.static(ti.ndrange(3, 3)):
-                offset = ti.Vector([i, j])
-                d_pos = (offset - fx) * dx
-                weight = w[i].x * w[j].y
-                v_new += weight * grid_v[base + offset]
-                C_new += weight * grid_v[base + offset].outer_product(d_pos) * (4 * inv_dx * inv_dx)
+            v_new = ti.Vector.zero(ti.f32, dim)
+            C_new = ti.Matrix.zero(ti.f32, dim, dim)
+            for o in ti.static(stencil3(dim)):
+                d_pos = (o - fx) * dx
+                weight = wprod(w, o)
+                v_new += weight * grid_v[base + o]
+                C_new += weight * grid_v[base + o].outer_product(d_pos) * (4 * inv_dx * inv_dx)
             v[p] = v_new
             C[p] = C_new
             J[p] *= 1.0 + dt * C_new.trace()
@@ -211,25 +249,24 @@ def G2P_fluid(grid_v: ti.template(),
 @ti.kernel
 def advect_fluid(x: ti.template(), v: ti.template(), alive: ti.template(), wall_type: ti.template(),
                  wall_v: ti.template(), wall_d: ti.template(), sdf: ti.template(), cells: ti.template(), use_sdf: int,
-                 inv_dx: float, dt: float, bound: int, dx: float, nx: int, ny: int,
+                 inv_dx: float, dt: float, bound: int, dx: float,
                  free_stack: ti.template(), free_top: ti.template()):
     """Advect fluid particles; kill those crossing an outlet (pressure or outward velocity); push those entering an
     obstacle back to its surface.
 
     **Inputs**
 
-    - `x`, `v` : vec2 f32 field (cap,) positions / velocities
+    - `x`, `v` : vec dim f32 field (cap,) positions / velocities
     - `alive` : i32 field (cap,) 1 = live particle
-    - `wall_type` : i32 field (4, nm) wall BC type
-    - `wall_v` : vec2 f32 field (4, nm) imposed velocity (inlet pointing outwards = velocity outlet)
-    - `wall_d` : i32 field (4, nm) wall offset from the edge (cells)
-    - `sdf` : f32 field (nx, ny) signed distance to the obstacles at cell centers (m, < 0 inside)
-    - `cells` : i32 field (nx, ny) bit flags (OBSTACLE)
+    - `wall_type` : i32 field (2 dim, na, nb) wall BC type
+    - `wall_v` : vec dim f32 field (2 dim, na, nb) imposed velocity (inlet pointing outwards = velocity outlet)
+    - `wall_d` : i32 field (2 dim, na, nb) wall offset from the edge (cells)
+    - `sdf` : f32 field (n) signed distance to the obstacles at cell centers (m, < 0 inside)
+    - `cells` : i32 field (n) bit flags (OBSTACLE)
     - `use_sdf` : int 1 = scene has obstacles
     - `inv_dx`, `dt` : float
     - `bound` : int
     - `dx` : float
-    - `nx`, `ny` : int
     - `free_stack` : i32 field (cap,) free slot stack
     - `free_top` : i32 field (1,) stack size
 
@@ -241,32 +278,40 @@ def advect_fluid(x: ti.template(), v: ti.template(), alive: ti.template(), wall_
     out mainly by the density projection (boundary volume map) ; this is the safety net for particles that still
     cross the surface in one Euler step (up to cfl * dx) : moved back along the normal, inward velocity removed.
     """
-    lo = ti.Vector([bound * dx, bound * dx])
-    hi = ti.Vector([(nx - bound) * dx, (ny - bound) * dx])
-    Lx, Ly = nx * dx, ny * dx
+    n = ti.static(cells.shape)
+    dim = ti.static(len(n))
+    lo = ti.Vector.zero(ti.f32, dim) + bound * dx
+    hi = (ti.Vector(n) - bound).cast(ti.f32) * dx
     margin = 0.1 * dx
     for p in x:
         if alive[p] == 1:
             xn = x[p] + dt * v[p]
-            kj = ti.math.clamp(int(xn.y * inv_dx), 0, ny - 1)
-            ki = ti.math.clamp(int(xn.x * inv_dx), 0, nx - 1)
-            out = ((xn.x < wall_d[LEFT, kj] * dx and exit_at(wall_type, wall_v, LEFT, kj, nx, ny, bound))
-                   or (xn.x > Lx - wall_d[RIGHT, kj] * dx and exit_at(wall_type, wall_v, RIGHT, kj, nx, ny, bound))
-                   or (xn.y < wall_d[BOTTOM, ki] * dx and exit_at(wall_type, wall_v, BOTTOM, ki, nx, ny, bound))
-                   or (xn.y > Ly - wall_d[TOP, ki] * dx and exit_at(wall_type, wall_v, TOP, ki, nx, ny, bound)))
+            c = (xn * inv_dx).cast(int)
+            c = ti.math.clamp(c, 0, ti.Vector(n) - 1)
+            out = False
+            for s in ti.static(range(2 * dim)):
+                a, plus, ts = ti.static(FRAMES[dim][s])
+                ka = c[ts[0]]
+                kb = 0
+                if ti.static(dim == 3):
+                    kb = c[ts[1]]
+                d = wall_d[s, ka, kb] * dx
+                crossed = xn[a] > n[a] * dx - d if ti.static(plus) else xn[a] < d
+                if crossed and exit_at(wall_type, wall_v, s, ka, kb, n, bound):
+                    out = True
             if out:
                 alive[p] = 0
-                x[p] = [-1.0, -1.0]
+                x[p] = ti.Vector.zero(ti.f32, dim) - 1.0
                 idx = ti.atomic_add(free_top[0], 1)
                 free_stack[idx] = p
             else:
                 xn = ti.math.clamp(xn, lo, hi)
                 if use_sdf == 1:
-                    for _ in ti.static(range(3)):                # distance bilinéaire approchée dans les coins
-                        phi, grad = sdf_at(sdf, xn, inv_dx, nx, ny)   # d'un escalier : on reprojette si besoin
+                    for _ in ti.static(range(3)):                # distance multilinéaire approchée dans les coins
+                        phi, grad = sdf_at(sdf, xn, inv_dx)      # d'un escalier : on reprojette si besoin
                         gn = grad.norm()
-                        c = cell_of(xn, inv_dx, nx, ny)
-                        in_obs = (cells[c.x, c.y] & OBSTACLE) != 0   # coin saillant : la distance interpolée
+                        cc = cell_of(xn, inv_dx, n)
+                        in_obs = (cells[cc] & OBSTACLE) != 0     # coin saillant : la distance interpolée
                         if (phi < margin or in_obs) and gn > 1e-6:   # peut y être positive
                             nrm = grad / gn                     # normale sortante de l'obstacle
                             step = margin - phi if phi < margin else 0.5 * dx
@@ -278,56 +323,64 @@ def advect_fluid(x: ti.template(), v: ti.template(), alive: ti.template(), wall_
 
 
 @ti.func
-def sdf_at(sdf: ti.template(), xp, inv_dx: float, nx: int, ny: int):
-    """Bilinear signed distance and its gradient at a point (samples at cell centers).
+def sdf_at(sdf: ti.template(), xp, inv_dx: float):
+    """Multilinear signed distance and its gradient at a point (samples at cell centers).
 
     **Inputs**
 
-    - `sdf` : f32 field (nx, ny) signed distance (m, < 0 inside obstacles)
-    - `xp` : vec2 f32 position (m)
+    - `sdf` : f32 field (n) signed distance (m, < 0 inside obstacles)
+    - `xp` : vec dim f32 position (m)
     - `inv_dx` : float
-    - `nx`, `ny` : int
 
     **Outputs**
 
-    - `phi` : f32 distance (m) ; `grad` : vec2 f32 gradient (points out of the obstacle)
+    - `phi` : f32 distance (m) ; `grad` : vec dim f32 gradient (points out of the obstacle)
     """
+    n = ti.static(sdf.shape)
+    dim = ti.static(len(n))
     g = xp * inv_dx - 0.5
-    i0 = ti.math.clamp(int(ti.floor(g.x)), 0, nx - 2)
-    j0 = ti.math.clamp(int(ti.floor(g.y)), 0, ny - 2)
-    fx = ti.math.clamp(g.x - i0, 0.0, 1.0)
-    fy = ti.math.clamp(g.y - j0, 0.0, 1.0)
-    s00, s10 = sdf[i0, j0], sdf[i0 + 1, j0]
-    s01, s11 = sdf[i0, j0 + 1], sdf[i0 + 1, j0 + 1]
-    phi = (s00 * (1 - fx) + s10 * fx) * (1 - fy) + (s01 * (1 - fx) + s11 * fx) * fy
-    grad = ti.Vector([(s10 - s00) * (1 - fy) + (s11 - s01) * fy,
-                      (s01 - s00) * (1 - fx) + (s11 - s10) * fx]) * inv_dx
-    return phi, grad
+    i0 = ti.math.clamp(ti.floor(g).cast(int), 0, ti.Vector(n) - 2)
+    f = ti.math.clamp(g - i0, 0.0, 1.0)
+    phi = 0.0
+    grad = ti.Vector.zero(ti.f32, dim)
+    for o in ti.static(ti.grouped(ti.ndrange(*([2] * dim)))):
+        s = sdf[i0 + o]
+        wt = 1.0
+        for c in ti.static(range(dim)):
+            wt *= f[c] if o[c] == 1 else 1.0 - f[c]
+        phi += wt * s
+        for c in ti.static(range(dim)):               # d(poids)/d(f_c)
+            dw = 1.0 if o[c] == 1 else -1.0
+            for e in ti.static(range(dim)):
+                if ti.static(e != c):
+                    dw *= f[e] if o[e] == 1 else 1.0 - f[e]
+            grad[c] += dw * s
+    return phi, grad * inv_dx
 
 
 # ---------------------------------------------------------------- 5. émission par flux sur les parois d'entrée
 @ti.kernel
 def emit_wall(x: ti.template(), v: ti.template(), C: ti.template(), J: ti.template(), alive: ti.template(),
               wall_type: ti.template(), wall_v: ti.template(), wall_d: ti.template(), emit_acc: ti.template(),
-              ppc2: float, free_stack: ti.template(), free_top: ti.template(), dt: float, dx: float, bound: int,
-              nx: int, ny: int):
-    """Emit particles from inlet walls by flux (ppc^2 v_n dt / dx per wall cell).
+              ppc_face: float, free_stack: ti.template(), free_top: ti.template(), dt: float, dx: float, bound: int,
+              cells: ti.template()):
+    """Emit particles from inlet walls by flux (ppc^dim v_n dt / dx per wall cell).
 
     **Inputs**
 
-    - `x`, `v` : vec2 f32 field (cap,) positions / velocities
-    - `C` : mat2 f32 field (cap,) affine matrices
+    - `x`, `v` : vec dim f32 field (cap,) positions / velocities
+    - `C` : mat dim f32 field (cap,) affine matrices
     - `J` : f32 field (cap,) volume ratios
     - `alive` : i32 field (cap,) 1 = live particle
-    - `wall_type` : i32 field (4, nm) wall BC type
-    - `wall_v` : vec2 f32 field (4, nm) inlet velocity
-    - `wall_d` : i32 field (4, nm) wall offset from the edge (cells)
-    - `emit_acc` : f32 field (4, nm) fractional particle carry
-    - `ppc2` : float
+    - `wall_type` : i32 field (2 dim, na, nb) wall BC type
+    - `wall_v` : vec dim f32 field (2 dim, na, nb) inlet velocity
+    - `wall_d` : i32 field (2 dim, na, nb) wall offset from the edge (cells)
+    - `emit_acc` : f32 field (2 dim, na, nb) fractional particle carry
+    - `ppc_face` : float ppc^dim (particles per wall cell per unit of v_n dt / dx)
     - `free_stack` : i32 field (cap,) free slot stack
     - `free_top` : i32 field (1,) stack size
-    - `dt`, `dx` : float
-    - `bound`, `nx`, `ny` : int
+    - `dt`, `dx` : float ; `bound` : int
+    - `cells` : i32 field (n) (grid shape only)
 
     **Outputs**
 
@@ -335,58 +388,82 @@ def emit_wall(x: ti.template(), v: ti.template(), C: ti.template(), J: ti.templa
 
     **Note** : stops silently when the pool is full.
     """
-    lo_d = ti.Vector([bound * dx, bound * dx])
-    hi_d = ti.Vector([(nx - bound) * dx, (ny - bound) * dx])
-    for side, k in wall_type:
-        ln = ny if side <= RIGHT else nx
-        if wall_type[side, k] == INLET and bound <= k < ln - bound:
-            lo = wall_d[side, k] * dx
-            hi = (nx if side <= RIGHT else ny) * dx - wall_d[side, k] * dx
-            vel = wall_v[side, k]
-            vn = 0.0
-            if side == LEFT:
-                vn = vel.x
-            elif side == RIGHT:
-                vn = -vel.x
-            elif side == BOTTOM:
-                vn = vel.y
-            else:
-                vn = -vel.y
-            if vn > 0:
-                emit_acc[side, k] += ppc2 * vn * dt / dx
-                count = int(emit_acc[side, k])
-                emit_acc[side, k] -= count
-                for _ in range(count):
-                    idx = ti.atomic_sub(free_top[0], 1) - 1
-                    if idx >= 0:
-                        p = free_stack[idx]
-                        along = (k + ti.random()) * dx
-                        depth = ti.random() * vn * dt
-                        xp = ti.Vector([0.0, 0.0])
-                        if side == LEFT:
-                            xp = ti.Vector([lo + depth, along])
-                        elif side == RIGHT:
-                            xp = ti.Vector([hi - depth, along])
-                        elif side == BOTTOM:
-                            xp = ti.Vector([along, lo + depth])
+    n = ti.static(cells.shape)
+    dim = ti.static(len(n))
+    lo_d = ti.Vector.zero(ti.f32, dim) + bound * dx
+    hi_d = (ti.Vector(n) - bound).cast(ti.f32) * dx
+    for side, ka, kb in wall_type:
+        for s in ti.static(range(2 * dim)):
+            a, plus, ts = ti.static(FRAMES[dim][s])
+            ok = side == s and wall_type[side, ka, kb] == INLET and bound <= ka < n[ts[0]] - bound
+            if ti.static(dim == 3):
+                ok = ok and bound <= kb < n[ts[1]] - bound
+            if ok:
+                vel = wall_v[side, ka, kb]
+                vn = -vel[a] if ti.static(plus) else vel[a]
+                if vn > 0:
+                    emit_acc[side, ka, kb] += ppc_face * vn * dt / dx
+                    count = int(emit_acc[side, ka, kb])
+                    emit_acc[side, ka, kb] -= count
+                    d = wall_d[side, ka, kb] * dx
+                    for _ in range(count):
+                        idx = ti.atomic_sub(free_top[0], 1) - 1
+                        if idx >= 0:
+                            p = free_stack[idx]
+                            depth = ti.random() * vn * dt
+                            xp = ti.Vector.zero(ti.f32, dim)
+                            xp[a] = n[a] * dx - d - depth if ti.static(plus) else d + depth
+                            xp[ts[0]] = (ka + ti.random()) * dx
+                            if ti.static(dim == 3):
+                                xp[ts[1]] = (kb + ti.random()) * dx
+                            x[p] = ti.math.clamp(xp, lo_d, hi_d)
+                            v[p] = vel
+                            C[p] = ti.Matrix.zero(ti.f32, dim, dim)
+                            J[p] = 1.0
+                            alive[p] = 1
                         else:
-                            xp = ti.Vector([along, hi - depth])
-                        x[p] = ti.math.clamp(xp, lo_d, hi_d)
-                        v[p] = vel
-                        C[p] = ti.Matrix.zero(ti.f32, 2, 2)
-                        J[p] = 1.0
-                        alive[p] = 1
-                    else:
-                        ti.atomic_add(free_top[0], 1)     # plus de slot libre : on rend ce qu'on a pris
+                            ti.atomic_add(free_top[0], 1)     # plus de slot libre : on rend ce qu'on a pris
 
 
 # ---------------------------------------------------------------- 6. quantité colorée du fluide
-# modes : 0 uniforme, 1 |v|, 2 vx, 3 vy, 4 pression, 5 vorticité, 6 masse volumique (écart rho - rho0),
-# 7 viscosité nu (fluid_nu + Smagorinsky, incompressible) (1, 7 : échelle 0..max ; 2-6 : ±max)
-FLUID_MODES = ["uniforme", "vitesse |v|", "vx", "vy", "pression", "vorticité", "masse volumique ρ − ρ0",
-               "viscosité ν (m²/s)"]
-MODE_DENSITY = 6                                     # mode par défaut
-MODE_NU = 7
+# Modes (identifiants fixes) : 0 uniforme, 1 |v|, 2 vx, 3 vy, 8 vz (3D), 4 pression, 5 vorticité (2D : signée ;
+# 3D : |ω|), 6 masse volumique (écart rho - rho0), 7 viscosité nu (fluid_nu + Smagorinsky, incompressible).
+MODE_UNIFORM, MODE_SPEED, MODE_VX, MODE_VY, MODE_P, MODE_VORT, MODE_DENSITY, MODE_NU, MODE_VZ = range(9)
+_LABELS = {MODE_UNIFORM: "uniforme", MODE_SPEED: "vitesse |v|", MODE_VX: "vx", MODE_VY: "vy", MODE_VZ: "vz",
+           MODE_P: "pression", MODE_VORT: "vorticité", MODE_DENSITY: "masse volumique ρ − ρ0",
+           MODE_NU: "viscosité ν (m²/s)"}
+
+
+def fluid_modes(dim: int = 2) -> list:
+    """Color modes available in a dimension, in menu order.
+
+    **Inputs**
+
+    - `dim` : int 2 or 3
+
+    **Outputs**
+
+    - list of (mode id, label)
+    """
+    ids = [0, 1, 2, 3, 4, 5, 6, 7] if dim == 2 else [0, 1, 2, 3, 8, 4, 5, 6, 7]
+    return [(m, _LABELS[m] if not (m == MODE_VORT and dim == 3) else "vorticité |ω|") for m in ids]
+
+
+FLUID_MODES = [lbl for _, lbl in fluid_modes(2)]      # libellés 2D (index = identifiant)
+
+
+def mode_signed(mode: int, dim: int = 2) -> bool:
+    """Whether a color mode is signed (diverging colormap, scale ±max) or positive (jet, 0..max).
+
+    **Inputs**
+
+    - `mode` : int ; `dim` : int
+
+    **Outputs**
+
+    - bool
+    """
+    return mode in (MODE_VX, MODE_VY, MODE_VZ, MODE_P, MODE_DENSITY) or (mode == MODE_VORT and dim == 2)
 
 
 @ti.func
@@ -428,91 +505,77 @@ def cmap_signed(t):
     return c
 
 
+@ti.func
+def particle_color(s: float, fluid_mode: int, signed: int, inv_smax: float, base):
+    """Display color of a particle.
+
+    **Inputs**
+
+    - `s` : float scalar ; `fluid_mode` : int (0 uniform) ; `signed` : int 1 = diverging colormap
+    - `inv_smax` : float 1 / scale ; `base` : vec3 uniform color
+
+    **Outputs**
+
+    - vec3 RGB
+    """
+    cp = base
+    if fluid_mode != 0:
+        if signed == 1:
+            cp = cmap_signed(ti.math.clamp(0.5 + 0.5 * s * inv_smax, 0.0, 1.0))
+        else:
+            cp = cmap_jet(ti.math.clamp(s * inv_smax, 0.0, 1.0))
+    return cp
+
+
 @ti.kernel
 def fluid_scalar_wc(mode: int, x: ti.template(), v: ti.template(), J: ti.template(), alive: ti.template(),
-                    grid_v: ti.template(), sc: ti.template(), E: float, rho0: float, inv_dx: float, nx: int, ny: int):
+                    grid_v: ti.template(), sc: ti.template(), E: float, rho0: float, inv_dx: float):
     """Per-particle display scalar, weakly compressible mode.
 
     **Inputs**
 
-    - `mode` : int (index in FLUID_MODES)
-    - `x`, `v` : vec2 f32 field (cap,) positions / velocities
+    - `mode` : int (mode id, see fluid_modes)
+    - `x`, `v` : vec dim f32 field (cap,) positions / velocities
     - `J` : f32 field (cap,) volume ratios
     - `alive` : i32 field (cap,) 1 = live particle
-    - `grid_v` : vec2 f32 field (nx, ny) node velocities
+    - `grid_v` : vec dim f32 field (n) node velocities
     - `sc` : f32 field (cap,)
     - `E`, `rho0`, `inv_dx` : float
-    - `nx`, `ny` : int
 
     **Outputs**
 
     - sc written in place
     """
+    n = ti.static(grid_v.shape)
+    dim = ti.static(len(n))
     for p in x:
         if alive[p] == 1:
             s = 0.0
-            if mode == 1:
+            if mode == MODE_SPEED:
                 s = v[p].norm()
-            elif mode == 2:
-                s = v[p].x
-            elif mode == 3:
-                s = v[p].y
-            elif mode == 4:
+            elif mode == MODE_VX:
+                s = v[p][0]
+            elif mode == MODE_VY:
+                s = v[p][1]
+            elif mode == MODE_VZ:
+                if ti.static(dim == 3):
+                    s = v[p][dim - 1]
+            elif mode == MODE_P:
                 s = E * (1.0 - J[p])
-            elif mode == 5:
-                c = cell_of(x[p], inv_dx, nx, ny)
-                i, j = ti.math.clamp(c.x, 1, nx - 2), ti.math.clamp(c.y, 1, ny - 2)
-                s = (grid_v[i + 1, j].y - grid_v[i - 1, j].y - grid_v[i, j + 1].x + grid_v[i, j - 1].x) * 0.5 * inv_dx
-            elif mode == 6:
+            elif mode == MODE_VORT:
+                c = ti.math.clamp(cell_of(x[p], inv_dx, n), 1, ti.Vector(n) - 2)
+                g = ti.Matrix.zero(ti.f32, dim, dim)                 # g[a, b] = d v_b / d x_a
+                for a in ti.static(range(dim)):
+                    e = ti.Vector.unit(dim, a, ti.i32)
+                    dv = (grid_v[c + e] - grid_v[c - e]) * 0.5 * inv_dx
+                    for b in ti.static(range(dim)):
+                        g[a, b] = dv[b]
+                if ti.static(dim == 2):
+                    s = g[0, 1] - g[1, 0]
+                else:
+                    s = ti.Vector([g[1, 2] - g[2, 1], g[2, 0] - g[0, 2], g[0, 1] - g[1, 0]]).norm()
+            elif mode == MODE_DENSITY:
                 s = rho0 * (1.0 / ti.max(J[p], 1e-6) - 1.0)
-            sc[p] = s
-
-
-@ti.kernel
-def fluid_scalar_inc(mode: int, x: ti.template(), v: ti.template(), alive: ti.template(),
-                     u: ti.template(), vv: ti.template(), q: ti.template(), dens: ti.template(), nu: ti.template(),
-                     sc: ti.template(), rho_over_dt: float, rho0: float, inv_dx: float, nx: int, ny: int):
-    """Per-particle display scalar, incompressible mode.
-
-    **Inputs**
-
-    - `mode` : int (index in FLUID_MODES)
-    - `x`, `v` : vec2 f32 field (cap,) positions / velocities
-    - `alive` : i32 field (cap,) 1 = live particle
-    - `u`, `vv` : f32 fields (nx+1, ny), (nx, ny+1) MAC face velocities
-    - `q` : f32 field (nx, ny) pressure dt / rho
-    - `dens` : f32 field (nx, ny) particle density rho / rho0 (kernels_inc.particle_density)
-    - `nu` : f32 field (nx, ny) cell viscosity (kernels_inc.visc_nu)
-    - `sc` : f32 field (cap,)
-    - `rho_over_dt`, `rho0`, `inv_dx` : float
-    - `nx`, `ny` : int
-
-    **Outputs**
-
-    - sc written in place
-    """
-    for p in x:
-        if alive[p] == 1:
-            s = 0.0
-            if mode == 1:
-                s = v[p].norm()
-            elif mode == 2:
-                s = v[p].x
-            elif mode == 3:
-                s = v[p].y
-            else:
-                c = cell_of(x[p], inv_dx, nx, ny)
-                i, j = ti.math.clamp(c.x, 1, nx - 2), ti.math.clamp(c.y, 1, ny - 2)
-                if mode == 4:
-                    s = q[i, j] * rho_over_dt
-                elif mode == 5:
-                    dvdx = ((vv[i + 1, j] + vv[i + 1, j + 1]) - (vv[i - 1, j] + vv[i - 1, j + 1])) * 0.25 * inv_dx
-                    dudy = ((u[i, j + 1] + u[i + 1, j + 1]) - (u[i, j - 1] + u[i + 1, j - 1])) * 0.25 * inv_dx
-                    s = dvdx - dudy
-                elif mode == 6:
-                    s = rho0 * (dens[c.x, c.y] - 1.0)
-                elif mode == 7:
-                    s = nu[c.x, c.y]
             sc[p] = s
 
 
@@ -557,16 +620,16 @@ def scalar_rms(sc: ti.template(), alive: ti.template()) -> ti.f32:
     return ti.sqrt(s / ti.max(n, 1))
 
 
-# ---------------------------------------------------------------- 7. rendu
+# ---------------------------------------------------------------- 7. rendu 2D
 @ti.kernel
 def render(img: ti.template(), res_x: int, res_y: int, x0: float, y0: float, k: float,
-           cells: ti.template(), wall_type: ti.template(), wall_d: ti.template(), nx: int, ny: int, inv_dx: float,
+           cells: ti.template(), wall_type: ti.template(), wall_d: ti.template(), inv_dx: float,
            bound: int,
            grid_on: int, tint_on: int,
            x_f: ti.template(), alive: ti.template(), has_fluid: int, fr: float, fg: float, fb: float, r_f: int,
-           sc: ti.template(), fluid_mode: int, inv_smax: float,
+           sc: ti.template(), fluid_mode: int, signed: int, inv_smax: float,
            x_s: ti.template(), col_s: ti.template(), has_solid: int, r_s: int):
-    """Render domain, walls, obstacles, grid and particles to an image.
+    """Render domain, walls, obstacles, grid and particles to an image (2D).
 
     **Inputs**
 
@@ -574,16 +637,16 @@ def render(img: ti.template(), res_x: int, res_y: int, x0: float, y0: float, k: 
     - `res_x`, `res_y` : int image size (px)
     - `x0`, `y0` : float view bottom-left corner (m) ; `k` : float view size of one pixel (m)
     - `cells` : i32 field (nx, ny) bit flags (FLUID0, SOLID0, OBSTACLE)
-    - `wall_type` : i32 field (4, nm) wall BC type
-    - `wall_d` : i32 field (4, nm) wall offset from the edge (cells)
-    - `nx`, `ny`, `bound`, `grid_on`, `tint_on` : int ; `inv_dx` : float (1 / m)
+    - `wall_type` : i32 field (4, nm, 1) wall BC type
+    - `wall_d` : i32 field (4, nm, 1) wall offset from the edge (cells)
+    - `inv_dx` : float (1 / m) ; `bound`, `grid_on`, `tint_on` : int
     - `x_f` : vec2 f32 field (cap,) fluid positions
     - `alive` : i32 field (cap,) 1 = live particle
     - `has_fluid` : int
     - fr, fg, fb float fluid color
     - `r_f` : int fluid dot radius (px)
     - `sc` : f32 field (cap,) display scalar
-    - fluid_mode int
+    - `fluid_mode` : int (0 uniform) ; `signed` : int 1 = diverging colormap
     - `inv_smax` : float
     - `x_s` : vec2 f32 field (Ns,) solid positions
     - `col_s` : vec3 f32 field (Ns,) solid colors
@@ -595,6 +658,8 @@ def render(img: ti.template(), res_x: int, res_y: int, x0: float, y0: float, k: 
 
     **Note** : indexed [row, col], row 0 at the top (QImage RGB888).
     """
+    n = ti.static(cells.shape)
+    nx, ny = n[0], n[1]
     cell_px = 1.0 / (inv_dx * k)                      # taille d'une cellule en pixels
     Lx, Ly = nx / inv_dx, ny / inv_dx
     for row, col in ti.ndrange(res_y, res_x):         # partie utile du tampon (res_y, res_x) <= (res, res)
@@ -605,10 +670,10 @@ def render(img: ti.template(), res_x: int, res_y: int, x0: float, y0: float, k: 
             ci = ti.math.clamp(int(xd * inv_dx), 0, nx - 1)
             cj = ti.math.clamp(int(yd * inv_dx), 0, ny - 1)
             f = cells[ci, cj]
-            side, kk = band_cell(ci, cj, nx, ny, bound, wall_d)
+            side, ka, kb = band_cell(ti.Vector([ci, cj]), n, bound, wall_d)
             t = WALL
             if side >= 0:
-                t = wall_type[side, kk]
+                t = wall_type[side, ka, kb]
             bc_col = ti.Vector([0.16, 0.16, 0.19])
             if t == INLET:
                 bc_col = ti.Vector([0.15, 0.50, 0.22])
@@ -639,11 +704,7 @@ def render(img: ti.template(), res_x: int, res_y: int, x0: float, y0: float, k: 
             col = int((x_f[p].x - x0) / k)
             row = res_y - 1 - int((x_f[p].y - y0) / k)
             if -r_f <= col < res_x + r_f and -r_f <= row < res_y + r_f:  # hors champ : rien à dessiner
-                cp = ti.Vector([fr, fg, fb])
-                if fluid_mode == 1 or fluid_mode == 7:
-                    cp = cmap_jet(ti.math.clamp(sc[p] * inv_smax, 0.0, 1.0))
-                elif fluid_mode > 1:
-                    cp = cmap_signed(ti.math.clamp(0.5 + 0.5 * sc[p] * inv_smax, 0.0, 1.0))
+                cp = particle_color(sc[p], fluid_mode, signed, inv_smax, ti.Vector([fr, fg, fb]))
                 for a, b in ti.ndrange((-r_f, r_f + 1), (-r_f, r_f + 1)):
                     rr, cc = row + a, col + b
                     if 0 <= rr < res_y and 0 <= cc < res_x:

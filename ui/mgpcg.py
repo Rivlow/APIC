@@ -1,10 +1,13 @@
-"""Gradient conjugué préconditionné par multigrille (MGPCG, McAdams et al. 2010) pour le laplacien des cellules.
+"""Gradient conjugué préconditionné par multigrille (MGPCG, McAdams et al. 2010) pour le laplacien des cellules,
+2D ou 3D.
 
-Même opérateur que kernels_inc.apply_A (5 points non mis à l'échelle, air : Dirichlet 0, solide : exclu) sur une
-hiérarchie de grilles n, n/2, n/4... Cellule grossière : AIR si un enfant est de l'air, sinon FLUID si un enfant
-est fluide, sinon SOLID. Restriction = somme des 4 enfants du résidu (l'opérateur non mis à l'échelle grossit de
-4 par niveau), prolongation = injection constante (transposée de la restriction). Lissage Gauss-Seidel rouge-noir,
-rouge puis noir à la descente, noir puis rouge à la remontée : V-cycle symétrique, donc préconditionneur SPD.
+Même opérateur que kernels_inc.apply_A (2·dim + 1 points non mis à l'échelle, air : Dirichlet 0, solide : exclu) sur
+une hiérarchie de grilles n, n/2, n/4... Cellule grossière : AIR si un enfant est de l'air, sinon FLUID si un enfant
+est fluide, sinon SOLID. Restriction = somme des 2^dim enfants du résidu × 2^(2-dim) : l'opérateur non mis à
+l'échelle grossit de 4 par niveau quelle que soit la dimension, la somme des enfants de 2^dim (d'où 0.5 en 3D).
+Prolongation = injection constante (transposée de la restriction, au facteur près). Lissage Gauss-Seidel
+rouge-noir, rouge puis noir à la descente, noir puis rouge à la remontée : V-cycle symétrique, donc
+préconditionneur SPD.
 
 Le coût est dominé par les lancements de kernels (~0.1 ms chacun) : une itération PCG = 2 L + 1 kernels (un par
 niveau et par phase du V-cycle, plus A p et la direction). Ne pas dérouler tout le V-cycle dans un seul kernel :
@@ -24,26 +27,29 @@ def _zero(x):
 
 
 @ti.func
-def _gs_cell(x, b, ct, i, j):
-    """Gauss-Seidel update of fluid cell (i, j) for A x = b (air neighbors = 0, solids excluded)."""
-    if ct[i, j] == FLUID:
+def _gs_cell(x, b, ct, I):
+    """Gauss-Seidel update of fluid cell I for A x = b (air neighbors = 0, solids excluded)."""
+    n = ti.static(x.shape)
+    dim = ti.static(len(n))
+    if ct[I] == FLUID:
         deg = 0
         s = 0.0
-        for di, dj in ti.static(((1, 0), (-1, 0), (0, 1), (0, -1))):
-            ni, nj = i + di, j + dj
-            if 0 <= ni < x.shape[0] and 0 <= nj < x.shape[1]:
-                t = ct[ni, nj]
-                if t < SOLID:
-                    deg += 1
-                    if t == FLUID:
-                        s += x[ni, nj]
+        for a in ti.static(range(dim)):
+            for sg in ti.static((1, -1)):
+                J = I + sg * ti.Vector.unit(dim, a, ti.i32)
+                if 0 <= J[a] < n[a]:
+                    t = ct[J]
+                    if t < SOLID:
+                        deg += 1
+                        if t == FLUID:
+                            s += x[J]
         if deg > 0:
-            x[i, j] = (b[i, j] + s) / deg
+            x[I] = (b[I] + s) / deg
 
 
 @ti.func
 def _smooth(x, b, ct, color: ti.template()):
-    """One Gauss-Seidel half sweep on cells with (i + j) % 2 == color (A x = b, air neighbors = 0).
+    """One Gauss-Seidel half sweep on cells with (sum of indices) % 2 == color (A x = b, air neighbors = 0).
 
     **Inputs**
 
@@ -54,81 +60,109 @@ def _smooth(x, b, ct, color: ti.template()):
 
     - x updated in place on fluid cells of that color
     """
-    for i, j in x:
-        if (i + j) % 2 == color:
-            _gs_cell(x, b, ct, i, j)
+    for I in ti.grouped(x):
+        if I.sum() % 2 == color:
+            _gs_cell(x, b, ct, I)
 
 
 @ti.func
 def _restrict_types(ctf, ctc):
-    """Coarse cell types from the 4 children (air wins, then fluid, else solid)."""
-    for I, J in ctc:
+    """Coarse cell types from the 2^dim children (air wins, then fluid, else solid)."""
+    nf = ti.static(ctf.shape)
+    dim = ti.static(len(nf))
+    for Ic in ti.grouped(ctc):
         air, fluid = 0, 0
-        for a, c in ti.static(ti.ndrange(2, 2)):
-            i, j = 2 * I + a, 2 * J + c
-            if i < ctf.shape[0] and j < ctf.shape[1]:
-                t = ctf[i, j]
+        for o in ti.static(ti.grouped(ti.ndrange(*([2] * dim)))):
+            If = 2 * Ic + o
+            inside = True
+            for c in ti.static(range(dim)):
+                inside = inside and If[c] < nf[c]
+            if inside:
+                t = ctf[If]
                 if t == AIR:
                     air = 1
                 elif t == FLUID:
                     fluid = 1
-        ctc[I, J] = AIR if air == 1 else (FLUID if fluid == 1 else SOLID)
+        ctc[Ic] = AIR if air == 1 else (FLUID if fluid == 1 else SOLID)
 
 
 @ti.func
-def _restrict(xf, bf, ctf, bc, ctc):
-    """Coarse rhs = sum of the fine residuals b - A x over the 4 children."""
-    for I, J in bc:
+def _residual(xf, bf, ctf, rf):
+    """Fine residual rf = b - A x on fluid cells (0 elsewhere) : one apply_A per cell."""
+    for I in ti.grouped(rf):
+        v = 0.0
+        if ctf[I] == FLUID:
+            v = bf[I] - apply_A(xf, ctf, I)
+        rf[I] = v
+
+
+@ti.func
+def _restrict(rf, bc, ctc):
+    """Coarse rhs = 2^(2-dim) × sum of the fine residuals over the 2^dim children.
+
+    **Note** : the residual is precomputed (_residual) : inlining apply_A for each of the 8 children made the 3D
+    kernel take ~25 s to compile.
+    """
+    nf = ti.static(rf.shape)
+    dim = ti.static(len(nf))
+    for Ic in ti.grouped(bc):
         s = 0.0
-        if ctc[I, J] == FLUID:
-            for a, c in ti.static(ti.ndrange(2, 2)):
-                i, j = 2 * I + a, 2 * J + c
-                if i < xf.shape[0] and j < xf.shape[1]:
-                    if ctf[i, j] == FLUID:
-                        s += bf[i, j] - apply_A(xf, ctf, i, j, xf.shape[0], xf.shape[1])
-        bc[I, J] = s
+        if ctc[Ic] == FLUID:
+            for o in ti.static(ti.grouped(ti.ndrange(*([2] * dim)))):
+                If = ti.min(2 * Ic + o, ti.Vector(nf) - 1)
+                inside = True
+                for c in ti.static(range(dim)):
+                    inside = inside and 2 * Ic[c] + o[c] < nf[c]
+                if inside:
+                    s += rf[If]
+        bc[Ic] = s * ti.static(2.0 ** (2 - dim))
 
 
 @ti.func
 def _prolong(xf, ctf, xc):
     """Add the coarse correction to the fine fluid cells (constant injection)."""
-    for i, j in xf:
-        if ctf[i, j] == FLUID:
-            xf[i, j] += xc[i // 2, j // 2]
+    for I in ti.grouped(xf):
+        if ctf[I] == FLUID:
+            xf[I] += xc[I // 2]
 
 
 @ti.data_oriented
 class MGPCG:
-    def __init__(self, fb, ctype, r, pd, Ap, cg, nx: int, ny: int, smooth: int = 2, coarse: int = 10,
+    def __init__(self, fb, ctype, r, pd, Ap, cg, shape, smooth: int = 2, coarse: int = 10,
                  max_coarse: int = 16, max_levels: int = 10):
         """Allocate the multigrid hierarchy on the solver's field builder.
 
         **Inputs**
 
         - `fb` : ti.FieldsBuilder   solver field tree (finalized by the caller)
-        - `ctype`, `r`, `pd`, `Ap` : fields (nx, ny) cell types, CG residual, direction, A direction
+        - `ctype`, `r`, `pd`, `Ap` : fields (shape) cell types, CG residual, direction, A direction
         - `cg` : f32 field (3,) CG scalars
-        - `nx`, `ny` : int fine grid
+        - `shape` : tuple[int, ...] fine grid, 2 or 3 axes
         - `smooth` : int red-black sweeps before and after each level
         - `coarse` : int symmetric sweep pairs on the coarsest level (serial)
         - `max_coarse`, `max_levels` : int coarsen until the coarsest level has <= max_coarse cells
 
         **Outputs**
 
-        - self.L levels, self.z preconditioned residual (nx, ny)
+        - self.L levels, self.z preconditioned residual (shape)
         """
-        shapes = [(nx, ny)]
-        while len(shapes) < max_levels and shapes[-1][0] * shapes[-1][1] > max_coarse and min(shapes[-1]) >= 2:
-            a, b = shapes[-1]
-            shapes.append(((a + 1) // 2, (b + 1) // 2))
+        shapes = [tuple(int(v) for v in shape)]
+        while len(shapes) < max_levels and _cells(shapes[-1]) > max_coarse and min(shapes[-1]) >= 2:
+            shapes.append(tuple((v + 1) // 2 for v in shapes[-1]))
+        ax = ti.ij if len(shapes[0]) == 2 else ti.ijk
         self.L, self.shapes = len(shapes), shapes
         self.smooth, self.coarse = smooth, coarse
         self.z = ti.field(ti.f32)
-        fb.dense(ti.ij, shapes[0]).place(self.z)
+        self.rs = [ti.field(ti.f32) for _ in shapes[:-1]]   # résidu de chaque niveau (sauf le plus grossier)
+        fb.dense(ax, shapes[0]).place(self.z)
+        if len(shapes) > 1:
+            fb.dense(ax, shapes[0]).place(self.rs[0])
         self.ct, self.x, self.b = [ctype], [self.z], [r]
-        for s in shapes[1:]:
+        for li, s in enumerate(shapes[1:], start=1):
             ct, x, b = ti.field(ti.i32), ti.field(ti.f32), ti.field(ti.f32)
-            fb.dense(ti.ij, s).place(ct, x, b)
+            fb.dense(ax, s).place(ct, x, b)
+            if li < len(shapes) - 1:
+                fb.dense(ax, s).place(self.rs[li])
             self.ct.append(ct)
             self.x.append(x)
             self.b.append(b)
@@ -141,7 +175,8 @@ class MGPCG:
         for _ in ti.static(range(self.smooth)):
             _smooth(self.x[l], self.b[l], self.ct[l], 0)
             _smooth(self.x[l], self.b[l], self.ct[l], 1)
-        _restrict(self.x[l], self.b[l], self.ct[l], self.b[l + 1], self.ct[l + 1])
+        _residual(self.x[l], self.b[l], self.ct[l], self.rs[l])
+        _restrict(self.rs[l], self.b[l + 1], self.ct[l + 1])
 
     @ti.kernel
     def _coarse(self):
@@ -152,13 +187,19 @@ class MGPCG:
         """
         x, b, ct = ti.static(self.x[self.L - 1], self.b[self.L - 1], self.ct[self.L - 1])
         _zero(x)
-        n0, n1 = ti.static(x.shape[0], x.shape[1])
+        n = ti.static(x.shape)
+        dim = ti.static(len(n))
+        nc = ti.static(_cells(n))
         ti.loop_config(serialize=True)
-        for k in range(2 * self.coarse * n0 * n1):     # balayage avant puis arrière, alternés : symétrique
-            s, c = k // (n0 * n1), k % (n0 * n1)
+        for k in range(2 * self.coarse * nc):          # balayage avant puis arrière, alternés : symétrique
+            s, c = k // nc, k % nc
             if s % 2 == 1:
-                c = n0 * n1 - 1 - c
-            _gs_cell(x, b, ct, c // n1, c % n1)
+                c = nc - 1 - c
+            I = ti.Vector.zero(ti.i32, dim)             # indice linéaire -> (i, j[, k]), dernier axe le plus rapide
+            for a in ti.static(range(dim)):
+                stride = ti.static(_cells(n[a + 1:]))
+                I[a] = (c // stride) % n[a]
+            _gs_cell(x, b, ct, I)
 
     @ti.kernel
     def _up(self, l: ti.template()):
@@ -198,7 +239,7 @@ class MGPCG:
 
         **Inputs**
 
-        - `x` : f32 field (nx, ny) unknown, updated in place
+        - `x` : f32 field (shape) unknown, updated in place
 
         **Outputs**
 
@@ -218,30 +259,30 @@ class MGPCG:
         """
         ct = ti.static(self.ct[0])
         n_air, n_f, sz = 0, 0, 0.0
-        for i, j in ct:
-            if ct[i, j] == AIR:
+        for I in ti.grouped(ct):
+            if ct[I] == AIR:
                 n_air += 1
-            elif ct[i, j] == FLUID:
+            elif ct[I] == FLUID:
                 n_f += 1
-                sz += self.z[i, j]
+                sz += self.z[I]
         shift = 0.0
         if n_air == 0:
             shift = sz / ti.max(n_f, 1)
-        for i, j in ct:
-            if ct[i, j] == FLUID:
-                self.z[i, j] -= shift
+        for I in ti.grouped(ct):
+            if ct[I] == FLUID:
+                self.z[I] -= shift
 
     @ti.kernel
     def _init_dir(self):
         """p = z, cg[0] = r·z."""
         self._remove_null()
         rz = 0.0
-        for i, j in self.z:
-            if self.ct[0][i, j] == FLUID:
-                self.pd[i, j] = self.z[i, j]
-                rz += self.r[i, j] * self.z[i, j]
+        for I in ti.grouped(self.z):
+            if self.ct[0][I] == FLUID:
+                self.pd[I] = self.z[I]
+                rz += self.r[I] * self.z[I]
             else:
-                self.pd[i, j] = 0.0
+                self.pd[I] = 0.0
         self.cg[0] = rz
 
     @ti.kernel
@@ -249,18 +290,18 @@ class MGPCG:
         """PCG: Ap, alpha = r·z / pAp, x += alpha p, r -= alpha Ap."""
         ct = ti.static(self.ct[0])
         pAp = 0.0
-        for i, j in ct:
-            if ct[i, j] == FLUID:
-                self.Ap[i, j] = apply_A(self.pd, ct, i, j, ct.shape[0], ct.shape[1])
-                pAp += self.pd[i, j] * self.Ap[i, j]
+        for I in ti.grouped(ct):
+            if ct[I] == FLUID:
+                self.Ap[I] = apply_A(self.pd, ct, I)
+                pAp += self.pd[I] * self.Ap[I]
         self.cg[1] = pAp
         alpha = 0.0                                    # convergé au bruit f32 près (pAp <= 0) : on n'avance plus
         if self.cg[1] > 1e-30 and self.cg[0] > 0.0:
             alpha = self.cg[0] / self.cg[1]
-        for i, j in ct:
-            if ct[i, j] == FLUID:
-                x[i, j] += alpha * self.pd[i, j]
-                self.r[i, j] -= alpha * self.Ap[i, j]
+        for I in ti.grouped(ct):
+            if ct[I] == FLUID:
+                x[I] += alpha * self.pd[I]
+                self.r[I] -= alpha * self.Ap[I]
 
     @ti.kernel
     def _dir(self):
@@ -268,14 +309,22 @@ class MGPCG:
         self._remove_null()
         ct = ti.static(self.ct[0])
         rz = 0.0
-        for i, j in ct:
-            if ct[i, j] == FLUID:
-                rz += self.r[i, j] * self.z[i, j]
+        for I in ti.grouped(ct):
+            if ct[I] == FLUID:
+                rz += self.r[I] * self.z[I]
         self.cg[2] = rz
         beta = 0.0
         if self.cg[0] > 1e-30 and self.cg[2] > 0.0:
             beta = self.cg[2] / self.cg[0]
-        for i, j in ct:
-            if ct[i, j] == FLUID:
-                self.pd[i, j] = self.z[i, j] + beta * self.pd[i, j]
+        for I in ti.grouped(ct):
+            if ct[I] == FLUID:
+                self.pd[I] = self.z[I] + beta * self.pd[I]
         self.cg[0] = self.cg[2]
+
+
+def _cells(shape) -> int:
+    """Number of cells of a grid shape (1 for an empty tuple)."""
+    m = 1
+    for v in shape:
+        m *= int(v)
+    return m

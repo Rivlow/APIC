@@ -1,10 +1,11 @@
-"""Solver : reçoit un dict de paramètres, des matrices (nx × ny) et la table des parois, alloue les champs
-Taichi, calcule.
+"""Solver : reçoit un dict de paramètres, des matrices (nx × ny ou nx × ny × nz) et la table des parois, alloue
+les champs Taichi, calcule. 2D ou 3D (`dim`), même code.
 
     solver = Solver(params, matrices, wall_table)     # semis + allocation + état initial
     solver.step(20)                       # 20 sous-pas
     solver.stats() ; solver.positions()   # lectures GPU -> CPU à la demande
-    solver.render(x0, y0, k=..., size=(w, h)) -> image (h, w, 3) u8 d'une vue quelconque (défaut : boîte entière)
+    solver.render(x0, y0, k=..., size=(w, h)) -> image (h, w, 3) u8 d'une vue 2D quelconque (défaut : boîte entière)
+    solver.render3d(camera, size=(w, h))  -> image (h, w, 3) u8 de la vue 3D (voir ui/render3d.py)
 
 Pendant la simulation rien ne quitte le GPU, sauf ce que l'on demande (stats, positions, image rendue).
 """
@@ -18,13 +19,15 @@ import taichi as ti
 
 from Solver import bc_expr
 from Solver.physics import grid_step
+from Solver.walls import frame
 from ui import kernels as K
 from ui import kernels_inc as M
-from ui.mgpcg import MGPCG
 from ui.kernels_solid import (G2P_solid, P2G_solid, clear_eps, scatter_eps, solid_colors,
                               solid_stats, update_damage)
+from ui.mgpcg import MGPCG
 
-STRUCTURAL = ("nx", "ny", "Lx", "Ly", "bound", "ppc", "capacity", "seed", "res", "incompressible")   # le reste s'applique à chaud
+STRUCTURAL = ("dim", "nx", "ny", "nz", "Lx", "Ly", "Lz", "bound", "ppc", "capacity", "seed", "res",
+              "incompressible")   # le reste s'applique à chaud
 
 _arch: str | None = None
 
@@ -52,42 +55,42 @@ def ensure_taichi() -> str:
 
 
 def _fluid_points(cells: np.ndarray, ppc: int, rng: np.random.Generator, dx: float) -> np.ndarray:
-    """Seed ppc² uniform random points per active cell.
+    """Seed ppc^dim uniform random points per active cell.
 
     **Inputs**
 
-    - `cells` : np.ndarray bool (nx, ny)   active cells
-    - `ppc` : int                        particles per cell side
+    - `cells` : np.ndarray bool (n)   active cells
+    - `ppc` : int                    particles per cell side
     - `rng` : np.random.Generator
-    - `dx` : float                      cell size
+    - `dx` : float                   cell size
 
     **Outputs**
 
-    - np.ndarray f64 (N, 2)   positions in domain units
+    - np.ndarray f64 (N, dim)   positions in domain units
     """
     idx = np.argwhere(cells)
-    base = np.repeat(idx, ppc * ppc, axis=0).astype(np.float64)
+    base = np.repeat(idx, ppc ** cells.ndim, axis=0).astype(np.float64)
     return (base + rng.random(base.shape)) * dx
 
 
 def _solid_points(cells: np.ndarray, ppc: int, dx: float) -> np.ndarray:
-    """Seed a regular ppc × ppc lattice per active cell.
+    """Seed a regular ppc^dim lattice per active cell.
 
     **Inputs**
 
-    - `cells` : np.ndarray bool (nx, ny)   active cells
-    - `ppc` : int                        particles per cell side
-    - `dx` : float                      cell size
+    - `cells` : np.ndarray bool (n)   active cells
+    - `ppc` : int                    particles per cell side
+    - `dx` : float                   cell size
 
     **Outputs**
 
-    - np.ndarray f64 (N, 2)   positions in domain units
+    - np.ndarray f64 (N, dim)   positions in domain units
     """
+    dim = cells.ndim
     idx = np.argwhere(cells)
     o = (np.arange(ppc) + 0.5) / ppc
-    ox, oy = np.meshgrid(o, o, indexing="ij")
-    offsets = np.column_stack([ox.ravel(), oy.ravel()])
-    return (idx[:, None, :] + offsets[None, :, :]).reshape(-1, 2) * dx
+    offsets = np.stack([g.ravel() for g in np.meshgrid(*([o] * dim), indexing="ij")], axis=1)
+    return (idx[:, None, :] + offsets[None, :, :]).reshape(-1, dim) * dx
 
 
 def _signed_distance(obstacle: np.ndarray, dx: float) -> np.ndarray:
@@ -95,12 +98,12 @@ def _signed_distance(obstacle: np.ndarray, dx: float) -> np.ndarray:
 
     **Inputs**
 
-    - `obstacle` : np.ndarray bool (nx, ny)
+    - `obstacle` : np.ndarray bool (n)
     - `dx` : float cell size (m)
 
     **Outputs**
 
-    - np.ndarray f32 (nx, ny) : > 0 outside, < 0 inside (m)
+    - np.ndarray f32 (n) : > 0 outside, < 0 inside (m)
     """
     from scipy.ndimage import distance_transform_edt
     out = distance_transform_edt(~obstacle) * dx - 0.5 * dx      # cellules libres : distance au centre obstacle le plus proche
@@ -113,21 +116,44 @@ def _boundary_volume(solid: np.ndarray) -> np.ndarray:
 
     **Inputs**
 
-    - `solid` : np.ndarray bool (nx, ny) boundary cells
+    - `solid` : np.ndarray bool (n) boundary cells
 
     **Outputs**
 
-    - np.ndarray f32 (nx, ny) : in [0, 1], = 1 inside a thick boundary
+    - np.ndarray f32 (n) : in [0, 1], = 1 inside a thick boundary
 
     **Note** : quadratic B-spline integrated over one cell = [1/6, 2/3, 1/6] per axis (separable convolution).
     """
-    a = np.array([1.0 / 6.0, 2.0 / 3.0, 1.0 / 6.0])
+    from scipy.ndimage import correlate1d
     b = solid.astype(np.float64)
-    p = np.pad(b, 1)
-    b = a[0] * p[:-2, 1:-1] + a[1] * p[1:-1, 1:-1] + a[2] * p[2:, 1:-1]
-    p = np.pad(b, 1)
-    b = a[0] * p[1:-1, :-2] + a[1] * p[1:-1, 1:-1] + a[2] * p[1:-1, 2:]
+    for ax in range(b.ndim):
+        b = correlate1d(b, [1.0 / 6.0, 2.0 / 3.0, 1.0 / 6.0], axis=ax, mode="constant")
     return b.astype(np.float32)
+
+
+def _wall_band(shape: tuple, bound: int, wtype: np.ndarray, open_type: int) -> np.ndarray:
+    """Wall band cells (bound layers along every face), open where the face is an outlet.
+
+    **Inputs**
+
+    - `shape` : tuple cells per axis ; `bound` : int
+    - `wtype` : np.ndarray int32 (2 dim, na, nb) wall types ; `open_type` : int type left open (OUTLET)
+
+    **Outputs**
+
+    - np.ndarray bool (shape)
+    """
+    dim = len(shape)
+    band = np.zeros(shape, bool)
+    for s in range(2 * dim):
+        a, plus, ts = frame(s, dim)
+        sl = [slice(None)] * dim
+        sl[a] = slice(shape[a] - bound, None) if plus else slice(0, bound)
+        lens = [shape[t] for t in ts]
+        closed = wtype[s, :lens[0], :(lens[1] if dim == 3 else 1)] != open_type
+        closed = np.expand_dims(closed.reshape(lens), a)
+        band[tuple(sl)] |= closed
+    return band
 
 
 class Solver:
@@ -136,33 +162,39 @@ class Solver:
 
         **Inputs**
 
-        - `params` : dict                              simulation parameters
-        - `matrices` : dict of np.ndarray (nx, ny)       fluid/solid/obstacle masks, vx0/vy0
-        - `wall_table` : WallTable (5 arrays, (4, max(nx, ny)[, 2]))   type, v, depth, pressure, friction
+        - `params` : dict   simulation parameters (dim, nx, ny[, nz], Lx, …)
+        - `matrices` : dict of np.ndarray (n)   fluid/solid/obstacle masks, vx0/vy0[/vz0]
+        - `wall_table` : Solver.walls.WallTable (2 dim, na, nb)   type, v, depth, pressure, friction, expr
+        - `consts` : dict | None   constants of the boundary expressions
         """
         self.arch = ensure_taichi()
         self.p = dict(params)
         p = self.p
+        self.dim = dim = int(p.get("dim", 2))
         nx, ny, ppc, bound = p["nx"], p["ny"], p["ppc"], p["bound"]
-        nm = max(nx, ny)                              # longueur des tables de parois
+        self.shape = shape = (nx, ny) if dim == 2 else (nx, ny, int(p["nz"]))
         dx0 = p["Lx"] / nx                            # cellules carrées, en mètres
         m = matrices
-        # Solver.walls.WallTable (4, max(nx, ny)) : type, v, depth, pressure, friction
         wt = wall_table
         wtype, wvel, wdepth, wpress, wfric, wexpr = wt.type, wt.v, wt.depth, wt.pressure, wt.friction, wt.expr
-        # zone utilisable : le stencil 3x3 sortirait de la grille dans la bande de paroi
-        lo = np.array([bound, bound]) * dx0
-        hi = np.array([nx - bound, ny - bound]) * dx0
+        # zone utilisable : le stencil 3^dim sortirait de la grille dans la bande de paroi
+        lo = np.full(dim, bound) * dx0
+        hi = (np.array(shape) - bound) * dx0
 
-        # ---- semis (numpy, une fois) ; vitesse initiale = celle de la cellule d'origine
+        # ---- semis (numpy, une fois) ; vitesse initiale = celle de la cellule d'origine. Jamais dans la bande de
+        # paroi : ses particules seraient ramenées sur la première couche intérieure (surdensité, 2,5x dans une
+        # tranche 3D de 10 cellules dont 6 de bande)
+        inner = np.zeros(shape, bool)
+        inner[tuple(slice(bound, n - bound) for n in shape)] = True
         rng = np.random.default_rng(p["seed"])
-        xf = _fluid_points(m["fluid"], ppc, rng, dx0)
-        xs = _solid_points(m["solid"], ppc, dx0)
+        xf = _fluid_points(m["fluid"] & inner, ppc, rng, dx0)
+        xs = _solid_points(m["solid"] & inner, ppc, dx0)
+        vkeys = ("vx0", "vy0", "vz0")[:dim]
 
         def vel_of(pts):
-            c = (pts / dx0).astype(int)
-            ci, cj = np.clip(c[:, 0], 0, nx - 1), np.clip(c[:, 1], 0, ny - 1)
-            return np.column_stack([m["vx0"][ci, cj], m["vy0"][ci, cj]])
+            c = np.clip((pts / dx0).astype(int), 0, np.array(shape) - 1)
+            ci = tuple(c[:, a] for a in range(dim))
+            return np.column_stack([m[k][ci] for k in vkeys]) if len(pts) else np.zeros((0, dim))
 
         vf, vs = vel_of(xf), vel_of(xs)
         xf, xs = np.clip(xf, lo, hi), np.clip(xs, lo, hi)
@@ -172,7 +204,7 @@ class Solver:
         self.has_inlet, self.has_outlet = bool((wtype == K.INLET).any()), bool((wtype == K.OUTLET).any())
         self.incompressible = bool(p.get("incompressible", False))
         # sortie à pression imposée p > 0 : l'eau peut aussi y rentrer (mode incompressible)
-        self.has_pressure_outlet = (bool((wpress > 0).any()) or bool((wexpr[..., 2] >= 0).any())) \
+        self.has_pressure_outlet = (bool((wpress > 0).any()) or bool((wexpr[..., dim] >= 0).any())) \
             and self.incompressible
         if not self.incompressible and (wpress != 0).any():     # pression imposée ignorée : sorties libres
             print("[solver] pression imposée en sortie ignorée : elle n'agit que sur la projection "
@@ -184,20 +216,21 @@ class Solver:
         self.has_fluid = self.n_fluid_init > 0 or self.has_inlet
         cap = self.n_fluid_init
         if self.has_inlet or self.has_pressure_outlet:
-            cap = max(cap, p["capacity"] or ppc * ppc * nx * ny)
+            cap = max(cap, p["capacity"] or ppc ** dim * int(np.prod(shape)))
         self.capacity = max(cap, 1)                    # dense(ti.i, 0) est invalide
         self.n_solid = len(xs)
         self.has_solid = self.n_solid > 0
-        self._x0f = np.zeros((self.capacity, 2), np.float32)
-        self._v0f = np.zeros((self.capacity, 2), np.float32)
+        self._x0f = np.zeros((self.capacity, dim), np.float32)
+        self._v0f = np.zeros((self.capacity, dim), np.float32)
         self._x0f[:self.n_fluid_init], self._v0f[:self.n_fluid_init] = xf, vf
-        self._x0s = (xs if self.has_solid else np.full((1, 2), 0.5)).astype(np.float32)
-        self._v0s = (vs if self.has_solid else np.zeros((1, 2))).astype(np.float32)
+        self._x0s = (xs if self.has_solid else np.full((1, dim), 0.5)).astype(np.float32)
+        self._v0s = (vs if self.has_solid else np.zeros((1, dim))).astype(np.float32)
 
         # ---- champs Taichi (un FieldsBuilder, libéré d'un bloc par release())
+        ax = ti.ij if dim == 2 else ti.ijk
         fb = ti.FieldsBuilder()
-        self.x_f, self.v_f = ti.Vector.field(2, ti.f32), ti.Vector.field(2, ti.f32)
-        self.C_f, self.J_f = ti.Matrix.field(2, 2, ti.f32), ti.field(ti.f32)
+        self.x_f, self.v_f = ti.Vector.field(dim, ti.f32), ti.Vector.field(dim, ti.f32)
+        self.C_f, self.J_f = ti.Matrix.field(dim, dim, ti.f32), ti.field(ti.f32)
         self.alive, self.free_stack = ti.field(ti.i32), ti.field(ti.i32)
         self.sc_f = ti.field(ti.f32)                   # quantité colorée par particule (voir fluid_mode)
         fb.dense(ti.i, self.capacity).place(self.x_f, self.v_f, self.C_f, self.J_f, self.alive, self.free_stack,
@@ -205,77 +238,48 @@ class Solver:
         self.free_top = ti.field(ti.i32)
         fb.dense(ti.i, 1).place(self.free_top)
 
-        self.x_s, self.v_s = ti.Vector.field(2, ti.f32), ti.Vector.field(2, ti.f32)
-        self.C_s, self.F_s = ti.Matrix.field(2, 2, ti.f32), ti.Matrix.field(2, 2, ti.f32)
+        self.x_s, self.v_s = ti.Vector.field(dim, ti.f32), ti.Vector.field(dim, ti.f32)
+        self.C_s, self.F_s = ti.Matrix.field(dim, dim, ti.f32), ti.Matrix.field(dim, dim, ti.f32)
         self.D_s, self.broken_s, self.col_s = ti.field(ti.f32), ti.field(ti.i32), ti.Vector.field(3, ti.f32)
         fb.dense(ti.i, len(self._x0s)).place(self.x_s, self.v_s, self.C_s, self.F_s, self.D_s, self.broken_s, self.col_s)
 
-        self.grid_v, self.grid_m = ti.Vector.field(2, ti.f32), ti.field(ti.f32)
+        self.grid_v, self.grid_m = ti.Vector.field(dim, ti.f32), ti.field(ti.f32)
         self.grid_e, self.grid_w = ti.field(ti.f32), ti.field(ti.f32)
         self.cells = ti.field(ti.i32)
         self.sdf = ti.field(ti.f32)                    # distance signée aux obstacles (m, < 0 dedans)
-        fb.dense(ti.ij, (nx, ny)).place(self.grid_v, self.grid_m, self.grid_e, self.grid_w, self.cells, self.sdf)
-        self.wall_type, self.wall_v, self.emit_acc = ti.field(ti.i32), ti.Vector.field(2, ti.f32), ti.field(ti.f32)
+        fb.dense(ax, shape).place(self.grid_v, self.grid_m, self.grid_e, self.grid_w, self.cells, self.sdf)
+        self.wall_type, self.wall_v, self.emit_acc = ti.field(ti.i32), ti.Vector.field(dim, ti.f32), ti.field(ti.f32)
         self.wall_d = ti.field(ti.i32)                 # position du mur (cellules depuis le bord) : bande ou face d'obstacle
         self.wall_p = ti.field(ti.f32)                 # pression imposée sur une sortie (0 : sortie libre)
         self.wall_f = ti.field(ti.f32)                 # frottement des murs (0 glissant, 1 adhérent)
-        self.wall_e = ti.Vector.field(3, ti.i32)       # expression dépendant de t pour (vx, vy, p), -1 = aucune
-        fb.dense(ti.ij, (4, nm)).place(self.wall_type, self.wall_v, self.emit_acc, self.wall_d, self.wall_p,
-                                       self.wall_f, self.wall_e)
+        self.wall_e = ti.Vector.field(dim + 1, ti.i32)  # expression dépendant de t pour (v…, p), -1 = aucune
+        fb.dense(ti.ijk, wtype.shape).place(self.wall_type, self.wall_v, self.emit_acc, self.wall_d, self.wall_p,
+                                            self.wall_f, self.wall_e)
         self.img = ti.Vector.field(3, ti.u8)
-        # image aux proportions du domaine : res pixels sur le grand côté
+        # image aux proportions du domaine (plan x-y) : res pixels sur le grand côté
         if nx >= ny:
             self.res_x, self.res_y = int(p["res"]), max(1, int(round(p["res"] * ny / nx)))
         else:
             self.res_x, self.res_y = max(1, int(round(p["res"] * nx / ny))), int(p["res"])
         fb.dense(ti.ij, (int(p["res"]), int(p["res"]))).place(self.img)   # tampon maximal : on n'en rend qu'une partie
-        if self.incompressible:                        # grille décalée + gradient conjugué
-            self.u, self.mu = ti.field(ti.f32), ti.field(ti.f32)
-            self.v, self.mv = ti.field(ti.f32), ti.field(ti.f32)
-            fb.dense(ti.ij, (nx + 1, ny)).place(self.u, self.mu)
-            fb.dense(ti.ij, (nx, ny + 1)).place(self.v, self.mv)
-            self.ctype = ti.field(ti.i32)
-            self.q, self.r, self.pd, self.Ap, self.rhs = (ti.field(ti.f32) for _ in range(5))
-            fb.dense(ti.ij, (nx, ny)).place(self.ctype, self.q, self.r, self.pd, self.Ap, self.rhs)
-            self.cg = ti.field(ti.f32)
-            fb.dense(ti.i, 3).place(self.cg)
-            self.fp = ti.Vector.field(2, ti.f32)      # accélération de pression sur les nœuds du solide
-            fb.dense(ti.ij, (nx, ny)).place(self.fp)
-            # projection de densité (positions) : rho / rho0 aux centres, potentiel phi, déplacement sur les faces
-            self.dens, self.phi, self.bvol = ti.field(ti.f32), ti.field(ti.f32), ti.field(ti.f32)
-            fb.dense(ti.ij, (nx, ny)).place(self.dens, self.phi, self.bvol)
-            self.du, self.dv = ti.field(ti.f32), ti.field(ti.f32)
-            fb.dense(ti.ij, (nx + 1, ny)).place(self.du)
-            fb.dense(ti.ij, (nx, ny + 1)).place(self.dv)
-            # viscosité implicite : type de face + tampons CG sur chaque grille de faces
-            self.ft_u, self.ft_v = ti.field(ti.i32), ti.field(ti.i32)
-            self.r_u, self.pd_u, self.Ap_u, self.rhs_u = (ti.field(ti.f32) for _ in range(4))
-            self.r_v, self.pd_v, self.Ap_v, self.rhs_v = (ti.field(ti.f32) for _ in range(4))
-            self.nuf_u, self.nuf_v, self.nu_c = ti.field(ti.f32), ti.field(ti.f32), ti.field(ti.f32)   # nu (m²/s)
-            fb.dense(ti.ij, (nx + 1, ny)).place(self.ft_u, self.nuf_u, self.r_u, self.pd_u, self.Ap_u, self.rhs_u)
-            fb.dense(ti.ij, (nx, ny + 1)).place(self.ft_v, self.nuf_v, self.r_v, self.pd_v, self.Ap_v, self.rhs_v)
-            fb.dense(ti.ij, (nx, ny)).place(self.nu_c)
-            self.cg_visc = ti.field(ti.f32)
-            fb.dense(ti.i, 3).place(self.cg_visc)
-            self.mg = MGPCG(fb, self.ctype, self.r, self.pd, self.Ap, self.cg, nx, ny)   # préconditionneur
+        self.view3d = None
+        if dim == 3:                                   # rendu 3D : profondeur + table des primitives (ui/render3d.py)
+            from ui.render3d import View3D
+            self.view3d = View3D(fb, int(p["res"]))
+        self.mac = self.mg = None
+        if self.incompressible:                        # grille décalée + gradient conjugué multigrille
+            self.mac = M.MAC(fb, shape)
+            self.mg = MGPCG(fb, self.mac.ctype, self.mac.r, self.mac.pd, self.mac.Ap, self.mac.cg, shape)
         self._tree = fb.finalize()
 
         self.cells.from_numpy(cells)
         # obstacles : distance signée (une fois), garde-fou contre la pénétration à l'advection
         self.use_sdf = int(bool(m["obstacle"].any()))
         self.sdf.from_numpy(_signed_distance(m["obstacle"], dx0) if self.use_sdf
-                            else np.full((nx, ny), 1e3, np.float32))
-        if self.incompressible:                        # volume map des parois (statique) pour la densité
-            boundary = m["obstacle"].copy()
-            band = np.zeros((nx, ny), bool)
-            band[:bound, :] = band[nx - bound:, :] = True
-            band[:, :bound] = band[:, ny - bound:] = True
-            free_out = wtype == K.OUTLET               # sortie (libre ou sous pression) : frontière ouverte, pas de paroi
-            band[:bound, free_out[K.LEFT, :ny]] = False
-            band[nx - bound:, free_out[K.RIGHT, :ny]] = False
-            band[free_out[K.BOTTOM, :nx], :bound] = False
-            band[free_out[K.TOP, :nx], ny - bound:] = False
-            self.bvol.from_numpy(_boundary_volume(boundary | band))
+                            else np.full(shape, 1e3, np.float32))
+        if self.incompressible:                        # volume map des parois (statique) pour la densité ;
+            band = _wall_band(shape, bound, wtype, K.OUTLET)   # sortie (libre ou sous pression) : pas de paroi
+            self.mac.bvol.from_numpy(_boundary_volume(m["obstacle"] | band))
         self.wall_type.from_numpy(np.ascontiguousarray(wtype, np.int32))
         self.wall_v.from_numpy(np.ascontiguousarray(wvel, np.float32))
         self.wall_d.from_numpy(np.ascontiguousarray(wdepth, np.int32))
@@ -283,13 +287,14 @@ class Solver:
         self.wall_f.from_numpy(np.ascontiguousarray(wfric, np.float32))
         self.wall_e.from_numpy(np.ascontiguousarray(wexpr, np.int32))
         # conditions limites dépendant du temps : un kernel généré réécrit wall_v / wall_p à chaque sous-pas
-        self._bc_eval = bc_expr.build_kernel(list(wt.sources), consts) if wt.sources else None
+        self._bc_eval = bc_expr.build_kernel(list(wt.sources), consts, dim) if wt.sources else None
         self.t = 0.0
         self.last_step_ms = 0.0
         self.cg_last_iters = 0
-        self.fluid_mode = K.MODE_DENSITY               # indice dans kernels.FLUID_MODES
+        self.fluid_mode = K.MODE_DENSITY               # identifiant de mode (kernels.fluid_modes)
         self.scalar_max = 0.0                          # échelle de couleur, mise à jour dans stats()
-        self._inlet_speed = float(np.hypot(wvel[..., 0], wvel[..., 1])[wtype == K.INLET].max()) if self.has_inlet else 0.0
+        speeds = np.linalg.norm(wvel, axis=-1)[wtype == K.INLET]
+        self._inlet_speed = float(speeds.max()) if speeds.size else 0.0
         self.set_params(p)
         self.reset()
 
@@ -310,10 +315,11 @@ class Solver:
                 self.p[k] = v
         p = self.p
         self.nx, self.ny = p["nx"], p["ny"]
+        self.nz = self.shape[2] if self.dim == 3 else 1
         self.dx = p["Lx"] / self.nx                    # cellules carrées, en mètres
         self.inv_dx = 1.0 / self.dx
         self.p_spacing = self.dx / p["ppc"]
-        p_vol = self.p_spacing ** 2
+        p_vol = self.p_spacing ** self.dim
         self.p_mass_f, self.p_mass_s = p_vol * p["fluid_rho"], p_vol * p["solid_rho"]
         self.p_vol = p_vol
         self.mu_s = p["solid_E"] / (2 * (1 + p["solid_nu"]))
@@ -343,8 +349,8 @@ class Solver:
         **Note** : one CPU -> GPU transfer of the seeded positions, then init kernels.
         """
         if self.incompressible:
-            self.q.fill(0.0)
-            self.fp.fill(0.0)
+            self.mac.q.fill(0.0)
+            self.mac.fp.fill(0.0)
         self.emit_acc.fill(0.0)
         self.x_f.from_numpy(self._x0f)
         self.v_f.from_numpy(self._v0f)
@@ -387,10 +393,10 @@ class Solver:
 
         **Outputs**
 
-        - self.nu_c (cell viscosity), self.u, self.v updated (no-op if fluid_nu <= 0 and smagorinsky <= 0)
+        - mac.nu_c (cell viscosity), mac.uf updated (no-op if fluid_nu <= 0 and smagorinsky <= 0)
 
         **Note** : nu = fluid_nu + Smagorinsky (smagorinsky dx)² |S| from the pre-diffusion velocities; fixed
-        `visc_iters` iterations per component, no read-back; face values set by mac_bc (walls, inlets, friction
+        `visc_iters` iterations per component, no read-back; face values set by the BCs (walls, inlets, friction
         ghosts) are Dirichlet, air faces Neumann.
         """
         p = self.p
@@ -398,29 +404,27 @@ class Solver:
         if (nu0 <= 0 and cs <= 0) or p["visc_iters"] <= 0:
             return
         k = self.dt / self.dx ** 2
-        M.visc_nu(self.nu_c, self.u, self.v, self.ctype, nu0, (cs * self.dx) ** 2, self.inv_dx, self.nx, self.ny)
-        for axis, w, ft, nuf, r, pd, Ap, rhs in (
-                (0, self.u, self.ft_u, self.nuf_u, self.r_u, self.pd_u, self.Ap_u, self.rhs_u),
-                (1, self.v, self.ft_v, self.nuf_v, self.r_v, self.pd_v, self.Ap_v, self.rhs_v)):
-            M.visc_classify(ft, nuf, self.ctype, self.nu_c, self.nx, self.ny, axis)
-            M.visc_cg_init(w, r, pd, rhs, ft, nuf, self.cg_visc, k)
+        self.mac.visc_nu(nu0, (cs * self.dx) ** 2, self.inv_dx)
+        for a in range(self.dim):
+            self.mac.visc_classify(a)
+            self.mac.visc_cg_init(a, k)
             for _ in range(int(p["visc_iters"])):
-                M.visc_apply(pd, Ap, ft, nuf, self.cg_visc, k)
-                M.visc_update(w, r, pd, Ap, ft, self.cg_visc)
+                self.mac.visc_apply(a, k)
+                self.mac.visc_update(a)
 
     def _cg_solve(self, x, iters: int) -> None:
         """Run `iters` CG iterations on the cell Laplacian after cg_init / density_cg_init.
 
         **Inputs**
 
-        - `x` : f32 field (nx, ny) unknown (q or phi), updated in place
+        - `x` : f32 field (n) unknown (q or phi), updated in place
         - `iters` : int fixed iteration count
 
         **Outputs**
 
         - x, r, pd, Ap, cg updated
 
-        **Note** : `multigrid` : V-cycle preconditioner, 1 kernel per iteration; else plain CG, 2 kernels.
+        **Note** : `multigrid` : V-cycle preconditioner (2 L + 1 kernels per iteration); else plain CG, 2 kernels.
         """
         if iters <= 0:
             return
@@ -430,26 +434,25 @@ class Solver:
                 self.mg.iterate(x)
         else:
             for _ in range(iters):
-                M.cg_apply(self.pd, self.Ap, self.ctype, self.cg, self.nx, self.ny)
-                M.cg_update(x, self.r, self.pd, self.Ap, self.ctype, self.cg)
+                self.mac.cg_apply()
+                self.mac.cg_update(x)
 
     def _project(self) -> None:
         """Pressure projection on the MAC grid by conjugate gradient.
 
         **Outputs**
 
-        - self.q (pressure), self.u, self.v updated
+        - mac.q (pressure), mac.uf updated
 
         **Note** : fixed `cg_iters` iterations, fully on GPU with no read-back; warm-started from previous pressure;
-        multigrid-preconditioned (one kernel per iteration) if `multigrid`.
+        multigrid-preconditioned if `multigrid`.
         """
         p = self.p
-        M.cg_init(self.q, self.r, self.pd, self.rhs, self.u, self.v, self.ctype, self.cg,
-                  self.wall_type, self.wall_d, self.wall_p, self.dx, self.dt, 1.0 / p["fluid_rho"],
-                  self.nx, self.ny, p["bound"])
-        self._cg_solve(self.q, int(p["cg_iters"]))
+        self.mac.cg_init(self.wall_type, self.wall_d, self.wall_p, self.dx, self.dt, 1.0 / p["fluid_rho"],
+                         p["bound"])
+        self._cg_solve(self.mac.q, int(p["cg_iters"]))
         self.cg_last_iters = p["cg_iters"]
-        M.mac_project(self.u, self.v, self.q, self.ctype, self.dx, self.nx, self.ny)
+        self.mac.project(self.dx)
 
     def _density_projection(self) -> None:
         """Density projection: shift fluid particle positions so that rho = rho0.
@@ -464,13 +467,11 @@ class Solver:
         kappa = float(p["volume_correction"])
         if kappa <= 0.0:
             return
-        nx, ny = self.nx, self.ny
-        M.particle_density(self.x_f, self.alive, self.dens, self.bvol, self.inv_dx, int(p["ppc"]))
-        M.density_cg_init(self.phi, self.r, self.pd, self.rhs, self.dens, self.ctype, self.cg, kappa, self.dx,
-                          nx, ny)
-        self._cg_solve(self.phi, int(p["density_iters"]))
-        M.density_gradient(self.phi, self.du, self.dv, self.ctype, self.dx, nx, ny)
-        M.density_shift(self.x_f, self.alive, self.du, self.dv, self.ctype, self.inv_dx, self.dx, p["bound"], nx, ny)
+        self.mac.particle_density(self.x_f, self.alive, self.inv_dx, int(p["ppc"]))
+        self.mac.density_cg_init(kappa, self.dx)
+        self._cg_solve(self.mac.phi, int(p["density_iters"]))
+        self.mac.density_gradient(self.dx)
+        self.mac.density_shift(self.x_f, self.alive, self.inv_dx, self.dx, p["bound"])
 
     def _solid_substep(self, dt_s: float, with_pressure: bool) -> None:
         """Advance the solid alone by one MPM step on the collocated grid.
@@ -478,22 +479,22 @@ class Solver:
         **Inputs**
 
         - `dt_s` : float   solid time step
-        - `with_pressure` : bool    add the fluid pressure acceleration self.fp
+        - `with_pressure` : bool    add the fluid pressure acceleration mac.fp
 
         **Outputs**
 
         - solid particle state (x_s, v_s, C_s, F_s, D_s, broken_s) updated
         """
-        p, dx, inv_dx, nx, ny, bound = self.p, self.dx, self.inv_dx, self.nx, self.ny, self.p["bound"]
+        p, dx, inv_dx, bound = self.p, self.dx, self.inv_dx, self.p["bound"]
         self.grid_m.fill(0.0)
         self.grid_v.fill(0.0)
         P2G_solid(self.grid_m, self.grid_v, self.x_s, self.v_s, self.C_s, self.F_s, self.D_s, self.broken_s,
                   inv_dx, dt_s, dx, self.mu_s, self.la_s, self.p_mass_s, self.p_vol, p["k_res"])
         grid_step(self.grid_m, self.grid_v, self.cells, self.wall_type, self.wall_v, self.wall_d, self.wall_f,
-                  dt_s, p["gravity"], 0.0, p["obstacle_friction"], bound, nx, ny)
+                  dt_s, p["gravity"], 0.0, p["obstacle_friction"], bound, self.nx, self.ny)
         if with_pressure:
-            M.add_accel(self.grid_v, self.grid_m, self.fp, dt_s)
-        G2P_solid(self.grid_v, self.x_s, self.v_s, self.C_s, self.F_s, self.broken_s, inv_dx, dt_s, dx, bound, nx, ny)
+            self.mac.add_accel(self.grid_v, self.grid_m, dt_s)
+        G2P_solid(self.grid_v, self.x_s, self.v_s, self.C_s, self.F_s, self.broken_s, inv_dx, dt_s, dx, bound)
         if p["use_damage"]:
             clear_eps(self.grid_e, self.grid_w)
             scatter_eps(self.grid_e, self.grid_w, self.x_s, self.F_s, self.broken_s, inv_dx)
@@ -509,7 +510,8 @@ class Solver:
 
         **Note** : solid sub-cycled at dt_solid imposes its velocity on occupied faces; fluid returns -grad p to it.
         """
-        p, dt, dx, inv_dx, nx, ny, bound = self.p, self.dt, self.dx, self.inv_dx, self.nx, self.ny, self.p["bound"]
+        p, dt, dx, inv_dx, bound = self.p, self.dt, self.dx, self.inv_dx, self.p["bound"]
+        mac = self.mac
         if self.has_solid:
             n_in = max(1, int(np.ceil(dt / self.dt_solid)))
             dt_s = dt / n_in
@@ -521,20 +523,20 @@ class Solver:
             P2G_solid(self.grid_m, self.grid_v, self.x_s, self.v_s, self.C_s, self.F_s, self.D_s, self.broken_s,
                       inv_dx, dt_s, dx, self.mu_s, self.la_s, self.p_mass_s, self.p_vol, p["k_res"])
             grid_step(self.grid_m, self.grid_v, self.cells, self.wall_type, self.wall_v, self.wall_d, self.wall_f,
-                      0.0, 0.0, 0.0, p["obstacle_friction"], bound, nx, ny)
-        M.mac_p2g(self.x_f, self.v_f, self.C_f, self.alive, self.u, self.v, self.mu, self.mv, inv_dx, dx)
-        M.mac_classify(self.ctype, self.cells, self.wall_type, self.wall_v, self.wall_d, self.x_f, self.alive, self.x_s,
-                       int(self.has_solid), inv_dx, nx, ny, bound, int(p["free_surface"]))
-        M.mac_bc(self.u, self.v, self.ctype, self.wall_type, self.wall_v, self.wall_d, self.wall_f, self.grid_v,
-                 self.grid_m, dt, p["gravity"], p["obstacle_friction"], nx, ny, bound, 1)
+                      0.0, 0.0, 0.0, p["obstacle_friction"], bound, self.nx, self.ny)
+        mac.p2g(self.x_f, self.v_f, self.C_f, self.alive, inv_dx, dx)
+        mac.cell_bc(self.wall_type, self.wall_v, self.wall_d, self.wall_f, bound, p["obstacle_friction"])
+        mac.classify(self.cells, self.wall_type, self.wall_v, self.wall_d, self.x_f, self.alive, self.x_s,
+                     int(self.has_solid), inv_dx, bound, int(p["free_surface"]))
+        mac.bc(self.wall_type, self.wall_v, self.wall_d, self.wall_f, self.grid_v, self.grid_m, dt, p["gravity"],
+               p["obstacle_friction"], bound, 1)
         self._viscosity()
         self._project()
-        M.mac_bc(self.u, self.v, self.ctype, self.wall_type, self.wall_v, self.wall_d, self.wall_f, self.grid_v,
-                 self.grid_m, dt, p["gravity"], p["obstacle_friction"], nx, ny, bound, 0)
+        mac.bc(self.wall_type, self.wall_v, self.wall_d, self.wall_f, self.grid_v, self.grid_m, dt, p["gravity"],
+               p["obstacle_friction"], bound, 0)
         if self.has_solid:
-            M.pressure_force(self.fp, self.grid_m, self.q, self.ctype, inv_dx,
-                             -(p["fluid_rho"] / p["solid_rho"]) / dt, nx, ny)
-        M.mac_g2p(self.x_f, self.v_f, self.C_f, self.alive, self.u, self.v, self.mu, self.mv, inv_dx, dx)
+            mac.pressure_force(self.grid_m, inv_dx, -(p["fluid_rho"] / p["solid_rho"]) / dt)
+        mac.g2p(self.x_f, self.v_f, self.C_f, self.alive, inv_dx, dx)
         self._advect_and_emit(dt)
         self._density_projection()
 
@@ -549,18 +551,18 @@ class Solver:
 
         - x_f, v_f, alive, free stack updated
         """
-        p, dx, inv_dx, nx, ny, bound = self.p, self.dx, self.inv_dx, self.nx, self.ny, self.p["bound"]
+        p, dx, inv_dx, bound = self.p, self.dx, self.inv_dx, self.p["bound"]
+        ppc_face = float(p["ppc"] ** self.dim)       # flux : ppc^dim particules par cellule et par (v_n dt / dx)
         K.advect_fluid(self.x_f, self.v_f, self.alive, self.wall_type, self.wall_v, self.wall_d, self.sdf, self.cells,
-                       self.use_sdf, inv_dx, dt, bound, dx, nx, ny,
-                       self.free_stack, self.free_top)
+                       self.use_sdf, inv_dx, dt, bound, dx, self.free_stack, self.free_top)
         if self.has_inlet:
             K.emit_wall(self.x_f, self.v_f, self.C_f, self.J_f, self.alive, self.wall_type, self.wall_v,
-                        self.wall_d, self.emit_acc, float(p["ppc"] * p["ppc"]), self.free_stack, self.free_top, dt, dx, bound,
-                        nx, ny)
+                        self.wall_d, self.emit_acc, ppc_face, self.free_stack, self.free_top, dt, dx, bound,
+                        self.cells)
         if self.has_pressure_outlet:
-            M.emit_pressure_outlet(self.x_f, self.v_f, self.C_f, self.J_f, self.alive, self.wall_type, self.wall_d,
-                                   self.wall_p, self.emit_acc, self.ctype, self.u, self.v, int(p["ppc"]),
-                                   self.free_stack, self.free_top, dt, dx, bound, nx, ny)
+            self.mac.emit_pressure_outlet(self.x_f, self.v_f, self.C_f, self.J_f, self.alive, self.wall_type,
+                                          self.wall_d, self.wall_p, self.emit_acc, ppc_face, self.free_stack,
+                                          self.free_top, dt, dx, bound)
 
     # ------------------------------------------------------------ simulation (faiblement compressible)
     def _substep(self) -> None:
@@ -570,7 +572,7 @@ class Solver:
 
         - fluid and solid state updated
         """
-        p, dt, dx, inv_dx, nx, ny, bound = self.p, self.dt, self.dx, self.inv_dx, self.nx, self.ny, self.p["bound"]
+        p, dt, dx, inv_dx, bound = self.p, self.dt, self.dx, self.inv_dx, self.p["bound"]
         if self.has_fluid:
             K.P2G_fluid(self.grid_m, self.grid_v, self.x_f, self.v_f, self.C_f, self.J_f, self.alive,
                         inv_dx, dt, dx, p["fluid_E"], self.p_mass_f, self.p_vol)
@@ -581,11 +583,11 @@ class Solver:
             P2G_solid(self.grid_m, self.grid_v, self.x_s, self.v_s, self.C_s, self.F_s, self.D_s, self.broken_s,
                       inv_dx, dt, dx, self.mu_s, self.la_s, self.p_mass_s, self.p_vol, p["k_res"])
         grid_step(self.grid_m, self.grid_v, self.cells, self.wall_type, self.wall_v, self.wall_d, self.wall_f,
-                  dt, p["gravity"], 0.0, p["obstacle_friction"], bound, nx, ny)
+                  dt, p["gravity"], 0.0, p["obstacle_friction"], bound, self.nx, self.ny)
         if self.has_fluid:
             K.G2P_fluid(self.grid_v, self.x_f, self.v_f, self.C_f, self.J_f, self.alive, inv_dx, dt, dx)
         if self.has_solid:
-            G2P_solid(self.grid_v, self.x_s, self.v_s, self.C_s, self.F_s, self.broken_s, inv_dx, dt, dx, bound, nx, ny)
+            G2P_solid(self.grid_v, self.x_s, self.v_s, self.C_s, self.F_s, self.broken_s, inv_dx, dt, dx, bound)
             if p["use_damage"]:
                 clear_eps(self.grid_e, self.grid_w)
                 scatter_eps(self.grid_e, self.grid_w, self.x_s, self.F_s, self.broken_s, inv_dx)
@@ -611,7 +613,8 @@ class Solver:
             self._adapt_dt()
         for _ in range(n_sub):
             if self._bc_eval is not None:              # valeurs imposées fonction de t, évaluées sur le GPU
-                self._bc_eval(self.wall_e, self.wall_v, self.wall_p, self.wall_d, self.t, self.dx, self.nx, self.ny)
+                self._bc_eval(self.wall_e, self.wall_v, self.wall_p, self.wall_d, self.t, self.dx, self.nx, self.ny,
+                              self.nz)
             if self.incompressible:
                 self._substep_incompressible()
             else:
@@ -639,8 +642,8 @@ class Solver:
               "ms": self.last_step_ms}
         if self.incompressible:                        # diagnostics, lus seulement quand stats() est appelé
             st["cg_iters"] = self.cg_last_iters
-            st["cg_rr"] = float(M.cg_residual(self.cg))
-            st["div_max"] = float(M.divergence_max(self.u, self.v, self.ctype, self.dx))
+            st["cg_rr"] = float(M.cg_residual(self.mac.cg))
+            st["div_max"] = float(self.mac.divergence_max(self.dx))
         if self.has_fluid and self.fluid_mode > 0:    # échelle de couleur lissée (max de la quantité affichée)
             if self.fluid_mode == K.MODE_DENSITY:      # 3 rms : quelques particules de bord (sortie) hors échelle
                 m = 3.0 * float(K.scalar_rms(self.sc_f, self.alive))
@@ -655,27 +658,31 @@ class Solver:
 
         **Outputs**
 
-        - np.ndarray f32 (N, 2)
+        - np.ndarray f32 (N, dim)
         """
-        return self.x_f.to_numpy()[self.alive.to_numpy() == 1] if self.has_fluid else np.zeros((0, 2), np.float32)
+        if not self.has_fluid:
+            return np.zeros((0, self.dim), np.float32)
+        return self.x_f.to_numpy()[self.alive.to_numpy() == 1]
 
     def velocities(self) -> np.ndarray:
         """Read alive fluid particle velocities (GPU -> CPU).
 
         **Outputs**
 
-        - np.ndarray f32 (N, 2)
+        - np.ndarray f32 (N, dim)
         """
-        return self.v_f.to_numpy()[self.alive.to_numpy() == 1] if self.has_fluid else np.zeros((0, 2), np.float32)
+        if not self.has_fluid:
+            return np.zeros((0, self.dim), np.float32)
+        return self.v_f.to_numpy()[self.alive.to_numpy() == 1]
 
     def solid_positions(self) -> np.ndarray:
         """Read solid particle positions (GPU -> CPU).
 
         **Outputs**
 
-        - np.ndarray f32 (Ns, 2)
+        - np.ndarray f32 (Ns, dim)
         """
-        return self.x_s.to_numpy() if self.has_solid else np.zeros((0, 2), np.float32)
+        return self.x_s.to_numpy() if self.has_solid else np.zeros((0, self.dim), np.float32)
 
     def damage(self) -> np.ndarray:
         """Read solid particle damage D (GPU -> CPU).
@@ -686,9 +693,31 @@ class Solver:
         """
         return self.D_s.to_numpy() if self.has_solid else np.zeros(0, np.float32)
 
+    # ------------------------------------------------------------ rendu
+    def _colors(self) -> tuple:
+        """Update per-particle display scalars and solid colors on the GPU.
+
+        **Outputs**
+
+        - (mode int, signed int, inv_smax float) for the render kernels
+        """
+        if self.has_solid:
+            solid_colors(self.F_s, self.D_s, self.broken_s, self.col_s, int(self.p["color_mode"]), self.p["epsf"])
+        mode = int(self.fluid_mode)
+        if self.has_fluid and mode > 0:
+            if self.incompressible:
+                if mode == K.MODE_DENSITY:             # à jour même sans correction de densité
+                    self.mac.particle_density(self.x_f, self.alive, self.inv_dx, int(self.p["ppc"]))
+                self.mac.fluid_scalar(mode, self.x_f, self.v_f, self.alive, self.sc_f,
+                                      self.p["fluid_rho"] / self.dt, self.p["fluid_rho"], self.inv_dx)
+            else:
+                K.fluid_scalar_wc(mode, self.x_f, self.v_f, self.J_f, self.alive, self.grid_v, self.sc_f,
+                                  self.p["fluid_E"], self.p["fluid_rho"], self.inv_dx)
+        return mode, int(K.mode_signed(mode, self.dim)), 1.0 / max(self.scalar_max, 1e-9)
+
     def render(self, x0: float = 0.0, y0: float = 0.0, scale: float = 1.0,
                grid: bool = False, tint: bool = False, k: float | None = None, size=None) -> np.ndarray:
-        """Render the view to an image on the GPU.
+        """Render the 2D view to an image on the GPU.
 
         **Inputs**
 
@@ -701,32 +730,46 @@ class Solver:
         **Outputs**
 
         - np.ndarray u8 (height, width, 3)
+
+        **Note** : 3D solvers render with render3d.
         """
+        if self.dim == 3:
+            raise ValueError("solveur 3D : utiliser render3d(camera, size)")
         if k is None:                                  # boîte entière, aux proportions de la boîte
             res_x, res_y = self.res_x, self.res_y
             k = self.nx * self.dx / (scale * res_x)
         else:                                          # vue quelconque (UI : proportions de la fenêtre)
             res = int(self.p["res"])
             res_x, res_y = (max(1, min(int(v), res)) for v in size)
-        if self.has_solid:
-            solid_colors(self.F_s, self.D_s, self.broken_s, self.col_s, int(self.p["color_mode"]), self.p["epsf"])
         r_px = max(0, int(0.5 * self.p_spacing / k + 0.5))
-        mode = int(self.fluid_mode)
-        if self.has_fluid and mode > 0:
-            if self.incompressible:
-                if mode == K.MODE_DENSITY:             # à jour même sans correction de densité
-                    M.particle_density(self.x_f, self.alive, self.dens, self.bvol, self.inv_dx, int(self.p["ppc"]))
-                K.fluid_scalar_inc(mode, self.x_f, self.v_f, self.alive, self.u, self.v, self.q, self.dens, self.nu_c,
-                                   self.sc_f,
-                                   self.p["fluid_rho"] / self.dt, self.p["fluid_rho"], self.inv_dx, self.nx, self.ny)
-            else:
-                K.fluid_scalar_wc(mode, self.x_f, self.v_f, self.J_f, self.alive, self.grid_v, self.sc_f,
-                                  self.p["fluid_E"], self.p["fluid_rho"], self.inv_dx, self.nx, self.ny)
-        K.render(self.img, res_x, res_y, x0, y0, k, self.cells, self.wall_type, self.wall_d, self.nx, self.ny,
-                 self.inv_dx,
-                 self.p["bound"],
-                 int(grid), int(tint),
+        mode, signed, inv_smax = self._colors()
+        K.render(self.img, res_x, res_y, x0, y0, k, self.cells, self.wall_type, self.wall_d, self.inv_dx,
+                 self.p["bound"], int(grid), int(tint),
                  self.x_f, self.alive, int(self.has_fluid), 0.35, 0.65, 1.0, r_px,
-                 self.sc_f, mode, 1.0 / max(self.scalar_max, 1e-9),
+                 self.sc_f, mode, signed, inv_smax,
                  self.x_s, self.col_s, int(self.has_solid), r_px)
         return self.img.to_numpy()[:res_y, :res_x]
+
+    def render3d(self, camera, size=None, clip=None, prims=None) -> np.ndarray:
+        """Render the 3D view (spheres with depth, obstacles, walls) to an image on the GPU.
+
+        **Inputs**
+
+        - `camera` : ui.render3d.Camera
+        - `size` : tuple[int, int] | None   image (width, height) px, each <= res ; None : res × res
+        - `clip` : tuple (axis, position m, keep_below bool) | None   clipping plane for the particles
+        - `prims` : np.ndarray | None   primitive preview table (see ui.render3d.View3D.set_prims)
+
+        **Outputs**
+
+        - np.ndarray u8 (height, width, 3)
+
+        **Note** : one GPU -> CPU copy of the image only.
+        """
+        if self.dim != 3:
+            raise ValueError("solveur 2D : utiliser render(x0, y0, k, size)")
+        res = int(self.p["res"])
+        w, h = (res, res) if size is None else (max(1, min(int(v), res)) for v in size)
+        mode, signed, inv_smax = self._colors()
+        self.view3d.draw(self, camera, w, h, mode, signed, inv_smax, clip, prims)
+        return self.img.to_numpy()[:h, :w]

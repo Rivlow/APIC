@@ -1,4 +1,4 @@
-# ui/kernels_solid.py -- Solide MLS-MPM 2D : élasticité corotationnelle + endommagement + rupture
+# ui/kernels_solid.py -- Solide MLS-MPM 2D / 3D : élasticité corotationnelle + endommagement + rupture
 #
 # Ancien Solver/MpM/mpm_solid.py, gardé ici tel quel tant que ui/solver.py n'est pas migré vers
 # Solver/APIC.py + Solver/Solid/solid.py (qui en reprennent le contenu).
@@ -6,7 +6,7 @@
 # Même grille et mêmes poids B-spline quadratiques que le fluide APIC.
 # Chaque particule solide porte :
 #   x, v, C   : position, vitesse, matrice affine APIC (comme le fluide)
-#   F         : gradient de déformation (2x2), F = I au repos
+#   F         : gradient de déformation (dim x dim), F = I au repos
 #   D         : variable d'endommagement dans [0, 1]  (0 = intact, 1 = rompu)
 #   broken    : 1 si la particule a perdu toute cohésion (rupture)
 #
@@ -19,6 +19,11 @@
 
 import taichi as ti
 
+from ui.kernels import stencil3, weights, wprod
+
+# Génériques en dimension (lue à la compilation sur les champs, voir ui/kernels.py) ; grid_update et init_beam
+# (Sandbox_tuto seulement) restent 2D.
+
 
 # ---------------------------------------------------------------- loi de comportement
 @ti.func
@@ -27,18 +32,36 @@ def kirchhoff_stress(F, mu: float, la: float):
 
     **Inputs**
 
-    - `F` : mat2 f32 deformation gradient
+    - `F` : mat dim f32 deformation gradient
     - `mu`, `la` : float Lame parameters
 
     **Outputs**
 
-    - mat2 tau
+    - mat dim tau
     """
     U, sig, V = ti.svd(F)
     R = U @ V.transpose()
     J = F.determinant()
-    I = ti.Matrix.identity(ti.f32, 2)
+    I = ti.Matrix.identity(ti.f32, F.n)
     return 2.0 * mu * (F - R) @ F.transpose() + la * J * (J - 1.0) * I
+
+
+@ti.func
+def max_stretch(sig):
+    """Largest singular value (principal stretch).
+
+    **Inputs**
+
+    - `sig` : mat dim f32 diagonal of singular values
+
+    **Outputs**
+
+    - float
+    """
+    m = sig[0, 0]
+    for d in ti.static(range(1, sig.n)):
+        m = ti.max(m, sig[d, d])
+    return m
 
 
 # ---------------------------------------------------------------- 1. Particules -> grille
@@ -55,7 +78,7 @@ def P2G_solid(grid_m: ti.template(), grid_v: ti.template(),
     - `grid_m` : f32 field (nx, ny) node masses
     - `grid_v` : vec2 f32 field (nx, ny) node momenta
     - `x`, `v` : vec2 f32 fields (Ns,) positions / velocities
-    - `C`, `F` : mat2 f32 fields (Ns,) affine matrices / deformation gradients
+    - `C`, `F` : mat dim f32 fields (Ns,) affine matrices / deformation gradients
     - `D` : f32 field (Ns,) damage
     - `broken` : i32 field (Ns,)
     - `inv_dx`, `dt`, `dx`, `mu`, `la`, `p_mass`, `p_vol`, `k_res` : float
@@ -67,13 +90,12 @@ def P2G_solid(grid_m: ti.template(), grid_v: ti.template(),
     **Note** : does not clear the grid (shared with the fluid).
     """
 
+    dim = ti.static(x.n)
     for p in x:
 
-        base = (x[p] * inv_dx - 0.5).cast(int)   # noeud en bas à gauche du stencil 3x3
+        base = (x[p] * inv_dx - 0.5).cast(int)   # noeud en bas à gauche du stencil 3^dim
         fx = x[p] * inv_dx - base
-        w = [0.5 * (1.5 - fx)**2,
-             0.75 - (fx - 1.0)**2,
-             0.5 * (fx - 0.5)**2]
+        w = weights(fx)
 
         # Raideur effective : (1 - D) E pour une particule endommagée, avec un plancher k_res
         # (une particule totalement sans raideur se comporterait comme de la poussière).
@@ -88,12 +110,11 @@ def P2G_solid(grid_m: ti.template(), grid_v: ti.template(),
         # -> on range tout dans une matrice "affine" appliquée à dpos, comme pour le terme C_p.
         affine = (-dt * p_vol * 4.0 * inv_dx * inv_dx) * tau + p_mass * C[p]
 
-        for i, j in ti.static(ti.ndrange(3, 3)):
-            offset = ti.Vector([i, j])
-            d_pos = (offset - fx) * dx
-            weight = w[i].x * w[j].y
-            grid_v[base + offset] += weight * (p_mass * v[p] + affine @ d_pos)
-            grid_m[base + offset] += weight * p_mass
+        for o in ti.static(stencil3(dim)):
+            d_pos = (o - fx) * dx
+            weight = wprod(w, o)
+            grid_v[base + o] += weight * (p_mass * v[p] + affine @ d_pos)
+            grid_m[base + o] += weight * p_mass
 
 
 # ---------------------------------------------------------------- 2. Mise à jour de la grille
@@ -137,43 +158,42 @@ def grid_update(grid_m: ti.template(), grid_v: ti.template(), mask: ti.template(
 def G2P_solid(grid_v: ti.template(),
               x: ti.template(), v: ti.template(), C: ti.template(), F: ti.template(),
               broken: ti.template(),
-              inv_dx: float, dt: float, dx: float, bound: int, nx: int, ny: int):
+              inv_dx: float, dt: float, dx: float, bound: int):
     """Grid to solid particles: v, C, F update, rupture clamp, advection.
 
     **Inputs**
 
     - `grid_v` : vec2 f32 field (nx, ny) node velocities
     - `x`, `v` : vec2 f32 fields (Ns,) positions / velocities
-    - `C`, `F` : mat2 f32 fields (Ns,) affine matrices / deformation gradients
+    - `C`, `F` : mat dim f32 fields (Ns,) affine matrices / deformation gradients
     - `broken` : i32 field (Ns,)
     - `inv_dx`, `dt`, `dx` : float
-    - `bound`, `nx`, `ny` : int
+    - `bound` : int (grid shape read from grid_v)
 
     **Outputs**
 
     - x, v, C, F written in place
     """
 
-    I = ti.Matrix.identity(ti.f32, 2)
-    lo = ti.Vector([bound * dx, bound * dx])
-    hi = ti.Vector([(nx - bound) * dx, (ny - bound) * dx])
+    n = ti.static(grid_v.shape)
+    dim = ti.static(len(n))
+    I = ti.Matrix.identity(ti.f32, dim)
+    lo = ti.Vector.zero(ti.f32, dim) + bound * dx
+    hi = (ti.Vector(n) - bound).cast(ti.f32) * dx
 
     for p in x:
 
         base = (x[p] * inv_dx - 0.5).cast(int)
         fx = x[p] * inv_dx - base
-        w = [0.5 * (1.5 - fx)**2,
-             0.75 - (fx - 1.0)**2,
-             0.5 * (fx - 0.5)**2]
+        w = weights(fx)
 
-        v_new = ti.Vector.zero(ti.f32, 2)
-        C_new = ti.Matrix.zero(ti.f32, 2, 2)
+        v_new = ti.Vector.zero(ti.f32, dim)
+        C_new = ti.Matrix.zero(ti.f32, dim, dim)
 
-        for i, j in ti.static(ti.ndrange(3, 3)):
-            offset = ti.Vector([i, j])
-            d_pos = (offset - fx) * dx
-            weight = w[i].x * w[j].y
-            g_v = grid_v[base + offset]
+        for o in ti.static(stencil3(dim)):
+            d_pos = (o - fx) * dx
+            weight = wprod(w, o)
+            g_v = grid_v[base + o]
             v_new += weight * g_v
             C_new += weight * g_v.outer_product(d_pos) * (4.0 * inv_dx * inv_dx)
 
@@ -187,7 +207,7 @@ def G2P_solid(grid_v: ti.template(),
             # Rupture : matériau sans cohésion. On écrête les étirements principaux à 1
             # (aucune traction possible) et on borne la compression pour éviter l'inversion.
             U, sig, V = ti.svd(F_new)
-            for d in ti.static(range(2)):
+            for d in ti.static(range(dim)):
                 sig[d, d] = ti.math.clamp(sig[d, d], 0.1, 1.0)
             F_new = U @ sig @ V.transpose()
 
@@ -211,9 +231,9 @@ def clear_eps(grid_e: ti.template(), grid_w: ti.template()):
 
     - grid_e, grid_w written in place
     """
-    for i, j in grid_e:
-        grid_e[i, j] = 0.0
-        grid_w[i, j] = 0.0
+    for I in ti.grouped(grid_e):
+        grid_e[I] = 0.0
+        grid_w[I] = 0.0
 
 
 @ti.kernel
@@ -225,7 +245,7 @@ def scatter_eps(grid_e: ti.template(), grid_w: ti.template(),
 
     - `grid_e`, `grid_w` : f32 fields (nx, ny) weighted strain / weights
     - `x` : vec2 f32 field (Ns,) positions
-    - `F` : mat2 f32 field (Ns,) deformation gradients
+    - `F` : mat dim f32 field (Ns,) deformation gradients
     - `broken` : i32 field (Ns,)
     - `inv_dx` : float
 
@@ -236,21 +256,20 @@ def scatter_eps(grid_e: ti.template(), grid_w: ti.template(),
     **Note** : does not clear the grid (see clear_eps).
     """
 
+    dim = ti.static(x.n)
     for p in x:
         if broken[p] == 0:
             base = (x[p] * inv_dx - 0.5).cast(int)
             fx = x[p] * inv_dx - base
-            w = [0.5 * (1.5 - fx)**2,
-                 0.75 - (fx - 1.0)**2,
-                 0.5 * (fx - 0.5)**2]
+            w = weights(fx)
 
             U, sig, V = ti.svd(F[p])
-            eps = ti.max(sig[0, 0], sig[1, 1]) - 1.0
+            eps = max_stretch(sig) - 1.0
 
-            for i, j in ti.static(ti.ndrange(3, 3)):
-                weight = w[i].x * w[j].y
-                grid_e[base + ti.Vector([i, j])] += weight * eps
-                grid_w[base + ti.Vector([i, j])] += weight
+            for o in ti.static(stencil3(dim)):
+                weight = wprod(w, o)
+                grid_e[base + o] += weight * eps
+                grid_w[base + o] += weight
 
 
 @ti.kernel
@@ -264,7 +283,7 @@ def update_damage(grid_e: ti.template(), grid_w: ti.template(),
 
     - `grid_e`, `grid_w` : f32 fields (nx, ny)
     - `x` : vec2 f32 field (Ns,) positions
-    - `F` : mat2 f32 field (Ns,) deformation gradients
+    - `F` : mat dim f32 field (Ns,) deformation gradients
     - `D` : f32 field (Ns,) damage
     - `broken` : i32 field (Ns,)
     - `inv_dx`, `dt`, `eps0`, `epsf`, `tau_D` : float
@@ -277,19 +296,18 @@ def update_damage(grid_e: ti.template(), grid_w: ti.template(),
     **Note** : rate-limited, dD <= dt / tau_D; D never decreases.
     """
 
+    dim = ti.static(x.n)
     for p in x:
         if broken[p] == 0:
             base = (x[p] * inv_dx - 0.5).cast(int)
             fx = x[p] * inv_dx - base
-            w = [0.5 * (1.5 - fx)**2,
-                 0.75 - (fx - 1.0)**2,
-                 0.5 * (fx - 0.5)**2]
+            w = weights(fx)
 
             eps = 0.0
-            for i, j in ti.static(ti.ndrange(3, 3)):
-                node = base + ti.Vector([i, j])
+            for o in ti.static(stencil3(dim)):
+                node = base + o
                 if grid_w[node] > 0:
-                    eps += w[i].x * w[j].y * grid_e[node] / grid_w[node]
+                    eps += wprod(w, o) * grid_e[node] / grid_w[node]
 
             D_new = ti.math.clamp((eps - eps0) / (epsf - eps0), 0.0, 1.0)
             D[p] = ti.max(D[p], ti.min(D_new, D[p] + dt / tau_D))
@@ -298,7 +316,7 @@ def update_damage(grid_e: ti.template(), grid_w: ti.template(),
                 broken[p] = 1
                 # on retire la traction tout de suite (au lieu de F = I) : la compression est conservée
                 U, sig, V = ti.svd(F[p])
-                for d in ti.static(range(2)):
+                for d in ti.static(range(dim)):
                     sig[d, d] = ti.math.clamp(sig[d, d], 0.1, 1.0)
                 F[p] = U @ sig @ V.transpose()
 
@@ -313,7 +331,7 @@ def init_beam(x: ti.template(), v: ti.template(), C: ti.template(), F: ti.templa
     **Inputs**
 
     - `x`, `v` : vec2 f32 fields (Ns,)
-    - `C`, `F` : mat2 f32 fields (Ns,)
+    - `C`, `F` : mat dim f32 fields (Ns,)
     - `D` : f32 field (Ns,)
     - `broken` : i32 field (Ns,)
     - `x0`, `y0` : float
@@ -343,7 +361,7 @@ def solid_colors(F: ti.template(), D: ti.template(), broken: ti.template(),
 
     **Inputs**
 
-    - `F` : mat2 f32 field (Ns,)
+    - `F` : mat dim f32 field (Ns,)
     - `D` : f32 field (Ns,)
     - `broken` : i32 field (Ns,)
     - `col` : vec3 f32 field (Ns,)
@@ -363,7 +381,7 @@ def solid_colors(F: ti.template(), D: ti.template(), broken: ti.template(),
                 col[p] = ti.Vector([0.75, 0.75, 0.75]) * (1 - D[p]) + ti.Vector([1.0, 0.85, 0.1]) * D[p]
         else:
             U, sig, V = ti.svd(F[p])
-            eps = ti.max(sig[0, 0], sig[1, 1]) - 1.0
+            eps = max_stretch(sig) - 1.0
             t = ti.math.clamp(0.5 + 0.5 * eps / eps_scale, 0.0, 1.0)
             col[p] = ti.Vector([0.2, 0.4, 1.0]) * (1 - t) + ti.Vector([1.0, 0.25, 0.1]) * t
 

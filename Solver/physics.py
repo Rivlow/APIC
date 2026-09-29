@@ -2,7 +2,7 @@
 #
 # grid_step reste UN seul kernel (une passe sur la grille) ; la physique y est composée à partir de ti.func.
 # Les conditions aux limites sont définies par le script de lancement ou l'UI (Solver/walls.py : Walls),
-# jamais codées en dur ici. Grille nx × ny, cellules carrées dx = 1 / max(nx, ny).
+# jamais codées en dur ici. Grille 2D ou 3D (forme lue sur grid_m à la compilation), cellules carrées.
 
 import taichi as ti
 
@@ -15,7 +15,7 @@ def apply_external_forces(v: ti.template(), dt: float, g: float, damp: float):
 
     **Inputs**
 
-    - `v` : vec2 f32 grid velocity (lvalue)
+    - `v` : vec dim f32 grid velocity (lvalue)
     - `dt`, `g`, `damp` : float (damp in 1/s, 0 = none)
 
     **Outputs**
@@ -34,14 +34,14 @@ def grid_step(grid_m: ti.template(), grid_v: ti.template(), cells: ti.template()
 
     **Inputs**
 
-    - `grid_m` : f32 field (nx, ny)
-    - `grid_v` : vec2 f32 field (nx, ny), momentum on entry
-    - `cells` : i32 field (nx, ny), OBSTACLE bit
-    - `wall_type`, `wall_d` : i32 field (4, nm)
-    - `wall_v` : vec2 f32 field (4, nm)
-    - `wall_f` : f32 field (4, nm)
+    - `grid_m` : f32 field (n) node masses
+    - `grid_v` : vec dim f32 field (n), momentum on entry
+    - `cells` : i32 field (n), OBSTACLE bit
+    - `wall_type`, `wall_d` : i32 field (2 dim, na, nb)
+    - `wall_v` : vec dim f32 field (2 dim, na, nb)
+    - `wall_f` : f32 field (2 dim, na, nb)
     - `dt`, `g`, `damp`, `obstacle_friction` : float (friction: 1 no-slip, 0 slip)
-    - `bound`, `nx`, `ny` : int
+    - `bound` : int ; `nx`, `ny` : int (unused, kept for the 2D scripts ; the shape is read from grid_m)
 
     **Outputs**
 
@@ -49,16 +49,16 @@ def grid_step(grid_m: ti.template(), grid_v: ti.template(), cells: ti.template()
 
     **Note** : obstacle faces carrying an inlet / outlet get the wall BC, not the obstacle BC.
     """
+    n = ti.static(grid_m.shape)
+    for I in ti.grouped(grid_m):
 
-    for i, j in grid_m:
+        if grid_m[I] > 0:
 
-        if grid_m[i, j] > 0:
-
-            grid_v[i, j] /= grid_m[i, j]      # quantité de mouvement -> vitesse (fin du transfert P2G)
-            apply_external_forces(grid_v[i, j], dt, g, damp)
-            if cells[i, j] & OBSTACLE and not is_bc_face(i, j, nx, ny, bound, wall_d):
-                apply_obstacle(i, j, grid_v[i, j], cells, obstacle_friction, nx, ny)
-            apply_walls(i, j, grid_v[i, j], wall_type, wall_v, wall_d, wall_f, bound, nx, ny)
+            grid_v[I] /= grid_m[I]            # quantité de mouvement -> vitesse (fin du transfert P2G)
+            apply_external_forces(grid_v[I], dt, g, damp)
+            if cells[I] & OBSTACLE and not is_bc_face(I, n, bound, wall_d):
+                apply_obstacle(I, grid_v[I], cells, obstacle_friction, n)
+            apply_walls(I, grid_v[I], wall_type, wall_v, wall_d, wall_f, bound, n)
 
 
 @ti.kernel

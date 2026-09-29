@@ -1,136 +1,174 @@
-# Solver/boundary.py -- Application des conditions aux limites sur la grille (Taichi).
+# Solver/boundary.py -- Application des conditions aux limites sur la grille (Taichi), 2D ou 3D.
 #
-# Grille nx × ny (cellules carrées dx = 1 / max(nx, ny)). Les parois sont définies par Solver/walls.py (Walls, par
-# le script de lancement ou l'UI) puis rastérisées en wall_type (i32), wall_v (vec2), wall_d (i32), wall_p (f32)
-# et wall_f (f32), tables (4, max(nx, ny)) indexées [côté, cellule le long du mur], lues ici :
+# Grille de cellules carrées, forme n = (nx, ny) ou (nx, ny, nz) (tuple Python passé en ti.template, lu à la
+# compilation). Les parois sont définies par Solver/walls.py (Walls, par le script de lancement ou l'UI) puis
+# rastérisées en wall_type (i32), wall_v (vecteur dim), wall_d (i32), wall_p (f32) et wall_f (f32), tables
+# (2·dim, na, nb) indexées [côté, ka, kb] (cellule le long des axes tangents ; kb = 0 en 2D), lues ici :
 #   - dans la bande de `bound` cellules qui borde le domaine, c'est-à-dire sur le mur lui-même ;
 #   - sur la FACE d'un obstacle collé à une entrée / sortie (wall_d > bound) : la dernière couche de l'obstacle
-#     le long de la normale du mur (cellule / nœud wall_d - 1 depuis le bord) porte la condition du segment.
+#     le long de la normale du mur (cellule / nœud wall_d - 1 depuis le bord) porte la condition de la zone.
 #     Les autres faces de l'obstacle restent des obstacles ordinaires.
-# Les obstacles intérieurs vivent dans la grille `cells` (i32, nx × ny) : bit OBSTACLE ; leur frottement est un
-# paramètre global beta_o (1 = adhérent : vitesse nulle, comme avant ; 0 = glissant).
+# Coins : une cellule dans la bande de deux axes (ou plus) est un mur ordinaire.
+# Les obstacles intérieurs vivent dans la grille `cells` (i32) : bit OBSTACLE ; leur frottement est un
+# paramètre global beta_o (1 = adhérent : vitesse nulle ; 0 = glissant).
+# Les côtés sont parcourus par des boucles ti.static : axe normal et axes tangents sont des constantes de
+# compilation (pas d'indexation dynamique de vecteurs).
 
 import taichi as ti
 
-from Solver.walls import (BOTTOM, INLET, LEFT, OBSTACLE, OUTLET, RIGHT, SIDES, TOP,  # noqa: F401
-                          WALL, WALL_TYPES, Walls, side_length)
+from Solver.walls import (BACK, BOTTOM, FRONT, INLET, LEFT, OBSTACLE, OUTLET, RIGHT, SIDES, TOP,  # noqa: F401
+                          WALL, WALL_TYPES, Walls, frame, side_length)
+
+FRAMES = {d: tuple(frame(s, d) for s in range(2 * d)) for d in (2, 3)}   # côté -> (axe normal, plus, tangents)
 
 
 @ti.func
-def face_side(i: int, j: int, nx: int, ny: int, bound: int, wall_d: ti.template()):
-    """Locate an obstacle face that carries a wall segment.
+def tcoords(I, s: ti.template()):
+    """Wall-table coordinates of a cell / node on side s.
 
     **Inputs**
 
-    - `i`, `j` : int cell / node
-    - `nx`, `ny`, `bound` : int
-    - `wall_d` : i32 field (4, nm), wall depth in cells from the edge
+    - `I` : ivec dim cell / node index
+    - `s` : static int side
 
     **Outputs**
 
-    - (side, k) int, side in LEFT/RIGHT/BOTTOM/TOP, k index along the wall ; (-1, 0) otherwise
-
-    **Note** : same index for cell and node (last obstacle layer before the fluid).
+    - (ka, kb) int ; kb = 0 in 2D
     """
-    side, k = -1, 0
-    if bound <= j < ny - bound:
-        dl, dr = wall_d[LEFT, j], wall_d[RIGHT, j]
-        if dl > bound and i == dl - 1:
-            side, k = LEFT, j
-        elif dr > bound and i == nx - dr:
-            side, k = RIGHT, j
-    if side < 0 and bound <= i < nx - bound:
-        db, dt = wall_d[BOTTOM, i], wall_d[TOP, i]
-        if db > bound and j == db - 1:
-            side, k = BOTTOM, i
-        elif dt > bound and j == ny - dt:
-            side, k = TOP, i
-    return side, k
+    ts = ti.static(FRAMES[I.n][s][2])
+    kb = 0
+    if ti.static(I.n == 3):
+        kb = I[ts[1]]
+    return I[ts[0]], kb
 
 
 @ti.func
-def band_cell(i: int, j: int, nx: int, ny: int, bound: int, wall_d: ti.template()):
-    """Map a wall-band cell or BC obstacle face to its wall-table entry.
+def tvalid(I, n: ti.template(), s: ti.template(), bound: int) -> bool:
+    """Whether the tangent coordinates of I on side s lie outside the corner bands.
 
     **Inputs**
 
-    - `i`, `j` : int cell
-    - `nx`, `ny`, `bound` : int
-    - `wall_d` : i32 field (4, nm)
-
-    **Outputs**
-
-    - (side, k) int ; (-1, 0) if neither band nor BC face, or in a corner
-
-    **Note** : corners (k in the transverse band) are always plain walls.
-    """
-    side, k = -1, 0
-    if i < bound:
-        side, k = LEFT, j
-    elif i >= nx - bound:
-        side, k = RIGHT, j
-    elif j < bound:
-        side, k = BOTTOM, i
-    elif j >= ny - bound:
-        side, k = TOP, i
-    if side >= 0:
-        ln = ny if side <= RIGHT else nx
-        if k < bound or k >= ln - bound:
-            side = -1
-    if side < 0:
-        side, k = face_side(i, j, nx, ny, bound, wall_d)
-    return side, k
-
-
-@ti.func
-def in_band(i: int, j: int, nx: int, ny: int, bound: int) -> bool:
-    """Test whether cell (i, j) lies in the wall band.
-
-    **Inputs**
-
-    - `i`, `j`, `nx`, `ny`, `bound` : int
+    - `I` : ivec dim ; `n` : static grid shape ; `s` : static side ; `bound` : int
 
     **Outputs**
 
     - bool
     """
-    return i < bound or j < bound or i >= nx - bound or j >= ny - bound
+    ok = True
+    for t in ti.static(FRAMES[len(n)][s][2]):
+        ok = ok and bound <= I[t] < n[t] - bound
+    return ok
 
 
 @ti.func
-def band_bc(wall_type: ti.template(), wall_v: ti.template(), wall_d: ti.template(),
-            i: int, j: int, nx: int, ny: int, bound: int):
-    """BC type and imposed velocity of cell (i, j).
+def face_side(I, n: ti.template(), bound: int, wall_d: ti.template()):
+    """Locate an obstacle face that carries a wall zone.
 
     **Inputs**
 
-    - `wall_type`, `wall_d` : i32 field (4, nm)
-    - `wall_v` : vec2 f32 field (4, nm)
-    - `i`, `j`, `nx`, `ny`, `bound` : int
+    - `I` : ivec dim cell / node
+    - `n` : static grid shape ; `bound` : int
+    - `wall_d` : i32 field (2 dim, na, nb), wall depth in cells from the edge
 
     **Outputs**
 
-    - (t int WALL/INLET/OUTLET, vel vec2 f32) ; (WALL, 0) outside the band or in a corner
+    - (side, ka, kb) int ; (-1, 0, 0) otherwise
+
+    **Note** : same index for cell and node (last obstacle layer before the fluid); sides in order left, right,
+    bottom, top, back, front.
+    """
+    side, ka, kb = -1, 0, 0
+    for s in ti.static(range(2 * len(n))):
+        a, plus = ti.static(FRAMES[len(n)][s][0], FRAMES[len(n)][s][1])
+        if side < 0 and tvalid(I, n, s, bound):
+            ca, cb = tcoords(I, s)
+            d = wall_d[s, ca, cb]
+            if d > bound and I[a] == (n[a] - d if ti.static(plus) else d - 1):
+                side, ka, kb = s, ca, cb
+    return side, ka, kb
+
+
+@ti.func
+def band_cell(I, n: ti.template(), bound: int, wall_d: ti.template()):
+    """Map a wall-band cell or BC obstacle face to its wall-table entry.
+
+    **Inputs**
+
+    - `I` : ivec dim cell
+    - `n` : static grid shape ; `bound` : int
+    - `wall_d` : i32 field (2 dim, na, nb)
+
+    **Outputs**
+
+    - (side, ka, kb) int ; (-1, 0, 0) if neither band nor BC face, or in a corner
+    """
+    cnt, side, ka, kb = 0, -1, 0, 0
+    for s in ti.static(range(2 * len(n))):
+        a, plus = ti.static(FRAMES[len(n)][s][0], FRAMES[len(n)][s][1])
+        inb = I[a] >= n[a] - bound if ti.static(plus) else I[a] < bound
+        if inb:
+            cnt += 1
+            side = s
+            ka, kb = tcoords(I, s)
+    if cnt != 1:                                      # hors bande, ou coin (bande de deux axes) : mur ordinaire
+        side = -1
+    if cnt == 0:
+        side, ka, kb = face_side(I, n, bound, wall_d)
+    return side, ka, kb
+
+
+@ti.func
+def in_band(I, n: ti.template(), bound: int) -> bool:
+    """Test whether cell I lies in the wall band.
+
+    **Inputs**
+
+    - `I` : ivec dim ; `n` : static grid shape ; `bound` : int
+
+    **Outputs**
+
+    - bool
+    """
+    inb = False
+    for a in ti.static(range(len(n))):
+        inb = inb or I[a] < bound or I[a] >= n[a] - bound
+    return inb
+
+
+@ti.func
+def band_bc(wall_type: ti.template(), wall_v: ti.template(), wall_d: ti.template(), I, n: ti.template(),
+            bound: int):
+    """BC type and imposed velocity of cell I.
+
+    **Inputs**
+
+    - `wall_type`, `wall_d` : i32 field (2 dim, na, nb)
+    - `wall_v` : vec dim f32 field (2 dim, na, nb)
+    - `I` : ivec dim ; `n` : static grid shape ; `bound` : int
+
+    **Outputs**
+
+    - (t int WALL/INLET/OUTLET, vel vec dim f32) ; (WALL, 0) outside the band or in a corner
     """
     t = WALL
-    vel = ti.Vector([0.0, 0.0])
-    side, k = band_cell(i, j, nx, ny, bound, wall_d)
+    vel = ti.Vector.zero(ti.f32, ti.static(len(n)))
+    side, ka, kb = band_cell(I, n, bound, wall_d)
     if side >= 0:
-        t = wall_type[side, k]
-        vel = wall_v[side, k]
+        t = wall_type[side, ka, kb]
+        vel = wall_v[side, ka, kb]
     return t, vel
 
 
 @ti.func
-def outlet_q(wall_type: ti.template(), wall_d: ti.template(), wall_p: ti.template(),
-             i: int, j: int, nx: int, ny: int, bound: int, dt: float, inv_rho: float):
-    """Imposed outlet pressure of cell (i, j) (wall band or obstacle face), as q = dt p / rho.
+def outlet_q(wall_type: ti.template(), wall_d: ti.template(), wall_p: ti.template(), I, n: ti.template(),
+             bound: int, dt: float, inv_rho: float):
+    """Imposed outlet pressure of cell I (wall band or obstacle face), as q = dt p / rho.
 
     **Inputs**
 
-    - `wall_type`, `wall_d` : i32 field (4, nm)
-    - `wall_p` : f32 field (4, nm)
-    - `i`, `j`, `nx`, `ny`, `bound` : int
+    - `wall_type`, `wall_d` : i32 field (2 dim, na, nb)
+    - `wall_p` : f32 field (2 dim, na, nb)
+    - `I` : ivec dim ; `n` : static grid shape ; `bound` : int
     - `dt`, `inv_rho` : float
 
     **Outputs**
@@ -138,67 +176,51 @@ def outlet_q(wall_type: ti.template(), wall_d: ti.template(), wall_p: ti.templat
     - q float ; 0 if not an outlet cell
     """
     q = 0.0
-    side, k = band_cell(i, j, nx, ny, bound, wall_d)
+    side, ka, kb = band_cell(I, n, bound, wall_d)
     if side >= 0:
-        if wall_type[side, k] == OUTLET:
-            q = dt * wall_p[side, k] * inv_rho
+        if wall_type[side, ka, kb] == OUTLET:
+            q = dt * wall_p[side, ka, kb] * inv_rho
     return q
 
 
 @ti.func
-def outlet_at(wall_type: ti.template(), side: int, k: int, nx: int, ny: int, bound: int) -> bool:
-    """Test whether wall entry (side, k) is an outlet (corners excluded).
+def exit_at(wall_type: ti.template(), wall_v: ti.template(), s: ti.template(), ka: int, kb: int,
+            n: ti.template(), bound: int) -> bool:
+    """Test whether particles leave through wall entry (s, ka, kb): outlet, or inlet whose velocity points out of
+    the domain (velocity outlet, e.g. u = q / h_aval ; no emission there, emit_wall only emits for inward velocity).
 
     **Inputs**
 
-    - `wall_type` : i32 field (4, nm)
-    - `side`, `k`, `nx`, `ny`, `bound` : int
+    - `wall_type` : i32 field (2 dim, na, nb)
+    - `wall_v` : vec dim f32 field (2 dim, na, nb) imposed velocity
+    - `s` : static side ; `ka`, `kb` : int ; `n` : static grid shape ; `bound` : int
 
     **Outputs**
 
-    - bool
+    - bool (corners excluded)
     """
-    ln = ny if side <= RIGHT else nx
-    return bound <= k < ln - bound and wall_type[side, k] == OUTLET
+    a, plus, ts = ti.static(FRAMES[len(n)][s])
+    ok = bound <= ka < n[ts[0]] - bound
+    if ti.static(len(n) == 3):
+        ok = ok and bound <= kb < n[ts[1]] - bound
+    res = False
+    if ok:
+        vn = wall_v[s, ka, kb][a]                     # composante entrante (normale intérieure)
+        if ti.static(plus):
+            vn = -vn
+        t = wall_type[s, ka, kb]
+        res = t == OUTLET or (t == INLET and vn < 0.0)
+    return res
 
 
 @ti.func
-def exit_at(wall_type: ti.template(), wall_v: ti.template(), side: int, k: int, nx: int, ny: int,
-            bound: int) -> bool:
-    """Test whether particles leave through wall entry (side, k): outlet, or inlet whose velocity points out of the
-    domain (velocity outlet, e.g. u = q / h_aval ; no emission there, emit_wall only emits for inward velocity).
+def is_bc_face(I, n: ti.template(), bound: int, wall_d: ti.template()) -> bool:
+    """Test whether node I is an obstacle face carrying a wall BC.
 
     **Inputs**
 
-    - `wall_type` : i32 field (4, nm)
-    - `wall_v` : vec2 f32 field (4, nm) imposed velocity
-    - `side`, `k`, `nx`, `ny`, `bound` : int
-
-    **Outputs**
-
-    - bool
-    """
-    ln = ny if side <= RIGHT else nx
-    vel = wall_v[side, k]
-    vn = vel.x                                        # composante entrante (normale intérieure)
-    if side == RIGHT:
-        vn = -vel.x
-    elif side == BOTTOM:
-        vn = vel.y
-    elif side == TOP:
-        vn = -vel.y
-    t = wall_type[side, k]
-    return bound <= k < ln - bound and (t == OUTLET or (t == INLET and vn < 0.0))
-
-
-@ti.func
-def is_bc_face(i: int, j: int, nx: int, ny: int, bound: int, wall_d: ti.template()) -> bool:
-    """Test whether node (i, j) is an obstacle face carrying a wall BC.
-
-    **Inputs**
-
-    - `i`, `j`, `nx`, `ny`, `bound` : int
-    - `wall_d` : i32 field (4, nm)
+    - `I` : ivec dim ; `n` : static grid shape ; `bound` : int
+    - `wall_d` : i32 field (2 dim, na, nb)
 
     **Outputs**
 
@@ -206,78 +228,62 @@ def is_bc_face(i: int, j: int, nx: int, ny: int, bound: int, wall_d: ti.template
 
     **Note** : such nodes must not be zeroed as obstacles.
     """
-    side, k = face_side(i, j, nx, ny, bound, wall_d)
+    side, ka, kb = face_side(I, n, bound, wall_d)
     return side >= 0
 
 
 @ti.func
-def apply_walls(i: int, j: int, v: ti.template(), wall_type: ti.template(), wall_v: ti.template(),
-                wall_d: ti.template(), wall_f: ti.template(), bound: int, nx: int, ny: int):
-    """Apply wall BCs to grid node (i, j).
+def apply_walls(I, v: ti.template(), wall_type: ti.template(), wall_v: ti.template(), wall_d: ti.template(),
+                wall_f: ti.template(), bound: int, n: ti.template()):
+    """Apply wall BCs to grid node I (collocated grid).
 
     **Inputs**
 
-    - `i`, `j` : int node
-    - `v` : vec2 f32 velocity (lvalue)
-    - `wall_type`, `wall_d` : i32 field (4, nm)
-    - `wall_v` : vec2 f32 field (4, nm)
-    - `wall_f` : f32 field (4, nm)
-    - `bound`, `nx`, `ny` : int
+    - `I` : ivec dim node
+    - `v` : vec dim f32 velocity (lvalue)
+    - `wall_type`, `wall_d` : i32 field (2 dim, na, nb)
+    - `wall_v` : vec dim f32 field (2 dim, na, nb)
+    - `wall_f` : f32 field (2 dim, na, nb)
+    - `bound` : int ; `n` : static grid shape
 
     **Outputs**
 
-    - v in place (wall: inward component zeroed, tangential x (1 - beta) ; inlet: imposed ; outlet: free)
+    - v in place (wall: outward component zeroed, tangential x (1 - beta) ; inlet: imposed ; outlet: free)
 
-    **Note** : band nodes are i < bound (left), i > nx - bound (right; node nx - bound is the wall), plus obstacle faces.
+    **Note** : band nodes are I[a] < bound (low side), I[a] > n[a] - bound (high side; node n - bound is the
+    wall), plus obstacle faces.
     """
-    fs, fk = face_side(i, j, nx, ny, bound, wall_d)
-    if i < bound or fs == LEFT:
-        t = wall_type[LEFT, j] if bound <= j < ny - bound else WALL
-        if t == INLET:
-            vw = wall_v[LEFT, j]
-            v.x, v.y = vw.x, vw.y
-        elif t == WALL:
-            if v.x < 0:
-                v.x = 0.0
-            v.y *= 1.0 - wall_f[LEFT, j]
-    if i > nx - bound or fs == RIGHT:
-        t = wall_type[RIGHT, j] if bound <= j < ny - bound else WALL
-        if t == INLET:
-            vw = wall_v[RIGHT, j]
-            v.x, v.y = vw.x, vw.y
-        elif t == WALL:
-            if v.x > 0:
-                v.x = 0.0
-            v.y *= 1.0 - wall_f[RIGHT, j]
-    if j < bound or fs == BOTTOM:
-        t = wall_type[BOTTOM, i] if bound <= i < nx - bound else WALL
-        if t == INLET:
-            vw = wall_v[BOTTOM, i]
-            v.x, v.y = vw.x, vw.y
-        elif t == WALL:
-            if v.y < 0:
-                v.y = 0.0
-            v.x *= 1.0 - wall_f[BOTTOM, i]
-    if j > ny - bound or fs == TOP:
-        t = wall_type[TOP, i] if bound <= i < nx - bound else WALL
-        if t == INLET:
-            vw = wall_v[TOP, i]
-            v.x, v.y = vw.x, vw.y
-        elif t == WALL:
-            if v.y > 0:
-                v.y = 0.0
-            v.x *= 1.0 - wall_f[TOP, i]
+    fs, _ka, _kb = face_side(I, n, bound, wall_d)
+    for s in ti.static(range(2 * len(n))):
+        a, plus, ts = ti.static(FRAMES[len(n)][s])
+        inb = I[a] > n[a] - bound if ti.static(plus) else I[a] < bound
+        if inb or fs == s:
+            ka, kb = tcoords(I, s)
+            t = wall_type[s, ka, kb] if tvalid(I, n, s, bound) else WALL
+            if t == INLET:
+                vw = wall_v[s, ka, kb]
+                for c in ti.static(range(len(n))):
+                    v[c] = vw[c]
+            elif t == WALL:
+                if ti.static(plus):
+                    if v[a] > 0:
+                        v[a] = 0.0
+                elif v[a] < 0:
+                    v[a] = 0.0
+                beta = wall_f[s, ka, kb]
+                for c in ti.static(ts):
+                    v[c] *= 1.0 - beta
 
 
 @ti.func
-def apply_obstacle(i: int, j: int, v: ti.template(), cells: ti.template(), beta: float, nx: int, ny: int):
-    """Apply obstacle BC to node (i, j) (collocated grid).
+def apply_obstacle(I, v: ti.template(), cells: ti.template(), beta: float, n: ti.template()):
+    """Apply obstacle BC to node I (collocated grid).
 
     **Inputs**
 
-    - `i`, `j`, `nx`, `ny` : int
-    - `v` : vec2 f32 velocity (lvalue)
-    - `cells` : i32 field (nx, ny), OBSTACLE bit
+    - `I` : ivec dim ; `n` : static grid shape
+    - `v` : vec dim f32 velocity (lvalue)
+    - `cells` : i32 field (n), OBSTACLE bit
     - `beta` : float friction (>= 1: no-slip)
 
     **Outputs**
@@ -286,22 +292,27 @@ def apply_obstacle(i: int, j: int, v: ti.template(), cells: ti.template(), beta:
 
     **Note** : outward normal estimated from the neighbour occupancy gradient.
     """
+    dim = ti.static(len(n))
     if beta >= 1.0:
-        v.x, v.y = 0.0, 0.0
+        for c in ti.static(range(dim)):
+            v[c] = 0.0
     else:
-        # indices bornés (un ternaire Taichi évalue ses deux branches) ; hors grille = obstacle
-        o_l = 1.0 if (cells[ti.max(i - 1, 0), j] & OBSTACLE) or i == 0 else 0.0
-        o_r = 1.0 if (cells[ti.min(i + 1, nx - 1), j] & OBSTACLE) or i == nx - 1 else 0.0
-        o_b = 1.0 if (cells[i, ti.max(j - 1, 0)] & OBSTACLE) or j == 0 else 0.0
-        o_t = 1.0 if (cells[i, ti.min(j + 1, ny - 1)] & OBSTACLE) or j == ny - 1 else 0.0
-        nrm = ti.Vector([o_l - o_r, o_b - o_t])       # vers les voisins libres
+        nrm = ti.Vector.zero(ti.f32, dim)             # vers les voisins libres
+        for a in ti.static(range(dim)):
+            e = ti.Vector.unit(dim, a, ti.i32)
+            # indices bornés (un ternaire Taichi évalue ses deux branches) ; hors grille = obstacle
+            lo = 1.0 if (cells[ti.max(I - e, 0)] & OBSTACLE) or I[a] == 0 else 0.0
+            hi = 1.0 if (cells[ti.min(I + e, ti.Vector(n) - 1)] & OBSTACLE) or I[a] == n[a] - 1 else 0.0
+            nrm[a] = lo - hi
         ln = nrm.norm()
         if ln < 1e-6:
-            v.x, v.y = 0.0, 0.0
+            for c in ti.static(range(dim)):
+                v[c] = 0.0
         else:
             nrm /= ln
             vn = v.dot(nrm)
             vt = v - vn * nrm
             vn = ti.max(vn, 0.0)                      # imperméable : pas de vitesse vers l'obstacle
             w = vn * nrm + (1.0 - beta) * vt
-            v.x, v.y = w.x, w.y
+            for c in ti.static(range(dim)):
+                v[c] = w[c]
